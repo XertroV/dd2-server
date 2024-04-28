@@ -1,4 +1,5 @@
 use lazy_static::lazy_static;
+use log::info;
 use lru::LruCache;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -39,6 +40,7 @@ pub async fn init_op_config() -> usize {
         let mut contents = String::new();
         f.read_to_string(&mut contents).await?;
         let config: Config = serde_json::from_str(&contents)?;
+        info!("Loaded config for plugin_id: {}", config.plugin_id);
         configs.insert(config.plugin_id, config);
         Ok(())
     }

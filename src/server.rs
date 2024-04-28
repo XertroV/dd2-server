@@ -14,6 +14,8 @@ use tokio::{
     sync::Mutex,
 };
 
+use crate::op_auth::init_op_config;
+
 mod op_auth;
 mod player;
 mod router;
@@ -29,6 +31,7 @@ async fn main() {
     // return;
 
     env_logger::Builder::from_env(Env::default().default_filter_or("info")).init();
+    init_op_config().await;
     let bind_addr = "0.0.0.0:17677";
     warn!("Starting server on: {}", bind_addr);
     listen(bind_addr).await;
