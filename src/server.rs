@@ -3,10 +3,15 @@ use std::{
     time::{Duration, SystemTime},
 };
 
+use dotenv::dotenv;
 use env_logger::Env;
-use log::{info, warn};
+use log::{error, info, warn};
 use player::Player;
 use serde_json;
+use sqlx::{
+    postgres::{PgPool, PgPoolOptions},
+    Pool, Postgres,
+};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, Interest},
     net::{TcpListener, TcpStream},
@@ -16,12 +21,28 @@ use tokio::{
 
 use crate::op_auth::init_op_config;
 
+mod db;
 mod op_auth;
 mod player;
+mod queries;
 mod router;
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 10)]
 async fn main() {
+    dotenv().ok();
+    env_logger::Builder::from_env(Env::default().default_filter_or("info")).init();
+
+    // init db from env var
+    let db_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
+    let pool = PgPoolOptions::new().max_connections(10).connect(&db_url).await.unwrap();
+    let db = Arc::new(pool);
+    info!("Connected to db");
+
+    match sqlx::migrate!().run(db.as_ref()).await {
+        Ok(_) => info!("Migrations ran successfully"),
+        Err(e) => panic!("Error running migrations: {:?}", e),
+    }
+
     // let rec = router::Response::NewRecord { name: "asdf".into(), height: 1234., testu64: 0x7ff7320b0000 };
     // // test: serialize using serde_json, print, and deserialize
     // let s = serde_json::to_string(&rec).unwrap();
@@ -30,14 +51,13 @@ async fn main() {
     // println!("Deserialized: {:?}", rec2);
     // return;
 
-    env_logger::Builder::from_env(Env::default().default_filter_or("info")).init();
     init_op_config().await;
     let bind_addr = "0.0.0.0:17677";
     warn!("Starting server on: {}", bind_addr);
-    listen(bind_addr).await;
+    listen(bind_addr, db).await;
 }
 
-async fn listen(bind_addr: &str) {
+async fn listen(bind_addr: &str, pool: Arc<Pool<Postgres>>) {
     let listener = TcpListener::bind(bind_addr).await.unwrap();
     info!("Listening on: {}", bind_addr);
     let (player_mgr, player_mgr_tx) = PlayerMgr::new();
@@ -47,18 +67,24 @@ async fn listen(bind_addr: &str) {
         let (stream, _) = listener.accept().await.unwrap();
         let player_mgr = player_mgr.clone();
         let player_mgr_tx = player_mgr_tx.clone();
+        let pool = pool.clone();
         tokio::spawn(async move {
-            run_connection(stream, player_mgr, player_mgr_tx).await;
+            run_connection(pool, stream, player_mgr, player_mgr_tx).await;
         });
     }
 }
 
-async fn run_connection(stream: TcpStream, player_mgr: Arc<PlayerMgr>, player_mgr_tx: UnboundedSender<ToPlayerMgr>) {
+async fn run_connection(
+    pool: Arc<Pool<Postgres>>,
+    stream: TcpStream,
+    player_mgr: Arc<PlayerMgr>,
+    player_mgr_tx: UnboundedSender<ToPlayerMgr>,
+) {
     info!("New connection from {:?}", stream.peer_addr().unwrap());
     let r = stream.ready(Interest::READABLE | Interest::WRITABLE).await.unwrap();
     info!("Ready: {:?}", r);
     let p = Player::new(player_mgr_tx);
-    player_mgr.add_player(p, stream).await;
+    player_mgr.add_player(pool, p, stream).await;
 }
 
 pub struct PlayerMgr {
@@ -80,10 +106,24 @@ impl PlayerMgr {
         )
     }
 
-    pub async fn add_player(&self, player: Player, stream: TcpStream) {
+    pub async fn add_player(&self, pool: Arc<Pool<Postgres>>, player: Player, stream: TcpStream) {
         let player: Arc<_> = player.into();
         self.players.lock().await.push(player.clone());
-        Player::start(player, stream);
+        Player::start(pool, player, stream);
+    }
+
+    pub fn watch_remove_players_dc(mgr: Arc<Self>) {
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                let mut players = mgr.players.lock().await;
+                for i in (0..players.len()).rev() {
+                    if !players[i].is_connected() {
+                        players.remove(i);
+                    }
+                }
+            }
+        });
     }
 
     pub fn start(mgr: Arc<Self>) {
@@ -95,7 +135,9 @@ impl PlayerMgr {
                         ToPlayerMgr::RecheckRecords() => {
                             Self::start_recheck_records(mgr.clone());
                         }
-                        ToPlayerMgr::AuthFailed() => todo!(),
+                        ToPlayerMgr::AuthFailed() => {
+                            error!("Auth failed");
+                        }
                     },
                     None => {
                         break;

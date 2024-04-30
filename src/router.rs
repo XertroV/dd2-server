@@ -3,6 +3,7 @@ use std::{fmt::Display, io};
 use bitflags::bitflags;
 use log::warn;
 use serde::{Deserialize, Serialize};
+use sqlx::types::JsonValue;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{
@@ -43,11 +44,13 @@ pub enum Request {
         token: String,
         plugin_info: String,
         game_info: String,
+        gamer_info: String,
     } = 1,
     ResumeSession {
         session_token: String,
         plugin_info: String,
         game_info: String,
+        gamer_info: String,
     } = 2,
     ReportContext {
         context: PlayerCtx,
@@ -72,7 +75,7 @@ pub enum Request {
     ReportFallStart {
         floor: u8,
         pos: [f32; 3],
-        vel: [f32; 3],
+        speed: f32,
         start_time: u32,
     } = 35,
     ReportFallEnd {
@@ -83,6 +86,7 @@ pub enum Request {
     ReportStats {
         stats: Stats,
     } = 37,
+    ReportMapLoad {} = 38,
 
     GetMyStats {} = 128,
     GetGlobalLB {} = 129,
@@ -107,6 +111,7 @@ impl Request {
             Request::ReportFallStart { .. } => 35,
             Request::ReportFallEnd { .. } => 36,
             Request::ReportStats { .. } => 37,
+            Request::ReportMapLoad { .. } => 38,
             Request::GetMyStats { .. } => 128,
             Request::GetGlobalLB { .. } => 129,
             Request::GetFriendsLB { .. } => 130,
@@ -127,6 +132,7 @@ impl Request {
             Request::ReportFallStart { .. } => "ReportFallStart",
             Request::ReportFallEnd { .. } => "ReportFallEnd",
             Request::ReportStats { .. } => "ReportStats",
+            Request::ReportMapLoad { .. } => "ReportMapLoad",
             Request::GetMyStats { .. } => "GetMyStats",
             Request::GetGlobalLB { .. } => "GetGlobalLB",
             Request::GetFriendsLB { .. } => "GetFriendsLB",
@@ -181,7 +187,10 @@ bitflags! {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlayerCtx {
     pub flags: u64,
-    pub uid: String,
+    pub managers: i64,
+    pub map_uid: String,
+    pub map_name: String,
+    pub map_hash: [u8; 32],
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -199,12 +208,15 @@ pub enum Response {
 
     Ping {},
     ServerInfo {
-        nb_players: u32,
+        nb_players_live: u32,
+        nb_players_total: u32,
         nb_sessions: u32,
+        nb_resets: u32,
+        nb_jumps: u32,
+        nb_map_loads: u32,
         nb_falls: u32,
         nb_floors_fallen: u32,
         total_height_fallen: u32,
-        curr_connected: u32,
     },
 
     NewRecord {
@@ -217,10 +229,10 @@ pub enum Response {
         stats: Stats,
     },
     GlobalLB {
-        lb: Leaderboard,
+        entries: Vec<LeaderboardEntry>,
     },
     FriendsLB {
-        lb: Leaderboard,
+        entries: Vec<LeaderboardEntry>,
     },
 }
 
@@ -275,14 +287,27 @@ pub struct ServerInfo {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Stats {
-    pub global_rank: u32,
-    // pub country_rank: u32,
+    pub nb_jumps: u32,
+    pub nb_falls: u32,
+    pub nb_floors_fallen: u32,
+    pub last_pb_set_ts: u32,
+    pub total_dist_fallen: f32,
+    pub pb_height: f32,
+    pub pb_floor: u32,
+    pub nb_resets: u32,
+    pub ggs_triggered: u32,
+    pub title_gags_triggered: u32,
+    pub title_gags_special_triggered: u32,
+    pub bye_byes_triggered: u32,
+    pub monument_triggers: JsonValue,
+    pub reached_floor_count: JsonValue,
+    pub floor_voice_lines_played: JsonValue,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Leaderboard {
-    entries: Vec<LeaderboardEntry>,
-}
+// #[derive(Debug, Clone, Serialize, Deserialize)]
+// pub struct Leaderboard {
+//     entries: Vec<LeaderboardEntry>,
+// }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LeaderboardEntry {
