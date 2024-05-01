@@ -6,6 +6,19 @@ use sqlx::{prelude::FromRow, query, query_as, types::Uuid, Pool, Postgres};
 
 use crate::router::Stats;
 
+pub async fn log_ml_ping(pool: &Pool<Postgres>, ip_v4: &str, ip_v6: &str, is_intro: bool, user_agent: &str) -> Result<(), sqlx::Error> {
+    query!(
+        "INSERT INTO ml_pings (ip_v4, ip_v6, is_intro, user_agent) VALUES ($1, $2, $3, $4);",
+        ip_v4,
+        ip_v6,
+        is_intro,
+        user_agent
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 pub async fn update_users_stats(pool: &Pool<Postgres>, user_id: &Uuid, stats: &Stats) -> Result<(), sqlx::Error> {
     info!("Updating stats for user {:?}: {:#?}", user_id, stats);
     let r = query!("UPDATE stats SET nb_jumps = $1, nb_falls = $2, nb_floors_fallen = $3, last_pb_set_ts = $4, total_dist_fallen = $5, pb_height = $6, pb_floor = $7, nb_resets = $8, ggs_triggered = $9, title_gags_triggered = $10, title_gags_special_triggered = $11, bye_byes_triggered = $12, monument_triggers = $13, reached_floor_count = $14, floor_voice_lines_played = $15, seconds_spent_in_map = $16, update_count = update_count + 1, ts = NOW() WHERE user_id = $17 RETURNING update_count;",
@@ -158,6 +171,43 @@ pub async fn insert_finish(pool: &Pool<Postgres>, session_id: &Uuid, race_time: 
         "INSERT INTO finishes (session_token, race_time) VALUES ($1, $2);",
         session_id,
         race_time
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/*
+
+CREATE TABLE vehicle_states (
+    id SERIAL PRIMARY KEY,
+    session_token UUID REFERENCES sessions(session_token) NOT NULL,
+    context_id UUID REFERENCES contexts(context_id),
+    is_official BOOLEAN NOT NULL,
+    pos FLOAT[] NOT NULL,
+    rotq FLOAT[] NOT NULL,
+    vel FLOAT[] NOT NULL,
+    ts TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT NOW()
+);
+*/
+
+pub async fn insert_vehicle_state(
+    pool: &Pool<Postgres>,
+    session_id: &Uuid,
+    context_id: Option<&Uuid>,
+    is_official: bool,
+    pos: [f32; 3],
+    rotq: [f32; 4],
+    vel: [f32; 3],
+) -> Result<(), sqlx::Error> {
+    query!(
+        "INSERT INTO vehicle_states (session_token, context_id, is_official, pos, rotq, vel) VALUES ($1, $2, $3, $4, $5, $6);",
+        session_id,
+        context_id,
+        is_official,
+        &pos.map(|f| f as f64),
+        &rotq.map(|f| f as f64),
+        &vel.map(|f| f as f64),
     )
     .execute(pool)
     .await?;

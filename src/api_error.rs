@@ -7,6 +7,7 @@ pub enum Error {
     StrErr(String),
     SqlxErr(sqlx::Error),
     SendErr(SendError<Response>),
+    B64(base64::DecodeError),
 }
 
 impl From<String> for Error {
@@ -24,5 +25,11 @@ impl From<sqlx::Error> for Error {
 impl From<SendError<Response>> for Error {
     fn from(e: SendError<Response>) -> Self {
         Error::SendErr(e)
+    }
+}
+
+impl From<base64::DecodeError> for Error {
+    fn from(e: base64::DecodeError) -> Self {
+        Error::B64(e)
     }
 }

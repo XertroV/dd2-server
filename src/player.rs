@@ -1,6 +1,7 @@
 use std::str::FromStr;
 use std::sync::Arc;
 
+use base64::Engine;
 use log::{info, warn};
 use sqlx::types::Uuid;
 use sqlx::{query, Pool, Postgres};
@@ -14,10 +15,10 @@ use crate::api_error::Error;
 use crate::consts::DD2_MAP_UID;
 use crate::op_auth::{check_token, TokenResp};
 use crate::queries::{
-    context_mark_succeeded, create_session, insert_context, insert_context_packed, insert_finish, insert_respawn, insert_start_fall,
-    register_or_login, resume_session, update_fall_with_end, update_users_stats, Session, User,
+    context_mark_succeeded, create_session, insert_context, insert_context_packed, insert_finish, insert_gc_nod, insert_respawn,
+    insert_start_fall, insert_vehicle_state, register_or_login, resume_session, update_fall_with_end, update_users_stats, Session, User,
 };
-use crate::router::{write_response, PlayerCtx, Request, Response, Stats};
+use crate::router::{write_response, Map, PlayerCtx, Request, Response, Stats};
 use crate::ToPlayerMgr;
 
 pub struct Player {
@@ -227,10 +228,13 @@ impl Player {
                 let res = match msg {
                     Request::Authenticate { .. } => Ok(()),  // ignore
                     Request::ResumeSession { .. } => Ok(()), // ignore
-                    Request::ReportContext { context } => Player::update_context(&pool, p.clone(), context).await,
-                    Request::ReportGCNodMsg { aux } => todo!(),
+                    Request::ReportContext { sf, mi, map, i, bi } => match (parse_u64_str(&sf), parse_u64_str(&mi)) {
+                        (Ok(sf), Ok(mi)) => Player::update_context(&pool, p.clone(), sf, mi, map.as_ref(), i.unwrap_or(false), bi).await,
+                        _ => Err("Invalid sf/mi".to_string().into()),
+                    },
+                    Request::ReportGCNodMsg { data } => Player::on_report_gcnod_msg(&pool, p.clone(), &data).await,
                     Request::Ping {} => p.queue_tx.send(Response::Ping {}).map_err(Into::into),
-                    Request::ReportVehicleState { vel, pos, rotq } => todo!(), //Player::report_vehicle_state,
+                    Request::ReportVehicleState { vel, pos, rotq } => Player::report_vehicle_state(&pool, p.clone(), pos, rotq, vel).await,
                     Request::ReportRespawn { race_time } => Player::report_respawn(&pool, p.clone(), race_time).await,
                     Request::ReportFinish { race_time } => Player::report_finish(&pool, p.clone(), race_time).await,
                     Request::ReportFallStart {
@@ -288,20 +292,62 @@ impl Player {
 
 /// handle messages impls
 impl Player {
-    pub async fn update_context(pool: &Pool<Postgres>, p: Arc<Player>, context: PlayerCtx) -> Result<(), Error> {
+    pub async fn report_vehicle_state(
+        pool: &Pool<Postgres>,
+        p: Arc<Player>,
+        pos: [f32; 3],
+        rotq: [f32; 4],
+        vel: [f32; 3],
+    ) -> Result<(), Error> {
+        let ctx_id_lock = p.context_id.lock().await;
+        let ctx_id = ctx_id_lock.as_ref();
+        let is_official = p.context.lock().await.as_ref().map(|ctx| ctx.is_official()).unwrap_or(false);
+        Ok(insert_vehicle_state(pool, p.get_session().session_id(), ctx_id, is_official, pos, rotq, vel).await?)
+    }
+
+    pub async fn update_context(
+        pool: &Pool<Postgres>,
+        p: Arc<Player>,
+        sf: u64,
+        mi: u64,
+        map: Option<&Map>,
+        has_vl_item: bool,
+        bi: [i32; 2],
+    ) -> Result<(), Error> {
         let mut ctx = p.context.lock().await;
-        let ctx_id = p.context_id.lock().await;
+        let mut ctx_id = p.context_id.lock().await;
         let mut previous_ctx = None;
         if let Some(ctx_id) = ctx_id.as_ref() {
             let _ = previous_ctx.insert(ctx_id.clone());
         }
-        let map_id: i32 = todo!();
-        let new_id = insert_context_packed(pool, &context, &previous_ctx, map_id).await?;
+        let new_ctx = PlayerCtx::new(sf, mi, map.cloned(), has_vl_item);
+        let map_id = match map {
+            Some(map) => {
+                let map_id = crate::queries::get_or_insert_map(pool, &map.uid, &map.name, &map.hash).await?;
+                Some(map_id)
+            }
+            None => None,
+        };
+        let new_id = insert_context_packed(pool, p.get_session().session_id(), &new_ctx, &previous_ctx, map_id, bi).await?;
         if let Some(previous_ctx) = previous_ctx {
             context_mark_succeeded(pool, &previous_ctx, &new_id).await?;
         }
-        *ctx = Some(context);
+        *ctx = Some(new_ctx);
         *ctx_id = Some(new_id);
+        Ok(())
+    }
+
+    pub async fn on_report_gcnod_msg(pool: &Pool<Postgres>, p: Arc<Player>, data: &str) -> Result<(), Error> {
+        // decode base64
+        let x = base64::prelude::BASE64_STANDARD.decode(data)?;
+        match p.context_id.lock().await.as_ref() {
+            Some(ctx_id) => {
+                insert_gc_nod(pool, p.get_session().session_id(), ctx_id, &x).await?;
+            }
+            None => {
+                warn!("GCNod message without context");
+            }
+        };
         Ok(())
     }
 
@@ -399,6 +445,12 @@ pub fn context_map_plain_to_cypher(plain: i32) -> i32 {
     ret
 }
 
+pub fn check_flags_sf_mi(sf: u64, mi: u64) -> bool {
+    let scene_flags = decode_context_flags(sf);
+    // todo
+    true
+}
+
 /*
 
     // !
@@ -492,6 +544,13 @@ pub fn decode_context_flags(flags: u64) -> [bool; 15] {
         }
     }
     plain
+}
+
+pub fn parse_u64_str(s: &str) -> Result<u64, std::num::ParseIntError> {
+    if &s[..2] == "0x" {
+        return u64::from_str_radix(&s[2..], 16);
+    }
+    u64::from_str_radix(s, 16)
 }
 
 #[cfg(test)]

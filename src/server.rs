@@ -19,11 +19,12 @@ use tokio::{
     sync::Mutex,
 };
 
-use crate::op_auth::init_op_config;
+use crate::{http::run_http_server, op_auth::init_op_config};
 
 mod api_error;
 mod consts;
 mod db;
+mod http;
 mod op_auth;
 mod player;
 mod queries;
@@ -56,7 +57,10 @@ async fn main() {
     init_op_config().await;
     let bind_addr = "0.0.0.0:17677";
     warn!("Starting server on: {}", bind_addr);
-    listen(bind_addr, db).await;
+    tokio::select! {
+        _ = listen(bind_addr, db.clone()) => {},
+        _ = run_http_server(db) => {},
+    };
 }
 
 async fn listen(bind_addr: &str, pool: Arc<Pool<Postgres>>) {

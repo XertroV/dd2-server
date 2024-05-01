@@ -55,7 +55,7 @@ CREATE TABLE maps (
     map_id SERIAL PRIMARY KEY,
     uid VARCHAR(30) NOT NULL,
     name VARCHAR(255) NOT NULL,
-    hash VARCHAR(32) NOT NULL,
+    hash bytea NOT NULL,
     load_count INTEGER NOT NULL DEFAULT 1,
     created_ts TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT NOW()
 );
@@ -64,17 +64,15 @@ CREATE INDEX uid_hash_idx ON maps(uid, hash);
 -- Contexts table
 CREATE TABLE contexts (
     context_id UUID PRIMARY KEY NOT NULL,
-    session_token UUID REFERENCES sessions(session_token) NOT NULL UNIQUE,
-    flags INTEGER[] NOT NULL,
-    is_mt_editor BOOLEAN NOT NULL,
-    is_playground BOOLEAN NOT NULL,
-    is_solo BOOLEAN NOT NULL,
-    is_server BOOLEAN NOT NULL,
+    session_token UUID REFERENCES sessions(session_token) NOT NULL,
+    flags BOOLEAN[15] NOT NULL,
     has_vl_item BOOLEAN NOT NULL,
     map_id INTEGER REFERENCES maps(map_id),
     managers BIGINT NOT NULL,
+    block_count INTEGER NOT NULL,
+    item_count INTEGER NOT NULL,
     created_ts TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT NOW(),
-    terminated BOOLEAN NOT NULL,
+    terminated BOOLEAN NOT NULL DEFAULT false,
     predecessor UUID REFERENCES contexts(context_id),
     successor UUID REFERENCES contexts(context_id),
     ended_ts TIMESTAMP WITHOUT TIME ZONE
@@ -86,6 +84,7 @@ CREATE INDEX map_id_idx ON contexts(map_id, created_ts);
 -- Game cam nods table
 CREATE TABLE game_cam_nods (
     id SERIAL PRIMARY KEY,
+    session_token UUID REFERENCES sessions(session_token) NOT NULL,
     context_id UUID REFERENCES contexts(context_id) NOT NULL,
     raw BYTEA NOT NULL,
     init_byte SMALLINT NOT NULL,
@@ -97,6 +96,17 @@ CREATE TABLE game_cam_nods (
 );
 CREATE INDEX context_id_idx ON game_cam_nods(context_id);
 CREATE INDEX flags_idx ON game_cam_nods(init_byte, is_race_nod_null, is_editor_cam_null, is_race_88_null, is_cam_1a8_16);
+
+
+CREATE TABLE ml_pings (
+    id SERIAL PRIMARY KEY,
+    ip_v4 VARCHAR(15),
+    ip_v6 VARCHAR(39),
+    user_agent VARCHAR(255),
+    is_intro BOOLEAN NOT NULL,
+    ts TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT NOW()
+);
+CREATE INDEX ml_pings_ts_idx ON ml_pings(ip_v4, ts);
 
 
 -- Position reports table

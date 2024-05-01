@@ -1,4 +1,4 @@
-use std::{fmt::Display, io};
+use std::{fmt::Display, io, sync::Arc};
 
 use bitflags::bitflags;
 use log::warn;
@@ -10,7 +10,10 @@ use tokio::{
         tcp::{OwnedReadHalf, OwnedWriteHalf, WriteHalf},
         TcpStream,
     },
+    sync::{Mutex, OnceCell},
 };
+
+use crate::{consts::DD2_MAP_UID, player::check_flags_sf_mi};
 
 pub struct Router {
     methods: Vec<Method>,
@@ -53,11 +56,14 @@ pub enum Request {
         gamer_info: String,
     } = 2,
     ReportContext {
-        context: PlayerCtx,
+        sf: String,
+        mi: String,
+        map: Option<Map>,
+        i: Option<bool>,
+        bi: [i32; 2],
     } = 3,
     ReportGCNodMsg {
-        // data: [u8; 0x2d0],
-        aux: AuxGCNod,
+        data: String,
     } = 4,
 
     Ping {} = 8,
@@ -188,16 +194,54 @@ bitflags! {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlayerCtx {
-    pub flags: u64,
-    pub managers: i64,
+    pub sf: u64,
+    pub mi: u64,
     pub map: Option<Map>,
+    pub i: bool,
+    #[serde(skip)]
+    pub is_official: Arc<std::sync::Mutex<Option<bool>>>,
+}
+
+impl PlayerCtx {
+    pub fn new(sf: u64, mi: u64, map: Option<Map>, i: bool) -> Self {
+        PlayerCtx {
+            sf,
+            mi,
+            map,
+            i,
+            is_official: Arc::new(std::sync::Mutex::new(None)),
+        }
+    }
+
+    pub fn is_official(&self) -> bool {
+        let mut io = self.is_official.lock().unwrap();
+        if let Some(v) = io.as_ref() {
+            return *v;
+        }
+        let ans = check_flags_sf_mi(self.sf, self.mi) && self.map.as_ref().map(|m| m.is_dd2()).unwrap_or(false);
+        *io = Some(ans);
+        ans
+    }
+}
+
+impl Default for PlayerCtx {
+    fn default() -> Self {
+        PlayerCtx::new(0, 0, None, false)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Map {
     pub uid: String,
     pub name: String,
+    // either 64 char hex, or raw string, or empty for none
     pub hash: String,
+}
+
+impl Map {
+    pub fn is_dd2(&self) -> bool {
+        self.uid.starts_with(DD2_MAP_UID)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
