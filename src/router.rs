@@ -55,7 +55,7 @@ pub enum Request {
     ReportContext {
         context: PlayerCtx,
     } = 3,
-    ReportGameCamNod {
+    ReportGCNodMsg {
         // data: [u8; 0x2d0],
         aux: AuxGCNod,
     } = 4,
@@ -63,31 +63,33 @@ pub enum Request {
     Ping {} = 8,
 
     ReportVehicleState {
-        mat: [[f32; 3]; 4],
+        pos: [f32; 3],
+        rotq: [f32; 4],
         vel: [f32; 3],
     } = 32,
     ReportRespawn {
-        game_time: u32,
+        race_time: i32,
     } = 33,
     ReportFinish {
-        game_time: u32,
+        race_time: i32,
     } = 34,
     ReportFallStart {
         floor: u8,
         pos: [f32; 3],
         speed: f32,
-        start_time: u32,
+        start_time: i32,
     } = 35,
     ReportFallEnd {
         floor: u8,
         pos: [f32; 3],
-        end_time: u32,
+        end_time: i32,
     } = 36,
     ReportStats {
         stats: Stats,
     } = 37,
-    ReportMapLoad {} = 38,
-
+    // ReportMapLoad {
+    //     uid: String,
+    // } = 38,
     GetMyStats {} = 128,
     GetGlobalLB {} = 129,
     GetFriendsLB {
@@ -103,7 +105,7 @@ impl Request {
             Request::Authenticate { .. } => 1,
             Request::ResumeSession { .. } => 2,
             Request::ReportContext { .. } => 3,
-            Request::ReportGameCamNod { .. } => 4,
+            Request::ReportGCNodMsg { .. } => 4,
             Request::Ping { .. } => 8,
             Request::ReportVehicleState { .. } => 32,
             Request::ReportRespawn { .. } => 33,
@@ -111,7 +113,7 @@ impl Request {
             Request::ReportFallStart { .. } => 35,
             Request::ReportFallEnd { .. } => 36,
             Request::ReportStats { .. } => 37,
-            Request::ReportMapLoad { .. } => 38,
+            // Request::ReportMapLoad { .. } => 38,
             Request::GetMyStats { .. } => 128,
             Request::GetGlobalLB { .. } => 129,
             Request::GetFriendsLB { .. } => 130,
@@ -124,7 +126,7 @@ impl Request {
             Request::Authenticate { .. } => "Authenticate",
             Request::ResumeSession { .. } => "ResumeSession",
             Request::ReportContext { .. } => "ReportContext",
-            Request::ReportGameCamNod { .. } => "ReportGameCamNod",
+            Request::ReportGCNodMsg { .. } => "ReportGameCamNod",
             Request::Ping { .. } => "Ping",
             Request::ReportVehicleState { .. } => "ReportVehicleState",
             Request::ReportRespawn { .. } => "ReportRespawn",
@@ -132,7 +134,7 @@ impl Request {
             Request::ReportFallStart { .. } => "ReportFallStart",
             Request::ReportFallEnd { .. } => "ReportFallEnd",
             Request::ReportStats { .. } => "ReportStats",
-            Request::ReportMapLoad { .. } => "ReportMapLoad",
+            // Request::ReportMapLoad { .. } => "ReportMapLoad",
             Request::GetMyStats { .. } => "GetMyStats",
             Request::GetGlobalLB { .. } => "GetGlobalLB",
             Request::GetFriendsLB { .. } => "GetFriendsLB",
@@ -188,9 +190,14 @@ bitflags! {
 pub struct PlayerCtx {
     pub flags: u64,
     pub managers: i64,
-    pub map_uid: String,
-    pub map_name: String,
-    pub map_hash: [u8; 32],
+    pub map: Option<Map>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Map {
+    pub uid: String,
+    pub name: String,
+    pub hash: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -287,6 +294,7 @@ pub struct ServerInfo {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Stats {
+    pub seconds_spent_in_map: i32,
     pub nb_jumps: u32,
     pub nb_falls: u32,
     pub nb_floors_fallen: u32,

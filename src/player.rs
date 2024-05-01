@@ -10,10 +10,12 @@ use tokio::net::TcpStream;
 use tokio::sync::mpsc::{error::SendError, unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio::sync::{Mutex, OnceCell};
 
+use crate::api_error::Error;
+use crate::consts::DD2_MAP_UID;
 use crate::op_auth::{check_token, TokenResp};
 use crate::queries::{
-    context_mark_succeeded, create_session, insert_context, insert_context_packed, register_or_login, resume_session, update_fall_with_end,
-    update_users_stats, Session, User,
+    context_mark_succeeded, create_session, insert_context, insert_context_packed, insert_finish, insert_respawn, insert_start_fall,
+    register_or_login, resume_session, update_fall_with_end, update_users_stats, Session, User,
 };
 use crate::router::{write_response, PlayerCtx, Request, Response, Stats};
 use crate::ToPlayerMgr;
@@ -217,7 +219,7 @@ impl Player {
                     Err(err) => {
                         warn!("Error reading from socket: {:?}", err);
                         // notify mgr to remove player
-                        let _ = p.tx_mgr.send(ToPlayerMgr::AuthFailed());
+                        let _ = p.tx_mgr.send(ToPlayerMgr::SocketError());
                         let _ = p.has_shutdown.set(true);
                         return;
                     }
@@ -226,11 +228,11 @@ impl Player {
                     Request::Authenticate { .. } => Ok(()),  // ignore
                     Request::ResumeSession { .. } => Ok(()), // ignore
                     Request::ReportContext { context } => Player::update_context(&pool, p.clone(), context).await,
-                    Request::ReportGameCamNod { aux } => todo!(),
+                    Request::ReportGCNodMsg { aux } => todo!(),
                     Request::Ping {} => p.queue_tx.send(Response::Ping {}).map_err(Into::into),
-                    Request::ReportVehicleState { mat, vel } => todo!(),
-                    Request::ReportRespawn { game_time } => todo!(),
-                    Request::ReportFinish { game_time } => todo!(),
+                    Request::ReportVehicleState { vel, pos, rotq } => todo!(), //Player::report_vehicle_state,
+                    Request::ReportRespawn { race_time } => Player::report_respawn(&pool, p.clone(), race_time).await,
+                    Request::ReportFinish { race_time } => Player::report_finish(&pool, p.clone(), race_time).await,
                     Request::ReportFallStart {
                         floor,
                         pos,
@@ -240,8 +242,8 @@ impl Player {
                     Request::ReportFallEnd { floor, pos, end_time } => {
                         Player::on_report_fall_end(&pool, p.clone(), floor as i32, pos.into(), end_time as i32).await
                     }
-                    Request::ReportStats { stats } => Player::on_report_stats(pool.clone(), p.clone(), stats).await,
-                    Request::ReportMapLoad {} => todo!(),
+                    Request::ReportStats { stats } => Player::on_report_stats(&pool, p.clone(), stats).await,
+                    // Request::ReportMapLoad { uid } => Player::on_report_map_load(&pool, p.clone(), &uid).await,
                     Request::GetMyStats {} => todo!(),
                     Request::GetGlobalLB {} => todo!(),
                     Request::GetFriendsLB { friends } => todo!(),
@@ -303,8 +305,18 @@ impl Player {
         Ok(())
     }
 
-    pub async fn on_report_stats(pool: Arc<Pool<Postgres>>, p: Arc<Player>, stats: Stats) -> Result<(), Error> {
-        Ok(update_users_stats(&pool, p.get_session().user_id(), &stats).await?)
+    pub async fn report_respawn(pool: &Pool<Postgres>, p: Arc<Player>, race_time: i32) -> Result<(), Error> {
+        insert_respawn(pool, p.get_session().session_id(), race_time).await?;
+        Ok(())
+    }
+
+    pub async fn report_finish(pool: &Pool<Postgres>, p: Arc<Player>, race_time: i32) -> Result<(), Error> {
+        insert_finish(pool, p.get_session().session_id(), race_time).await?;
+        Ok(())
+    }
+
+    pub async fn on_report_stats(pool: &Pool<Postgres>, p: Arc<Player>, stats: Stats) -> Result<(), Error> {
+        Ok(update_users_stats(pool, p.get_session().user_id(), &stats).await?)
     }
 
     pub async fn on_report_fall_start(
@@ -316,18 +328,16 @@ impl Player {
         start_time: i32,
     ) -> Result<(), Error> {
         // insert
-        query!(
-            "INSERT INTO falls (session_token, user_id, start_floor, start_pos_x, start_pos_y, start_pos_z, start_speed, start_time) VALUES ($1, $2, $3, $4, $5, $6, $7, $8);",
-            p.get_session().session_id(),
+        Ok(insert_start_fall(
+            pool,
+            p.get_session().user_id(),
             p.get_session().user_id(),
             floor,
-            pos.0 as f64,
-            pos.1 as f64,
-            pos.2 as f64,
-            speed as f64,
+            pos,
+            speed,
             start_time,
-        ).execute(pool).await?;
-        Ok(())
+        )
+        .await?)
     }
 
     pub async fn on_report_fall_end(
@@ -364,27 +374,269 @@ impl LoginSession {
     }
 }
 
-#[derive(Debug)]
-pub enum Error {
-    StrErr(String),
-    SqlxErr(sqlx::Error),
-    SendErr(SendError<Response>),
-}
+/// Context stuff
 
-impl From<String> for Error {
-    fn from(s: String) -> Self {
-        Error::StrErr(s)
+const CONTEXT_COEFFICIENTS: [i32; 15] = [69, 59, 136, 1, 26, 77, 41, 1, 95, 53, 1, 1, 86, 62, 89];
+// from shuffled to plain order
+const CONTEXT_MAP_CYPHER_TO_PLAIN: [i32; 15] = [6, 1, 14, -1, 12, 0, 8, -1, 13, 5, -1, -1, 2, 4, 9];
+const CONTEXT_MAP_PLAIN_TO_CYPHER: [i32; 15] = [5, 1, 12, -1, 13, 9, 0, -1, 6, 14, -1, -1, 4, 8, 2];
+
+pub fn context_map_cypher_to_plain(cypher: i32) -> i32 {
+    let ret = CONTEXT_MAP_CYPHER_TO_PLAIN[cypher as usize];
+    if ret == -1 {
+        // panic!("invalid index: {}", cypher);
+        return cypher;
     }
+    ret
 }
 
-impl From<sqlx::Error> for Error {
-    fn from(e: sqlx::Error) -> Self {
-        Error::SqlxErr(e)
+pub fn context_map_plain_to_cypher(plain: i32) -> i32 {
+    let ret = CONTEXT_MAP_PLAIN_TO_CYPHER[plain as usize];
+    if ret == -1 {
+        // panic!("invalid index: {}", plain);
+        return plain;
     }
+    ret
 }
 
-impl From<SendError<Response>> for Error {
-    fn from(e: SendError<Response>) -> Self {
-        Error::SendErr(e)
+/*
+
+    // !
+    const int[] unsafeMap = {5, 1, 12, -1, 13, 9, 0, -1, 6, 14, -1, -1, 4, 8, 2};
+    bool[]@ unsafeEncodeShuffle(const array<bool>@ arr) {
+        bool[] ret = array<bool>(15);
+        for (uint i = 0; i < 15; i++) {
+            if (unsafeMap[i] == -1) {
+                ret[i] = arr[i];
+            } else {
+                ret[unsafeMap[i]] = arr[i];
+            }
+        }
+        return ret;
+    }
+    uint64 encode(const array<bool>@ arr) {
+        uint64 ret = 1;
+        for (uint i = 0; i < 15; i++) {
+            if (arr[i]) {
+                ret *= uint64(lambda[i]);
+            }
+            while (ret & 1 == 0) {
+                trace("trimming: " + Text::FormatPointer(ret));
+                ret = ret >> 1;
+            }
+            trace("ret: " + Text::FormatPointer(ret));
+        }
+        return ret;
+    }
+    void runEncTest() {
+        bool[] arr = {true, false, true, false, true, false, true, false, true, false, true, false, true, false, true};
+        runEncTestCase(arr);
+        for (uint i = 0; i < 15; i++) {
+            arr[i] = true;
+        }
+        runEncTestCase(arr);
+        for (uint i = 0; i < 15; i++) {
+            arr[i] = i % 3 == 0;
+        }
+        runEncTestCase(arr);
+        print("^ mod 3");
+        for (uint i = 0; i < 15; i++) {
+            arr[i] = i % 5 == 0;
+        }
+        runEncTestCase(arr);
+        print("^ mod 5");
+    }
+
+    void runEncTestCase(const array<bool>@ arr) {
+        auto sarr = unsafeEncodeShuffle(arr);
+        trace('Encoded: ' + Text::FormatPointer(encode(sarr)));
+        // auto enc = encode(arr);
+        // trace("enc: " + Text::FormatPointer(enc));
+        // auto dec = decode(enc);
+        // trace("dec: " + dec);
+        // auto enc2 = encode(dec);
+        // trace("enc2: " + Text::FormatPointer(enc2));
+        // auto dec2 = decode(enc2);
+        // trace("dec2: " + dec2);
+    }
+
+*/
+
+pub fn encode_context_flags(arr: &[bool; 15]) -> u64 {
+    let mut ret = 1;
+    for i in 0..15 {
+        if arr[i] {
+            ret *= CONTEXT_COEFFICIENTS[context_map_plain_to_cypher(i as i32) as usize] as u64;
+        }
+        while ret & 1 == 0 {
+            ret = ret >> 1;
+        }
+    }
+    ret
+}
+
+pub fn decode_context_flags(flags: u64) -> [bool; 15] {
+    let mut plain = [false; 15];
+    let mut flags = flags;
+    for i in 0..15 {
+        if CONTEXT_COEFFICIENTS[i] < 2 {
+            continue;
+        }
+        let mut c = CONTEXT_COEFFICIENTS[i] as u64;
+        while c & 1 == 0 && c > 0 {
+            c = c >> 1;
+        }
+        if flags % c == 0 {
+            plain[context_map_cypher_to_plain(i as i32) as usize] = true;
+            flags = flags / c;
+        }
+    }
+    plain
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_encode_decode() {
+        let all_true: [bool; 15] = [true; 15];
+        let enc = encode_context_flags(&all_true);
+        // eprintln!("{:?}", enc);
+        let plain = decode_context_flags(enc);
+        // eprintln!("{:?}", plain);
+        for i in 0..15 {
+            if CONTEXT_MAP_CYPHER_TO_PLAIN[i] < 0 {
+                continue;
+            }
+            assert_eq!(plain[i], true);
+        }
+
+        let all_false: [bool; 15] = [false; 15];
+        let enc = encode_context_flags(&all_false);
+        // eprintln!("{:?}", enc);
+        let plain = decode_context_flags(enc);
+        // eprintln!("{:?}", plain);
+        for i in 0..15 {
+            if CONTEXT_MAP_CYPHER_TO_PLAIN[i] < 0 {
+                continue;
+            }
+            assert_eq!(plain[i], false);
+        }
+
+        let alternating: [bool; 15] = [
+            true, false, true, false, true, false, true, false, true, false, true, false, true, false, true,
+        ];
+        let enc = encode_context_flags(&alternating);
+        // eprintln!("{:?}", enc);
+        let plain = decode_context_flags(enc);
+        // eprintln!("{:?}", plain);
+        for i in 0..15 {
+            if CONTEXT_MAP_CYPHER_TO_PLAIN[i] < 0 {
+                continue;
+            }
+            assert_eq!(plain[i], i % 2 == 0);
+        }
+
+        let mod3: [bool; 15] = [
+            true, false, false, true, false, false, true, false, false, true, false, false, true, false, false,
+        ];
+        let enc = encode_context_flags(&mod3);
+        let plain = decode_context_flags(enc);
+        for i in 0..15 {
+            if CONTEXT_MAP_CYPHER_TO_PLAIN[i] < 0 {
+                continue;
+            }
+            assert_eq!(plain[i], i % 3 == 0);
+        }
+
+        let mod5: [bool; 15] = [
+            true, false, false, false, false, true, false, false, false, false, true, false, false, false, false,
+        ];
+        let enc = encode_context_flags(&mod5);
+        let plain = decode_context_flags(enc);
+        for i in 0..15 {
+            if CONTEXT_MAP_CYPHER_TO_PLAIN[i] < 0 {
+                continue;
+            }
+            assert_eq!(plain[i], i % 5 == 0);
+        }
+    }
+
+    #[test]
+    fn test_decode() {
+        let all_true: u64 = 0x178BA59576325029;
+        let plain = decode_context_flags(all_true);
+        for i in 0..15 {
+            if CONTEXT_COEFFICIENTS[i] < 2 {
+                assert_eq!(plain[i], false);
+            } else {
+                assert_eq!(plain[i], true);
+                if plain[i] {
+                    // eprintln!("{}: {}", i, CONTEXT_COEFFICIENTS[i]);
+                }
+            }
+        }
+
+        let alternating: u64 = 0x0000000EF0F42FA9;
+        let plain = decode_context_flags(alternating);
+        for i in 0..15 {
+            if CONTEXT_COEFFICIENTS[i] < 2 {
+                assert_eq!(plain[i], false);
+            } else {
+                assert_eq!(plain[i], i % 2 == 0);
+                if plain[i] {
+                    // eprintln!("{}: {}", i, CONTEXT_COEFFICIENTS[i]);
+                }
+            }
+        }
+
+        let mod3: u64 = 0x00000000005DCC45;
+        let plain = decode_context_flags(mod3);
+        for i in 0..15 {
+            if CONTEXT_COEFFICIENTS[i] < 2 {
+                assert_eq!(plain[i], false);
+            } else {
+                assert_eq!(plain[i], i % 3 == 0);
+                if plain[i] {
+                    // eprintln!("{}: {}", i, CONTEXT_COEFFICIENTS[i]);
+                }
+            }
+        }
+
+        let mod5: u64 = 0x0000000000000FF1;
+        let plain = decode_context_flags(mod5);
+        for i in 0..15 {
+            if CONTEXT_COEFFICIENTS[i] < 2 {
+                assert_eq!(plain[i], false);
+            } else {
+                assert_eq!(plain[i], i % 5 == 0);
+                if plain[i] {
+                    // eprintln!("{}: {}", i, CONTEXT_COEFFICIENTS[i]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_context_map() {
+        for i in 0..15 {
+            let p2c = CONTEXT_MAP_PLAIN_TO_CYPHER[i];
+            if (p2c) == -1 {
+                continue;
+            }
+            let c2p = CONTEXT_MAP_CYPHER_TO_PLAIN[p2c as usize];
+            assert_eq!(c2p, i as i32);
+        }
+    }
+
+    #[test]
+    fn test_context_map2() {
+        for i in 0..15 {
+            if i == 3 || i == 7 || i == 10 || i == 11 {
+                continue;
+            }
+            assert_eq!(i, context_map_cypher_to_plain(context_map_plain_to_cypher(i)));
+        }
     }
 }

@@ -53,19 +53,19 @@ CREATE INDEX user_id_idx ON sessions(user_id, replaced);
 -- Maps table
 CREATE TABLE maps (
     map_id SERIAL PRIMARY KEY,
-    uid VARCHAR(30) UNIQUE NOT NULL,
+    uid VARCHAR(30) NOT NULL,
     name VARCHAR(255) NOT NULL,
-    hash VARCHAR(32) UNIQUE NOT NULL,
+    hash VARCHAR(32) NOT NULL,
     load_count INTEGER NOT NULL DEFAULT 1,
     created_ts TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT NOW()
 );
-CREATE INDEX uid_idx ON maps(uid);
+CREATE INDEX uid_hash_idx ON maps(uid, hash);
 
 -- Contexts table
 CREATE TABLE contexts (
     context_id UUID PRIMARY KEY NOT NULL,
     session_token UUID REFERENCES sessions(session_token) NOT NULL UNIQUE,
-    is_editor BOOLEAN NOT NULL,
+    flags INTEGER[] NOT NULL,
     is_mt_editor BOOLEAN NOT NULL,
     is_playground BOOLEAN NOT NULL,
     is_solo BOOLEAN NOT NULL,
@@ -86,7 +86,7 @@ CREATE INDEX map_id_idx ON contexts(map_id, created_ts);
 -- Game cam nods table
 CREATE TABLE game_cam_nods (
     id SERIAL PRIMARY KEY,
-    context_id UUID REFERENCES contexts(context_id),
+    context_id UUID REFERENCES contexts(context_id) NOT NULL,
     raw BYTEA NOT NULL,
     init_byte SMALLINT NOT NULL,
     is_race_nod_null BOOLEAN NOT NULL,
@@ -102,8 +102,7 @@ CREATE INDEX flags_idx ON game_cam_nods(init_byte, is_race_nod_null, is_editor_c
 -- Position reports table
 CREATE TABLE position_reports (
     id SERIAL PRIMARY KEY,
-    session_token UUID REFERENCES sessions(session_token),
-    user_id UUID REFERENCES users(web_services_user_id),
+    session_token UUID REFERENCES sessions(session_token) NOT NULL,
     context_id UUID REFERENCES contexts(context_id),
     is_official BOOLEAN NOT NULL,
     x DOUBLE PRECISION NOT NULL,
@@ -112,8 +111,19 @@ CREATE TABLE position_reports (
     ts TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT NOW()
 );
 CREATE INDEX pr_session_token_idx ON position_reports(session_token, ts);
-CREATE INDEX pr_user_id_ts_idx ON position_reports(user_id, ts);
 CREATE INDEX pr_y_idx ON position_reports(y);
+
+CREATE TABLE vehicle_states (
+    id SERIAL PRIMARY KEY,
+    session_token UUID REFERENCES sessions(session_token) NOT NULL,
+    context_id UUID REFERENCES contexts(context_id),
+    is_official BOOLEAN NOT NULL,
+    pos FLOAT[] NOT NULL,
+    rotq FLOAT[] NOT NULL,
+    vel FLOAT[] NOT NULL,
+    ts TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT NOW()
+);
+CREATE INDEX vs_session_token_ts_idx ON vehicle_states(session_token, ts);
 
 -- Falls table
 CREATE TABLE falls (
@@ -139,6 +149,7 @@ CREATE INDEX falls_user_id_ts_idx on falls(user_id, ts);
 -- Stats table
 CREATE TABLE stats (
     user_id UUID REFERENCES users(web_services_user_id) NOT NULL,
+    seconds_spent_in_map INTEGER NOT NULL,
     nb_jumps INTEGER NOT NULL,
     nb_falls INTEGER NOT NULL,
     nb_floors_fallen INTEGER NOT NULL,
@@ -164,6 +175,7 @@ CREATE TABLE stats (
 CREATE TABLE stats_archive (
     id SERIAL PRIMARY KEY,
     user_id UUID REFERENCES users(web_services_user_id) NOT NULL,
+    seconds_spent_in_map INTEGER NOT NULL,
     nb_jumps INTEGER NOT NULL,
     nb_falls INTEGER NOT NULL,
     nb_floors_fallen INTEGER NOT NULL,
@@ -204,6 +216,7 @@ CREATE TABLE leaderboard_archive (
     ts TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT NOW(),
     PRIMARY KEY (user_id, ts)
 );
+CREATE INDEX lba_height_idx ON leaderboard_archive(height, ts);
 
 -- Friends table
 CREATE TABLE friends (
@@ -214,3 +227,43 @@ CREATE TABLE friends (
 );
 CREATE INDEX friends_user_id_idx ON friends(user_id, ts);
 CREATE INDEX friends_friend_id_idx ON friends(friend_id, ts);
+
+-- Respawns table
+CREATE TABLE respawns (
+    id SERIAL PRIMARY KEY,
+    session_token UUID REFERENCES sessions(session_token) NOT NULL,
+    race_time INTEGER NOT NULL,
+    ts TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT NOW()
+);
+CREATE INDEX respawns_session_token_ts_idx ON respawns(session_token, ts);
+
+-- Finishes table
+CREATE TABLE finishes (
+    id SERIAL PRIMARY KEY,
+    session_token UUID REFERENCES sessions(session_token) NOT NULL,
+    race_time INTEGER NOT NULL,
+    ts TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT NOW()
+);
+CREATE INDEX finishes_session_token_ts_idx ON finishes(session_token, ts);
+
+CREATE TABLE clip_submissions (
+    id SERIAL PRIMARY KEY,
+    user_id UUID REFERENCES users(web_services_user_id) NOT NULL,
+    clip_url VARCHAR(255) NOT NULL UNIQUE,
+    clip_start_time INTEGER NOT NULL DEFAULT -1,
+    clip_end_time INTEGER NOT NULL DEFAULT -1,
+    clip_description TEXT NOT NULL,
+    hidden BOOLEAN NOT NULL DEFAULT false,
+    ts TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT NOW()
+);
+CREATE INDEX clip_submissions_user_id_ts_idx ON clip_submissions(id, user_id, ts);
+CREATE UNIQUE INDEX clip_submissions_clip_url_idx ON clip_submissions(clip_url);
+
+CREATE TABLE clip_votes (
+    id SERIAL PRIMARY KEY,
+    clip_id INTEGER REFERENCES clip_submissions(id) NOT NULL,
+    user_id UUID REFERENCES users(web_services_user_id) NOT NULL,
+    vote INTEGER NOT NULL,
+    ts TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT NOW()
+);
+CREATE UNIQUE INDEX clip_votes_clip_id_idx ON clip_votes(clip_id, user_id);

@@ -1,4 +1,8 @@
 -- Add down migration script here
+drop table clip_votes;
+drop table clip_submissions;
+drop table finishes;
+drop table respawns;
 drop table friends;
 drop table leaderboard_archive;
 drop table leaderboard;

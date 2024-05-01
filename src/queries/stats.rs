@@ -1,13 +1,14 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use chrono::{DateTime, Utc};
-use log::warn;
+use log::{info, warn};
 use sqlx::{prelude::FromRow, query, query_as, types::Uuid, Pool, Postgres};
 
 use crate::router::Stats;
 
 pub async fn update_users_stats(pool: &Pool<Postgres>, user_id: &Uuid, stats: &Stats) -> Result<(), sqlx::Error> {
-    let r = query!("UPDATE stats SET nb_jumps = $1, nb_falls = $2, nb_floors_fallen = $3, last_pb_set_ts = $4, total_dist_fallen = $5, pb_height = $6, pb_floor = $7, nb_resets = $8, ggs_triggered = $9, title_gags_triggered = $10, title_gags_special_triggered = $11, bye_byes_triggered = $12, monument_triggers = $13, reached_floor_count = $14, floor_voice_lines_played = $15, update_count = update_count + 1, ts = NOW() WHERE user_id = $16 RETURNING update_count;",
+    info!("Updating stats for user {:?}: {:#?}", user_id, stats);
+    let r = query!("UPDATE stats SET nb_jumps = $1, nb_falls = $2, nb_floors_fallen = $3, last_pb_set_ts = $4, total_dist_fallen = $5, pb_height = $6, pb_floor = $7, nb_resets = $8, ggs_triggered = $9, title_gags_triggered = $10, title_gags_special_triggered = $11, bye_byes_triggered = $12, monument_triggers = $13, reached_floor_count = $14, floor_voice_lines_played = $15, seconds_spent_in_map = $16, update_count = update_count + 1, ts = NOW() WHERE user_id = $17 RETURNING update_count;",
         stats.nb_jumps as i32,
         stats.nb_falls as i32,
         stats.nb_floors_fallen as i32,
@@ -23,21 +24,23 @@ pub async fn update_users_stats(pool: &Pool<Postgres>, user_id: &Uuid, stats: &S
         stats.monument_triggers,
         stats.reached_floor_count,
         stats.floor_voice_lines_played,
+        stats.seconds_spent_in_map,
         user_id
     ).fetch_one(pool).await;
     match r {
         Ok(r) => {
-            if (r.update_count + 28) % 30 == 0 {
+            if (r.update_count + 18) % 20 == 0 {
                 // insert into stats_archive
-                query!("INSERT INTO stats_archive (user_id, nb_jumps, nb_falls, nb_floors_fallen, last_pb_set_ts, total_dist_fallen, pb_height, pb_floor, nb_resets, ggs_triggered, title_gags_triggered, title_gags_special_triggered, bye_byes_triggered, monument_triggers, reached_floor_count, floor_voice_lines_played, update_count)
-                    SELECT user_id, nb_jumps, nb_falls, nb_floors_fallen, last_pb_set_ts, total_dist_fallen, pb_height, pb_floor, nb_resets, ggs_triggered, title_gags_triggered, title_gags_special_triggered, bye_byes_triggered, monument_triggers, reached_floor_count, floor_voice_lines_played, update_count
+                query!("INSERT INTO stats_archive (user_id, seconds_spent_in_map, nb_jumps, nb_falls, nb_floors_fallen, last_pb_set_ts, total_dist_fallen, pb_height, pb_floor, nb_resets, ggs_triggered, title_gags_triggered, title_gags_special_triggered, bye_byes_triggered, monument_triggers, reached_floor_count, floor_voice_lines_played, update_count)
+                    SELECT user_id, seconds_spent_in_map, nb_jumps, nb_falls, nb_floors_fallen, last_pb_set_ts, total_dist_fallen, pb_height, pb_floor, nb_resets, ggs_triggered, title_gags_triggered, title_gags_special_triggered, bye_byes_triggered, monument_triggers, reached_floor_count, floor_voice_lines_played, update_count
                     FROM stats WHERE user_id = $1;", user_id).execute(pool).await?;
             }
             Ok(())
         }
         Err(sqlx::Error::RowNotFound) => {
-            query!("INSERT INTO stats (user_id, nb_jumps, nb_falls, nb_floors_fallen, last_pb_set_ts, total_dist_fallen, pb_height, pb_floor, nb_resets, ggs_triggered, title_gags_triggered, title_gags_special_triggered, bye_byes_triggered, monument_triggers, reached_floor_count, floor_voice_lines_played) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16);",
+            query!("INSERT INTO stats (user_id, seconds_spent_in_map, nb_jumps, nb_falls, nb_floors_fallen, last_pb_set_ts, total_dist_fallen, pb_height, pb_floor, nb_resets, ggs_triggered, title_gags_triggered, title_gags_special_triggered, bye_byes_triggered, monument_triggers, reached_floor_count, floor_voice_lines_played) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17);",
                 user_id,
+                stats.seconds_spent_in_map,
                 stats.nb_jumps as i32,
                 stats.nb_falls as i32,
                 stats.nb_floors_fallen as i32,
@@ -81,6 +84,29 @@ CREATE TABLE falls (
 );
 */
 
+pub async fn insert_start_fall(
+    pool: &Pool<Postgres>,
+    user_id: &Uuid,
+    session_id: &Uuid,
+    start_floor: i32,
+    start_pos: (f32, f32, f32),
+    start_speed: f32,
+    start_time: i32,
+) -> Result<(), sqlx::Error> {
+    query!(
+        "INSERT INTO falls (session_token, user_id, start_floor, start_pos_x, start_pos_y, start_pos_z, start_speed, start_time) VALUES ($1, $2, $3, $4, $5, $6, $7, $8);",
+        session_id,
+        user_id,
+        start_floor,
+        start_pos.0 as f64,
+        start_pos.1 as f64,
+        start_pos.2 as f64,
+        start_speed as f64,
+        start_time,
+    ).execute(pool).await?;
+    Ok(())
+}
+
 pub async fn update_fall_with_end(
     pool: &Pool<Postgres>,
     user_id: &Uuid,
@@ -113,5 +139,27 @@ pub async fn update_fall_with_end(
     .execute(pool)
     .await?;
 
+    Ok(())
+}
+
+pub async fn insert_respawn(pool: &Pool<Postgres>, session_id: &Uuid, race_time: i32) -> Result<(), sqlx::Error> {
+    query!(
+        "INSERT INTO respawns (session_token, race_time) VALUES ($1, $2);",
+        session_id,
+        race_time
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn insert_finish(pool: &Pool<Postgres>, session_id: &Uuid, race_time: i32) -> Result<(), sqlx::Error> {
+    query!(
+        "INSERT INTO finishes (session_token, race_time) VALUES ($1, $2);",
+        session_id,
+        race_time
+    )
+    .execute(pool)
+    .await?;
     Ok(())
 }

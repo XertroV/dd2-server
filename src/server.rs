@@ -21,6 +21,8 @@ use tokio::{
 
 use crate::op_auth::init_op_config;
 
+mod api_error;
+mod consts;
 mod db;
 mod op_auth;
 mod player;
@@ -138,6 +140,9 @@ impl PlayerMgr {
                         ToPlayerMgr::AuthFailed() => {
                             error!("Auth failed");
                         }
+                        ToPlayerMgr::SocketError() => {
+                            warn!("Socket error");
+                        }
                     },
                     None => {
                         break;
@@ -170,4 +175,5 @@ pub struct PlayerMgrState {
 pub enum ToPlayerMgr {
     RecheckRecords(),
     AuthFailed(),
+    SocketError(),
 }
