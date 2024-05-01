@@ -44,6 +44,7 @@ CREATE TABLE sessions (
     plugin_info_id INTEGER REFERENCES plugin_infos(id) NOT NULL,
     game_info_id INTEGER REFERENCES game_infos(id) NOT NULL,
     gamer_info_id INTEGER REFERENCES gamer_infos(id) NOT NULL,
+    ip_address VARCHAR(39) NOT NULL,
     replaced BOOLEAN NOT NULL DEFAULT false,
     ended_ts TIMESTAMP WITHOUT TIME ZONE
 );

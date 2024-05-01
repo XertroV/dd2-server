@@ -32,10 +32,11 @@ pub struct Player {
     session: OnceCell<LoginSession>,
     context: Mutex<Option<PlayerCtx>>,
     context_id: Mutex<Option<Uuid>>,
+    ip_address: String,
 }
 
 impl Player {
-    pub fn new(tx_mgr: UnboundedSender<ToPlayerMgr>) -> Self {
+    pub fn new(tx_mgr: UnboundedSender<ToPlayerMgr>, ip_address: String) -> Self {
         let (tx, rx) = unbounded_channel();
         let (queue_tx, queue_rx) = unbounded_channel();
         Player {
@@ -49,6 +50,7 @@ impl Player {
             session: OnceCell::new(),
             context: Mutex::new(None),
             context_id: Mutex::new(None),
+            ip_address,
         }
     }
 
@@ -160,7 +162,7 @@ impl Player {
             }
         };
         let user = register_or_login(&pool, &wsid, &token_resp.display_name).await?;
-        let session = create_session(&pool, user.id(), &plugin_info, &game_info, &gamer_info).await?;
+        let session = create_session(&pool, user.id(), &plugin_info, &game_info, &gamer_info, &p.ip_address).await?;
         Ok(LoginSession {
             user,
             session,
@@ -183,7 +185,7 @@ impl Player {
             }
         };
         // check for sesison and resume
-        let (s, u) = resume_session(&pool, &session_token, &plugin_info, &game_info, &gamer_info).await?;
+        let (s, u) = resume_session(&pool, &session_token, &plugin_info, &game_info, &gamer_info, &p.ip_address).await?;
         Ok(LoginSession {
             user: u,
             session: s,
@@ -339,13 +341,21 @@ impl Player {
 
     pub async fn on_report_gcnod_msg(pool: &Pool<Postgres>, p: Arc<Player>, data: &str) -> Result<(), Error> {
         // decode base64
-        let x = base64::prelude::BASE64_STANDARD.decode(data)?;
+
+        let x = if data.len() < 0x2E0 {
+            data.into()
+        } else {
+            base64::prelude::BASE64_URL_SAFE.decode(data).unwrap_or(data.into())
+        };
+
         match p.context_id.lock().await.as_ref() {
             Some(ctx_id) => {
                 insert_gc_nod(pool, p.get_session().session_id(), ctx_id, &x).await?;
             }
             None => {
-                warn!("GCNod message without context");
+                if (data.len() > 0x20) {
+                    warn!("GCNod message without context");
+                }
             }
         };
         Ok(())

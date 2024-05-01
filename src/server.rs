@@ -88,8 +88,15 @@ async fn run_connection(
 ) {
     info!("New connection from {:?}", stream.peer_addr().unwrap());
     let r = stream.ready(Interest::READABLE | Interest::WRITABLE).await.unwrap();
+    let ip_address = match stream.peer_addr() {
+        Ok(addr) => addr.ip().to_string(),
+        Err(_) => {
+            warn!("Failed to get peer address: {:?}", stream);
+            return;
+        }
+    };
     info!("Ready: {:?}", r);
-    let p = Player::new(player_mgr_tx);
+    let p = Player::new(player_mgr_tx, ip_address);
     player_mgr.add_player(pool, p, stream).await;
 }
 

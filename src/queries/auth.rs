@@ -22,6 +22,7 @@ pub async fn create_session(
     plugin_info: &str,
     game_info: &str,
     gamer_info: &str,
+    ip_address: &str,
 ) -> Result<Session, sqlx::Error> {
     let session_token = Uuid::now_v7();
 
@@ -30,12 +31,13 @@ pub async fn create_session(
     let gri_id = select_or_insert_gamer_info(pool, gamer_info).await?;
 
     let r = query!(
-        "INSERT INTO sessions (session_token, user_id, plugin_info_id, game_info_id, gamer_info_id) VALUES ($1, $2, $3, $4, $5) RETURNING session_token;",
+        "INSERT INTO sessions (session_token, user_id, plugin_info_id, game_info_id, gamer_info_id, ip_address) VALUES ($1, $2, $3, $4, $5, $6) RETURNING session_token;",
         session_token,
         user_id,
         pi_id,
         gi_id,
-        gri_id
+        gri_id,
+        &ip_address[..ip_address.len().min(39)],
     )
     .fetch_one(pool)
     .await?;
@@ -110,6 +112,7 @@ pub async fn resume_session(
     plugin_info: &str,
     game_info: &str,
     gamer_info: &str,
+    ip_address: &str,
 ) -> Result<(Session, User), sqlx::Error> {
     let user = query_as!(
         User,
@@ -124,7 +127,10 @@ pub async fn resume_session(
         .execute(pool)
         .await?;
 
-    Ok((create_session(pool, user.id(), plugin_info, game_info, gamer_info).await?, user))
+    Ok((
+        create_session(pool, user.id(), plugin_info, game_info, gamer_info, ip_address).await?,
+        user,
+    ))
 }
 
 pub async fn register_or_login(pool: &Pool<Postgres>, account_id: &Uuid, display_name: &str) -> Result<User, sqlx::Error> {
