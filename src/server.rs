@@ -19,7 +19,7 @@ use tokio::{
     sync::Mutex,
 };
 
-use crate::{http::run_http_server, op_auth::init_op_config};
+use crate::{consts::DD2_MAP_UID, http::run_http_server, op_auth::init_op_config};
 
 mod api_error;
 mod consts;
@@ -34,6 +34,8 @@ mod router;
 async fn main() {
     dotenv().ok();
     env_logger::Builder::from_env(Env::default().default_filter_or("info")).init();
+
+    info!("Starting DD2 Server for UID: {}", DD2_MAP_UID);
 
     // init db from env var
     let db_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
@@ -58,8 +60,8 @@ async fn main() {
     let bind_addr = "0.0.0.0:17677";
     warn!("Starting server on: {}", bind_addr);
     tokio::select! {
+        _ = run_http_server(db.clone()) => {},
         _ = listen(bind_addr, db.clone()) => {},
-        _ = run_http_server(db) => {},
     };
 }
 
@@ -71,6 +73,7 @@ async fn listen(bind_addr: &str, pool: Arc<Pool<Postgres>>) {
     PlayerMgr::start(player_mgr.clone());
     loop {
         let (stream, _) = listener.accept().await.unwrap();
+        info!("New connection from {:?}", stream.peer_addr().unwrap());
         let player_mgr = player_mgr.clone();
         let player_mgr_tx = player_mgr_tx.clone();
         let pool = pool.clone();
@@ -86,7 +89,6 @@ async fn run_connection(
     player_mgr: Arc<PlayerMgr>,
     player_mgr_tx: UnboundedSender<ToPlayerMgr>,
 ) {
-    info!("New connection from {:?}", stream.peer_addr().unwrap());
     let r = stream.ready(Interest::READABLE | Interest::WRITABLE).await.unwrap();
     let ip_address = match stream.peer_addr() {
         Ok(addr) => addr.ip().to_string(),

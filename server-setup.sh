@@ -19,7 +19,7 @@ sudo apt-get update
 
 sudo apt-get install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin -y
 
-sudo apt-get install dotnet-runtime-8.0 postgresql-client -y
+sudo apt-get install dotnet-runtime-8.0 postgresql-client openssl -y
 
 
 # firewall
@@ -29,7 +29,9 @@ ufw allow 22
 ufw allow 80/tcp
 ufw allow 443/tcp
 ufw allow 17677/tcp
-echo -n 'y' > ufw enable || ufw reload
+ufw allow 27677/tcp
+ufw allow 19796/tcp
+ufw enable || ufw reload | tee /dev/null
 
 PG_PASSWORD="$(openssl rand -hex 20)"
 # check for .pg_password
@@ -50,11 +52,11 @@ fi
     ./restart_quiet.sh
 )
 
-echo "DATABASE_URL=postgresql://postgres:$PG_PASSWORD@localhost:5432/deepdip2" > .env
+echo "DATABASE_URL=postgresql://postgres:$PG_PASSWORD@localhost:5432/postgres" > .env
 chmod 600 .env
 
 echo "127.0.0.1:5432::postgres:$PG_PASSWORD" > ~/.pgpass
 chmod 600 ~/.pgpass
 
 
-psql -U postgres -h localhost -c "CREATE DATABASE deepdip2;"
+psql -U postgres -h 127.0.0.1 -c "CREATE DATABASE deepdip2;"

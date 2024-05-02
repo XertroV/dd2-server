@@ -96,6 +96,9 @@ pub enum Request {
     // ReportMapLoad {
     //     uid: String,
     // } = 38,
+    ReportPBHeight {
+        h: f32,
+    } = 39,
     GetMyStats {} = 128,
     GetGlobalLB {} = 129,
     GetFriendsLB {
@@ -120,6 +123,7 @@ impl Request {
             Request::ReportFallEnd { .. } => 36,
             Request::ReportStats { .. } => 37,
             // Request::ReportMapLoad { .. } => 38,
+            Request::ReportPBHeight { .. } => 39,
             Request::GetMyStats { .. } => 128,
             Request::GetGlobalLB { .. } => 129,
             Request::GetFriendsLB { .. } => 130,
@@ -141,6 +145,7 @@ impl Request {
             Request::ReportFallEnd { .. } => "ReportFallEnd",
             Request::ReportStats { .. } => "ReportStats",
             // Request::ReportMapLoad { .. } => "ReportMapLoad",
+            Request::ReportPBHeight { .. } => "ReportPBHeight",
             Request::GetMyStats { .. } => "GetMyStats",
             Request::GetGlobalLB { .. } => "GetGlobalLB",
             Request::GetFriendsLB { .. } => "GetFriendsLB",

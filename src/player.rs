@@ -16,7 +16,8 @@ use crate::consts::DD2_MAP_UID;
 use crate::op_auth::{check_token, TokenResp};
 use crate::queries::{
     context_mark_succeeded, create_session, insert_context, insert_context_packed, insert_finish, insert_gc_nod, insert_respawn,
-    insert_start_fall, insert_vehicle_state, register_or_login, resume_session, update_fall_with_end, update_users_stats, Session, User,
+    insert_start_fall, insert_vehicle_state, register_or_login, resume_session, update_fall_with_end, update_user_pb_height,
+    update_users_stats, Session, User,
 };
 use crate::router::{write_response, Map, PlayerCtx, Request, Response, Stats};
 use crate::ToPlayerMgr;
@@ -56,6 +57,18 @@ impl Player {
 
     pub fn get_session(&self) -> &LoginSession {
         self.session.get().unwrap()
+    }
+
+    pub fn display_name(&self) -> &str {
+        self.get_session().display_name()
+    }
+
+    pub fn user_id(&self) -> &Uuid {
+        self.get_session().user_id()
+    }
+
+    pub fn session_id(&self) -> &Uuid {
+        self.get_session().session_id()
     }
 
     pub fn is_connected(&self) -> bool {
@@ -250,6 +263,7 @@ impl Player {
                     }
                     Request::ReportStats { stats } => Player::on_report_stats(&pool, p.clone(), stats).await,
                     // Request::ReportMapLoad { uid } => Player::on_report_map_load(&pool, p.clone(), &uid).await,
+                    Request::ReportPBHeight { h } => Player::on_report_pb_height(&pool, p.clone(), h).await,
                     Request::GetMyStats {} => todo!(),
                     Request::GetGlobalLB {} => todo!(),
                     Request::GetFriendsLB { friends } => todo!(),
@@ -373,6 +387,45 @@ impl Player {
 
     pub async fn on_report_stats(pool: &Pool<Postgres>, p: Arc<Player>, stats: Stats) -> Result<(), Error> {
         Ok(update_users_stats(pool, p.get_session().user_id(), &stats).await?)
+    }
+
+    pub async fn on_report_pb_height(pool: &Pool<Postgres>, p: Arc<Player>, h: f32) -> Result<(), Error> {
+        if !p.context.lock().await.as_ref().map(|c| c.is_official()).unwrap_or(false) {
+            let lock = p.context.lock().await;
+            match lock.as_ref() {
+                None => warn!("Dropping PB height b/c no context"),
+                Some(ctx) => {
+                    info!("context: {:?}", ctx);
+                    match ctx.map.as_ref() {
+                        None => warn!("Dropping PB height b/c no map"),
+                        Some(map) => {
+                            if map.uid != DD2_MAP_UID {
+                                warn!("Dropping PB height b/c not DD2; user: {}", p.get_session().display_name());
+                                return Ok(());
+                            } else {
+                                if !check_flags_sf_mi(ctx.sf, ctx.mi) {
+                                    warn!("Dropping PB height b/c invalid sf/mi; user: {}", p.get_session().display_name());
+                                    return Ok(());
+                                } else {
+                                    if !ctx.is_official() {
+                                        warn!("Dropping PB height b/c not official; user: {}", p.get_session().display_name());
+                                        return Ok(());
+                                    } else {
+                                        warn!("Dropping PB height b/c unknown reason; user: {}", p.get_session().display_name());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            // let uid = ;
+            warn!("Dropping PB height b/c not official; user: {}", p.display_name());
+            return Ok(());
+        }
+        update_user_pb_height(pool, p.get_session().user_id(), h as f64).await?;
+        info!("updated user pb height: {}: {}", p.display_name(), h);
+        Ok(())
     }
 
     pub async fn on_report_fall_start(

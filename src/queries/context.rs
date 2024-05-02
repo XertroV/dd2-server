@@ -117,9 +117,9 @@ async fn insert_map(pool: &Pool<Postgres>, uid: &str, name: &str, hash: &str) ->
     let h = match hash.len() == 64 {
         true => match hex::decode(hash) {
             Ok(h) => h,
-            Err(e) => hash[0..32].into(),
+            Err(e) => hash[0..hash.len().min(32)].into(),
         },
-        false => hash[..32].into(),
+        false => hash[..hash.len().min(32)].into(),
     };
     let r = query!(
         "INSERT INTO maps (uid, name, hash) VALUES ($1, $2, $3) RETURNING map_id;",
@@ -157,11 +157,16 @@ CREATE INDEX flags_idx ON game_cam_nods(init_byte, is_race_nod_null, is_editor_c
 */
 
 pub async fn insert_gc_nod(pool: &Pool<Postgres>, session_id: &Uuid, context_id: &Uuid, nod: &[u8]) -> Result<(), sqlx::Error> {
-    let init_byte = nod[0] as u8;
-    let is_race_nod_null = nod[0x70..0x78] == [0; 8];
-    let is_editor_cam_null = nod[0x80..0x88] == [0; 8];
-    let is_race_88_null = nod[0x88..0x90] == [0; 8];
-    let is_cam_1a8_16 = nod[0x1a8] == 0x16;
+    let (init_byte, is_race_nod_null, is_editor_cam_null, is_race_88_null, is_cam_1a8_16) = match nod.len() < 0x2C0 {
+        true => (0, true, true, true, false),
+        false => (
+            nod[0] as u8,
+            nod[0x70..0x78] == [0; 8],
+            nod[0x80..0x88] == [0; 8],
+            nod[0x88..0x90] == [0; 8],
+            nod[0x1a8] == 0x16,
+        ),
+    };
     query!(
         "INSERT INTO game_cam_nods (session_token, context_id, raw, init_byte, is_race_nod_null, is_editor_cam_null, is_race_88_null, is_cam_1a8_16) VALUES ($1, $2, $3, $4, $5, $6, $7, $8);",
         session_id,

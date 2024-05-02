@@ -13,7 +13,7 @@ services:
     #      size: 134217728 # 128*2^20 bytes = 128Mb
     environment:
       POSTGRES_PASSWORD: examplePgPassword1234
-      POSTGERS_DB: deepdip2
+      POSTGERS_DB: postgres
       POSTGRES_USER: postgres
     # healthcheck:
     #   test: [ “CMD-SHELL”, “pg_isready” ]
@@ -29,4 +29,4 @@ services:
     image: adminer
     restart: always
     ports:
-      - 8080:8080
+      - 48080:8080

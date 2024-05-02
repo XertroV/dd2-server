@@ -20,7 +20,7 @@ pub async fn log_ml_ping(pool: &Pool<Postgres>, ip_v4: &str, ip_v6: &str, is_int
 }
 
 pub async fn update_users_stats(pool: &Pool<Postgres>, user_id: &Uuid, stats: &Stats) -> Result<(), sqlx::Error> {
-    info!("Updating stats for user {:?}: {:#?}", user_id, stats);
+    info!("Updating stats for user {:?}", user_id);
     let r = query!("UPDATE stats SET nb_jumps = $1, nb_falls = $2, nb_floors_fallen = $3, last_pb_set_ts = $4, total_dist_fallen = $5, pb_height = $6, pb_floor = $7, nb_resets = $8, ggs_triggered = $9, title_gags_triggered = $10, title_gags_special_triggered = $11, bye_byes_triggered = $12, monument_triggers = $13, reached_floor_count = $14, floor_voice_lines_played = $15, seconds_spent_in_map = $16, update_count = update_count + 1, ts = NOW() WHERE user_id = $17 RETURNING update_count;",
         stats.nb_jumps as i32,
         stats.nb_falls as i32,
@@ -42,10 +42,10 @@ pub async fn update_users_stats(pool: &Pool<Postgres>, user_id: &Uuid, stats: &S
     ).fetch_one(pool).await;
     match r {
         Ok(r) => {
-            if (r.update_count + 18) % 20 == 0 {
+            if (r.update_count + 8) % 10 == 0 {
                 // insert into stats_archive
-                query!("INSERT INTO stats_archive (user_id, seconds_spent_in_map, nb_jumps, nb_falls, nb_floors_fallen, last_pb_set_ts, total_dist_fallen, pb_height, pb_floor, nb_resets, ggs_triggered, title_gags_triggered, title_gags_special_triggered, bye_byes_triggered, monument_triggers, reached_floor_count, floor_voice_lines_played, update_count)
-                    SELECT user_id, seconds_spent_in_map, nb_jumps, nb_falls, nb_floors_fallen, last_pb_set_ts, total_dist_fallen, pb_height, pb_floor, nb_resets, ggs_triggered, title_gags_triggered, title_gags_special_triggered, bye_byes_triggered, monument_triggers, reached_floor_count, floor_voice_lines_played, update_count
+                query!("INSERT INTO stats_archive (user_id, seconds_spent_in_map, nb_jumps, nb_falls, nb_floors_fallen, last_pb_set_ts, total_dist_fallen, pb_height, pb_floor, nb_resets, ggs_triggered, title_gags_triggered, title_gags_special_triggered, bye_byes_triggered, monument_triggers, reached_floor_count, floor_voice_lines_played, update_count, rank_at_time)
+                    SELECT user_id, seconds_spent_in_map, nb_jumps, nb_falls, nb_floors_fallen, last_pb_set_ts, total_dist_fallen, pb_height, pb_floor, nb_resets, ggs_triggered, title_gags_triggered, title_gags_special_triggered, bye_byes_triggered, monument_triggers, reached_floor_count, floor_voice_lines_played, update_count, rank() over (ORDER BY pb_height DESC) as rank_at_time
                     FROM stats WHERE user_id = $1;", user_id).execute(pool).await?;
             }
             Ok(())
@@ -177,20 +177,6 @@ pub async fn insert_finish(pool: &Pool<Postgres>, session_id: &Uuid, race_time: 
     Ok(())
 }
 
-/*
-
-CREATE TABLE vehicle_states (
-    id SERIAL PRIMARY KEY,
-    session_token UUID REFERENCES sessions(session_token) NOT NULL,
-    context_id UUID REFERENCES contexts(context_id),
-    is_official BOOLEAN NOT NULL,
-    pos FLOAT[] NOT NULL,
-    rotq FLOAT[] NOT NULL,
-    vel FLOAT[] NOT NULL,
-    ts TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT NOW()
-);
-*/
-
 pub async fn insert_vehicle_state(
     pool: &Pool<Postgres>,
     session_id: &Uuid,
@@ -212,4 +198,38 @@ pub async fn insert_vehicle_state(
     .execute(pool)
     .await?;
     Ok(())
+}
+
+pub async fn update_user_pb_height(pool: &Pool<Postgres>, user_id: &Uuid, height: f64) -> Result<(), sqlx::Error> {
+    return match query!("SELECT height FROM leaderboard WHERE user_id = $1;", user_id)
+        .fetch_one(pool)
+        .await
+    {
+        Ok(r) => {
+            if r.height < height {
+                let uc = query!(
+                    "UPDATE leaderboard SET height = $1, ts = NOW(), update_count = update_count + 1 WHERE user_id = $2 RETURNING update_count;",
+                    height,
+                    user_id
+                )
+                .fetch_one(pool)
+                .await?;
+                if uc.update_count + 2 % 10 == 0 {
+                    query!("INSERT INTO leaderboard_archive (user_id, height, rank_at_time) SELECT user_id, height, rank() over (ORDER BY height DESC) as rank_at_time FROM leaderboard WHERE user_id = $1;", user_id).execute(pool).await?;
+                }
+            }
+            Ok(())
+        }
+        Err(sqlx::Error::RowNotFound) => {
+            query!(
+                "INSERT INTO leaderboard (user_id, height, ts) VALUES ($1, $2, NOW());",
+                user_id,
+                height
+            )
+            .execute(pool)
+            .await?;
+            Ok(())
+        }
+        Err(e) => Err(e),
+    };
 }
