@@ -386,6 +386,7 @@ pub struct LeaderboardEntry {
     pub wsid: String,
     pub height: f32,
     pub ts: u32,
+    pub name: String,
 }
 
 pub async fn write_response(stream: &mut OwnedWriteHalf, resp: Response) -> io::Result<()> {

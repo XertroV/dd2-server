@@ -283,6 +283,7 @@ pub struct LBEntry {
     pub height: f64,
     pub rank: Option<i64>,
     pub ts: NaiveDateTime,
+    pub display_name: Option<String>,
 }
 impl Into<LeaderboardEntry> for LBEntry {
     fn into(self) -> LeaderboardEntry {
@@ -291,6 +292,7 @@ impl Into<LeaderboardEntry> for LBEntry {
             height: self.height as f32,
             rank: self.rank.unwrap_or(99999) as u32,
             ts: self.ts.and_utc().timestamp() as u32,
+            name: self.display_name.unwrap_or_else(|| "?".to_string()),
         }
     }
 }
@@ -300,48 +302,57 @@ pub async fn get_global_lb(pool: &Pool<Postgres>, start: i32, end: i32) -> Resul
         return Ok(vec![]);
     }
     let limit = end - start + 1;
-    let r = query_as!(
-        LBEntry,
-        "SELECT user_id as wsid, height, ts, rank() over (ORDER BY height DESC) as rank FROM leaderboard LIMIT $1 OFFSET $2;",
+    let r = query!(
+        "SELECT user_id as wsid, height, ts, rank, display_name FROM ranked_lb_view LIMIT $1 OFFSET $2;",
         limit as i32,
         start as i32
     )
     .fetch_all(pool)
     .await?;
-    Ok(r)
+    Ok(r.into_iter()
+        .map(|e| LBEntry {
+            wsid: e.wsid.unwrap(),
+            height: e.height.unwrap(),
+            rank: e.rank,
+            ts: e.ts.unwrap(),
+            display_name: e.display_name,
+        })
+        .collect())
 }
 
-pub async get_user_in_lb(pool: &Pool<Postgres>, user_id: &Uuid) -> Result<Option<LBEntry>, sqlx::Error> {
-    let r = query_as!(
-        LBEntry,
+pub async fn get_user_in_lb(pool: &Pool<Postgres>, user_id: &Uuid) -> Result<Option<LBEntry>, sqlx::Error> {
+    let r = query!(
         r#"--sql
-        query!(r#"--sql
-                    WITH ranked_leaderboard AS (
-                        SELECT
-                            user_id as wsid,
-                            height,
-                            ts,
-                            rank() OVER (ORDER BY height DESC) AS global_rank
-                        FROM
-                            leaderboard
-                    )
-                    SELECT user_id as wsid, height, ts, global_rank FROM ranked_leaderboard WHERE user_id = $1;"#,
+        SELECT user_id as wsid, height, ts, rank, display_name FROM ranked_lb_view WHERE user_id = $1;"#,
         user_id
     )
     .fetch_optional(pool)
     .await?;
-    Ok(r)
+    Ok(r.map(|e| LBEntry {
+        wsid: e.wsid.unwrap(),
+        height: e.height.unwrap(),
+        rank: e.rank,
+        ts: e.ts.unwrap(),
+        display_name: e.display_name,
+    }))
 }
 
 pub async fn get_friends_lb(pool: &Pool<Postgres>, user_id: &Uuid, friends: &[Uuid]) -> Result<Vec<LBEntry>, sqlx::Error> {
-    let r = query_as!(
-        LBEntry,
-        "SELECT user_id as wsid, height, ts, rank() over (ORDER BY height DESC) as rank FROM leaderboard WHERE user_id = ANY($1) ORDER BY height DESC;",
+    let r = query!(
+        "SELECT user_id as wsid, height, ts, rank, display_name FROM ranked_lb_view WHERE user_id = ANY($1) ORDER BY height DESC;",
         friends
     )
     .fetch_all(pool)
     .await?;
-    Ok(r)
+    Ok(r.into_iter()
+        .map(|e| LBEntry {
+            wsid: e.wsid.unwrap(),
+            height: e.height.unwrap(),
+            rank: e.rank,
+            ts: e.ts.unwrap(),
+            display_name: e.display_name,
+        })
+        .collect())
 }
 
 pub async fn get_global_overview(pool: &Pool<Postgres>) -> Result<serde_json::Value, sqlx::Error> {
