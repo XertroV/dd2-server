@@ -100,10 +100,15 @@ pub enum Request {
         h: f32,
     } = 39,
     GetMyStats {} = 128,
-    GetGlobalLB {} = 129,
+    GetGlobalLB {
+        start: u32,
+        end: u32,
+    } = 129,
     GetFriendsLB {
         friends: Vec<String>,
     } = 130,
+    GetGlobalOverview {} = 131,
+    GetServerStats {} = 132,
 
     StressMe {} = 255,
 }
@@ -127,6 +132,8 @@ impl Request {
             Request::GetMyStats { .. } => 128,
             Request::GetGlobalLB { .. } => 129,
             Request::GetFriendsLB { .. } => 130,
+            Request::GetGlobalOverview {} => 131,
+            Request::GetServerStats {} => 132,
             Request::StressMe { .. } => 255,
         }
     }
@@ -149,6 +156,8 @@ impl Request {
             Request::GetMyStats { .. } => "GetMyStats",
             Request::GetGlobalLB { .. } => "GetGlobalLB",
             Request::GetFriendsLB { .. } => "GetFriendsLB",
+            Request::GetGlobalOverview {} => "GetGlobalOverview",
+            Request::GetServerStats {} => "GetServerStats",
             Request::StressMe { .. } => "StressMe",
         }
     }
@@ -283,12 +292,23 @@ pub enum Response {
 
     Stats {
         stats: Stats,
+        rank: u32,
     },
     GlobalLB {
         entries: Vec<LeaderboardEntry>,
     },
     FriendsLB {
         entries: Vec<LeaderboardEntry>,
+    },
+    GlobalOverview {
+        j: JsonValue, // players: u32,
+                      // sessions: u32,
+                      // resets: u32,
+                      // jumps: u32,
+                      // map_loads: u32,
+                      // falls: u32,
+                      // floors_fallen: u32,
+                      // height_fallen: u32,
     },
 }
 
@@ -304,6 +324,7 @@ impl Response {
             Response::Stats { .. } => 128,
             Response::GlobalLB { .. } => 129,
             Response::FriendsLB { .. } => 130,
+            Response::GlobalOverview { .. } => 131,
         }
     }
 
@@ -318,6 +339,7 @@ impl Response {
             Response::Stats { .. } => "Stats",
             Response::GlobalLB { .. } => "GlobalLB",
             Response::FriendsLB { .. } => "FriendsLB",
+            Response::GlobalOverview { .. } => "GlobalOverview",
         }
     }
 
@@ -368,11 +390,10 @@ pub struct Stats {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LeaderboardEntry {
-    rank: u32,
-    name: String,
-    wsid: String,
-    height: f32,
-    ts: u32,
+    pub rank: u32,
+    pub wsid: String,
+    pub height: f32,
+    pub ts: u32,
 }
 
 pub async fn write_response(stream: &mut OwnedWriteHalf, resp: Response) -> io::Result<()> {

@@ -15,9 +15,9 @@ use crate::api_error::Error;
 use crate::consts::DD2_MAP_UID;
 use crate::op_auth::{check_token, TokenResp};
 use crate::queries::{
-    context_mark_succeeded, create_session, insert_context, insert_context_packed, insert_finish, insert_gc_nod, insert_respawn,
-    insert_start_fall, insert_vehicle_state, register_or_login, resume_session, update_fall_with_end, update_user_pb_height,
-    update_users_stats, Session, User,
+    self, context_mark_succeeded, create_session, get_user_stats, insert_context, insert_context_packed, insert_finish, insert_gc_nod,
+    insert_respawn, insert_start_fall, insert_vehicle_state, register_or_login, resume_session, update_fall_with_end,
+    update_user_pb_height, update_users_stats, Session, User,
 };
 use crate::router::{write_response, Map, PlayerCtx, Request, Response, Stats};
 use crate::ToPlayerMgr;
@@ -264,9 +264,11 @@ impl Player {
                     Request::ReportStats { stats } => Player::on_report_stats(&pool, p.clone(), stats).await,
                     // Request::ReportMapLoad { uid } => Player::on_report_map_load(&pool, p.clone(), &uid).await,
                     Request::ReportPBHeight { h } => Player::on_report_pb_height(&pool, p.clone(), h).await,
-                    Request::GetMyStats {} => todo!(),
-                    Request::GetGlobalLB {} => todo!(),
-                    Request::GetFriendsLB { friends } => todo!(),
+                    Request::GetMyStats {} => Player::get_stats(&pool, p.clone()).await,
+                    Request::GetGlobalLB { start, end } => Player::get_global_lb(&pool, p.clone(), start as i32, end as i32).await,
+                    Request::GetFriendsLB { friends } => todo!(), // Player::get_friends_lb(&pool, p.clone(), &friends).await,
+                    Request::GetGlobalOverview {} => todo!(),     // Player::get_global_overview(&pool, p.clone()).await,
+                    Request::GetServerStats {} => todo!(),        // Player::get_server_stats(&pool, p.clone()).await,
                     Request::StressMe {} => (0..100)
                         .map(|_| p.queue_tx.send(Response::Ping {}))
                         .collect::<Result<_, _>>()
@@ -308,6 +310,34 @@ impl Player {
 
 /// handle messages impls
 impl Player {
+    // pub async fn get_global_overview(pool: &Pool<Postgres>, p: Arc<Player>) -> Result<(), Error> {
+    //     let overview = queries::get_global_overview(pool).await?;
+    //     Ok(p.queue_tx.send(Response::GlobalOverview { overview })?)
+    // }
+
+    pub async fn get_friends_lb(pool: &Pool<Postgres>, p: Arc<Player>, friends: &[Uuid]) -> Result<(), Error> {
+        let lb = queries::get_friends_lb(pool, p.user_id(), friends).await?;
+        Ok(p.queue_tx.send(Response::FriendsLB {
+            entries: lb.into_iter().map(|e| e.into()).collect(),
+        })?)
+    }
+
+    pub async fn get_global_lb(pool: &Pool<Postgres>, p: Arc<Player>, start: i32, end: i32) -> Result<(), Error> {
+        let lb = queries::get_global_lb(pool, start, end).await?;
+        Ok(p.queue_tx.send(Response::GlobalLB {
+            entries: lb.into_iter().map(|e| e.into()).collect(),
+        })?)
+    }
+
+    pub async fn get_stats(pool: &Pool<Postgres>, p: Arc<Player>) -> Result<(), Error> {
+        match get_user_stats(pool, p.get_session().user_id()).await {
+            Ok((stats, rank)) => Ok(p.queue_tx.send(Response::Stats { stats, rank })?),
+            // nothing to return
+            Err(sqlx::Error::RowNotFound) => Ok(()),
+            Err(e) => Ok(Err(e)?),
+        }
+    }
+
     pub async fn report_vehicle_state(
         pool: &Pool<Postgres>,
         p: Arc<Player>,
@@ -420,7 +450,7 @@ impl Player {
                 }
             }
             // let uid = ;
-            warn!("Dropping PB height b/c not official; user: {}", p.display_name());
+            // warn!("Dropping PB height b/c not official; user: {}", p.display_name());
             return Ok(());
         }
         update_user_pb_height(pool, p.get_session().user_id(), h as f64).await?;

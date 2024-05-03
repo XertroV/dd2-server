@@ -1,10 +1,10 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDateTime, Utc};
 use log::{info, warn};
 use sqlx::{prelude::FromRow, query, query_as, types::Uuid, Pool, Postgres};
 
-use crate::router::Stats;
+use crate::router::{LeaderboardEntry, Stats};
 
 pub async fn log_ml_ping(pool: &Pool<Postgres>, ip_v4: &str, ip_v6: &str, is_intro: bool, user_agent: &str) -> Result<(), sqlx::Error> {
     query!(
@@ -74,6 +74,31 @@ pub async fn update_users_stats(pool: &Pool<Postgres>, user_id: &Uuid, stats: &S
         }
         Err(e) => Err(e),
     }
+}
+
+pub async fn get_user_stats(pool: &Pool<Postgres>, user_id: &Uuid) -> Result<(Stats, u32), sqlx::Error> {
+    let r = query!("SELECT seconds_spent_in_map, nb_jumps, nb_falls, nb_floors_fallen, last_pb_set_ts, total_dist_fallen, pb_height, pb_floor, nb_resets, ggs_triggered, title_gags_triggered, title_gags_special_triggered, bye_byes_triggered, monument_triggers, reached_floor_count, floor_voice_lines_played, update_count, rank() over (ORDER BY pb_height DESC) as rank_at_time FROM stats WHERE user_id = $1;", user_id)
+        .fetch_one(pool)
+        .await?;
+    let s = Stats {
+        seconds_spent_in_map: r.seconds_spent_in_map,
+        nb_jumps: r.nb_jumps as u32,
+        nb_falls: r.nb_falls as u32,
+        nb_floors_fallen: r.nb_floors_fallen as u32,
+        last_pb_set_ts: r.last_pb_set_ts.map(|t| t.and_utc().timestamp()).unwrap_or(0) as u32,
+        total_dist_fallen: r.total_dist_fallen as f32,
+        pb_height: r.pb_height as f32,
+        pb_floor: r.pb_floor as u32,
+        nb_resets: r.nb_resets as u32,
+        ggs_triggered: r.ggs_triggered as u32,
+        title_gags_triggered: r.title_gags_triggered as u32,
+        title_gags_special_triggered: r.title_gags_special_triggered as u32,
+        bye_byes_triggered: r.bye_byes_triggered as u32,
+        monument_triggers: r.monument_triggers,
+        reached_floor_count: r.reached_floor_count,
+        floor_voice_lines_played: r.floor_voice_lines_played,
+    };
+    Ok((s, r.rank_at_time.unwrap_or(u32::MAX as i64) as u32))
 }
 
 /*
@@ -214,7 +239,7 @@ pub async fn update_user_pb_height(pool: &Pool<Postgres>, user_id: &Uuid, height
                 )
                 .fetch_one(pool)
                 .await?;
-                if uc.update_count + 2 % 10 == 0 {
+                if (uc.update_count + 2) % 10 == 0 {
                     query!("INSERT INTO leaderboard_archive (user_id, height, rank_at_time) SELECT user_id, height, rank() over (ORDER BY height DESC) as rank_at_time FROM leaderboard WHERE user_id = $1;", user_id).execute(pool).await?;
                 }
             }
@@ -233,3 +258,55 @@ pub async fn update_user_pb_height(pool: &Pool<Postgres>, user_id: &Uuid, height
         Err(e) => Err(e),
     };
 }
+
+#[derive(FromRow, Debug, Clone)]
+pub struct LBEntry {
+    pub wsid: Uuid,
+    pub height: f64,
+    pub rank: Option<i64>,
+    pub ts: NaiveDateTime,
+}
+impl Into<LeaderboardEntry> for LBEntry {
+    fn into(self) -> LeaderboardEntry {
+        LeaderboardEntry {
+            wsid: self.wsid.to_string(),
+            height: self.height as f32,
+            rank: self.rank.unwrap_or(99999) as u32,
+            ts: self.ts.and_utc().timestamp() as u32,
+        }
+    }
+}
+
+pub async fn get_global_lb(pool: &Pool<Postgres>, start: i32, end: i32) -> Result<Vec<LBEntry>, sqlx::Error> {
+    if end < start {
+        return Ok(vec![]);
+    }
+    let limit = end - start + 1;
+    let r = query_as!(
+        LBEntry,
+        "SELECT user_id as wsid, height, ts, rank() over (ORDER BY height DESC) as rank FROM leaderboard LIMIT $1 OFFSET $2;",
+        limit as i32,
+        start as i32
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(r)
+}
+
+pub async fn get_friends_lb(pool: &Pool<Postgres>, user_id: &Uuid, friends: &[Uuid]) -> Result<Vec<LBEntry>, sqlx::Error> {
+    let r = query_as!(
+        LBEntry,
+        "SELECT user_id as wsid, height, ts, rank() over (ORDER BY height DESC) as rank FROM leaderboard WHERE user_id = ANY($1) ORDER BY height DESC;",
+        friends
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(r)
+}
+
+// pub async fn get_global_overview(pool: &Pool<Postgres>) -> Result<(u32, u32), sqlx::Error> {
+//     let r = query!("SELECT * FROM cached_json WHERE key = $1;", "global_overview")
+//         .fetch_one(pool)
+//         .await?;
+//     Ok((r.count as u32, 0))
+// }
