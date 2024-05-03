@@ -48,15 +48,8 @@ pub async fn update_users_stats(pool: &Pool<Postgres>, user_id: &Uuid, stats: &S
             if (r.update_count + 8) % 10 == 0 {
                 // insert into stats_archive
                 query!(r#"--sql
-                WITH ranked_stats AS (
-                    SELECT
-                        *,
-                        rank() OVER (ORDER BY pb_height DESC) AS global_rank
-                    FROM
-                        stats
-                )
                 INSERT INTO stats_archive (user_id, seconds_spent_in_map, nb_jumps, nb_falls, nb_floors_fallen, last_pb_set_ts, total_dist_fallen, pb_height, pb_floor, nb_resets, ggs_triggered, title_gags_triggered, title_gags_special_triggered, bye_byes_triggered, monument_triggers, reached_floor_count, floor_voice_lines_played, update_count, rank_at_time)
-                    SELECT user_id, seconds_spent_in_map, nb_jumps, nb_falls, nb_floors_fallen, last_pb_set_ts, total_dist_fallen, pb_height, pb_floor, nb_resets, ggs_triggered, title_gags_triggered, title_gags_special_triggered, bye_byes_triggered, monument_triggers, reached_floor_count, floor_voice_lines_played, update_count, global_rank as rank_at_time
+                    SELECT user_id, seconds_spent_in_map, nb_jumps, nb_falls, nb_floors_fallen, last_pb_set_ts, total_dist_fallen, pb_height, pb_floor, nb_resets, ggs_triggered, title_gags_triggered, title_gags_special_triggered, bye_byes_triggered, monument_triggers, reached_floor_count, floor_voice_lines_played, update_count, rank as rank_at_time
                     FROM ranked_stats WHERE user_id = $1;
                 "#, user_id).execute(pool).await?;
             }
@@ -89,26 +82,26 @@ pub async fn update_users_stats(pool: &Pool<Postgres>, user_id: &Uuid, stats: &S
 }
 
 pub async fn get_user_stats(pool: &Pool<Postgres>, user_id: &Uuid) -> Result<(Stats, u32), sqlx::Error> {
-    let r = query!("SELECT seconds_spent_in_map, nb_jumps, nb_falls, nb_floors_fallen, last_pb_set_ts, total_dist_fallen, pb_height, pb_floor, nb_resets, ggs_triggered, title_gags_triggered, title_gags_special_triggered, bye_byes_triggered, monument_triggers, reached_floor_count, floor_voice_lines_played, update_count, rank() over (ORDER BY pb_height DESC) as rank_at_time FROM stats WHERE user_id = $1;", user_id)
+    let r = query!("SELECT seconds_spent_in_map, nb_jumps, nb_falls, nb_floors_fallen, last_pb_set_ts, total_dist_fallen, pb_height, pb_floor, nb_resets, ggs_triggered, title_gags_triggered, title_gags_special_triggered, bye_byes_triggered, monument_triggers, reached_floor_count, floor_voice_lines_played, update_count, rank as rank_at_time FROM ranked_stats WHERE user_id = $1;", user_id)
         .fetch_one(pool)
         .await?;
     let s = Stats {
-        seconds_spent_in_map: r.seconds_spent_in_map,
-        nb_jumps: r.nb_jumps as u32,
-        nb_falls: r.nb_falls as u32,
-        nb_floors_fallen: r.nb_floors_fallen as u32,
+        seconds_spent_in_map: r.seconds_spent_in_map.unwrap_or_default(),
+        nb_jumps: r.nb_jumps.unwrap_or_default() as u32,
+        nb_falls: r.nb_falls.unwrap_or_default() as u32,
+        nb_floors_fallen: r.nb_floors_fallen.unwrap_or_default() as u32,
         last_pb_set_ts: r.last_pb_set_ts.map(|t| t.and_utc().timestamp()).unwrap_or(0) as u32,
-        total_dist_fallen: r.total_dist_fallen as f32,
-        pb_height: r.pb_height as f32,
-        pb_floor: r.pb_floor as u32,
-        nb_resets: r.nb_resets as u32,
-        ggs_triggered: r.ggs_triggered as u32,
-        title_gags_triggered: r.title_gags_triggered as u32,
-        title_gags_special_triggered: r.title_gags_special_triggered as u32,
-        bye_byes_triggered: r.bye_byes_triggered as u32,
-        monument_triggers: r.monument_triggers,
-        reached_floor_count: r.reached_floor_count,
-        floor_voice_lines_played: r.floor_voice_lines_played,
+        total_dist_fallen: r.total_dist_fallen.unwrap_or_default() as f32,
+        pb_height: r.pb_height.unwrap_or_default() as f32,
+        pb_floor: r.pb_floor.unwrap_or_default() as u32,
+        nb_resets: r.nb_resets.unwrap_or_default() as u32,
+        ggs_triggered: r.ggs_triggered.unwrap_or_default() as u32,
+        title_gags_triggered: r.title_gags_triggered.unwrap_or_default() as u32,
+        title_gags_special_triggered: r.title_gags_special_triggered.unwrap_or_default() as u32,
+        bye_byes_triggered: r.bye_byes_triggered.unwrap_or_default() as u32,
+        monument_triggers: r.monument_triggers.unwrap_or_default(),
+        reached_floor_count: r.reached_floor_count.unwrap_or_default(),
+        floor_voice_lines_played: r.floor_voice_lines_played.unwrap_or_default(),
     };
     Ok((s, r.rank_at_time.unwrap_or(u32::MAX as i64) as u32))
 }
