@@ -7,7 +7,7 @@ use dotenv::dotenv;
 use env_logger::Env;
 use log::{error, info, warn};
 use player::Player;
-use queries::{update_global_overview, update_server_stats};
+use queries::{get_global_lb, update_global_overview, update_server_stats};
 use serde_json;
 use sqlx::{
     postgres::{PgPool, PgPoolOptions},
@@ -20,7 +20,10 @@ use tokio::{
     sync::Mutex,
 };
 
-use crate::{consts::DD2_MAP_UID, http::run_http_server, op_auth::init_op_config};
+use crate::{
+    consts::DD2_MAP_UID, http::run_http_server, op_auth::init_op_config, player::ToPlayer, queries::get_server_info,
+    router::LeaderboardEntry,
+};
 
 mod api_error;
 mod consts;
@@ -146,6 +149,7 @@ impl PlayerMgr {
 
     pub fn start(mgr: Arc<Self>) {
         let orig_mgr = mgr;
+        let (new_top3_tx, mut new_top3_rx) = unbounded_channel();
 
         // receive msgs loop
         let mgr = orig_mgr.clone();
@@ -163,6 +167,10 @@ impl PlayerMgr {
                         ToPlayerMgr::SocketError() => {
                             warn!("Socket error");
                         }
+                        ToPlayerMgr::NewTop3() => {
+                            info!("New top3");
+                            let _ = new_top3_tx.send(());
+                        }
                     },
                     None => {
                         break;
@@ -175,11 +183,12 @@ impl PlayerMgr {
         let mgr = orig_mgr.clone();
         tokio::spawn(async move {
             loop {
-                tokio::time::sleep(Duration::from_secs(5)).await;
+                tokio::time::sleep(Duration::from_millis(100)).await;
                 let mut players = mgr.players.lock().await;
                 for i in (0..players.len()).rev() {
                     if !players[i].is_connected() {
-                        players.remove(i);
+                        let p = players.remove(i);
+                        info!("Removing disconnected player: {:?}", p.display_name());
                     }
                 }
             }
@@ -215,6 +224,30 @@ impl PlayerMgr {
                 };
             }
         });
+
+        // send top3 to all players every 2 min
+        let mgr = orig_mgr.clone();
+        tokio::spawn(async move {
+            loop {
+                if let Ok(r) = get_global_lb(&mgr.pool, 1, 6).await {
+                    let top3 = r.into_iter().map(|r| r.into()).collect::<Vec<LeaderboardEntry>>();
+                    let top3 = router::Response::Top3 { top3 };
+                    let nb_players_live = get_server_info(&mgr.pool).await.unwrap_or_default();
+                    let server_info = router::Response::ServerInfo { nb_players_live };
+                    info!("Sending top3 to all players: {:?}", &top3);
+                    // let top3 = serde_json::to_string(&top3).unwrap();
+                    let players = mgr.players.lock().await;
+                    for p in players.iter() {
+                        let _ = p.queue_tx.send(top3.clone());
+                        let _ = p.queue_tx.send(server_info.clone());
+                    }
+                };
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_secs(120)) => {},
+                    _ = new_top3_rx.recv() => {},
+                }
+            }
+        });
     }
 
     pub fn start_recheck_records(mgr: Arc<Self>) {
@@ -241,4 +274,5 @@ pub enum ToPlayerMgr {
     RecheckRecords(),
     AuthFailed(),
     SocketError(),
+    NewTop3(),
 }

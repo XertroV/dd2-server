@@ -53,6 +53,8 @@ pub async fn update_users_stats(pool: &Pool<Postgres>, user_id: &Uuid, stats: &S
                     FROM ranked_stats WHERE user_id = $1;
                 "#, user_id).execute(pool).await?;
             }
+            // check that lb is up to date, should be close
+            update_user_pb_height(pool, user_id, stats.pb_height as f64).await?;
             Ok(())
         }
         Err(sqlx::Error::RowNotFound) => {
@@ -231,39 +233,39 @@ pub async fn insert_vehicle_state(
     Ok(())
 }
 
-pub async fn update_user_pb_height(pool: &Pool<Postgres>, user_id: &Uuid, height: f64) -> Result<(), sqlx::Error> {
+pub struct PBUpdateRes {
+    pub is_top_3: bool,
+}
+
+pub async fn update_user_pb_height(pool: &Pool<Postgres>, user_id: &Uuid, height: f64) -> Result<PBUpdateRes, sqlx::Error> {
     return match query!("SELECT height FROM leaderboard WHERE user_id = $1;", user_id)
         .fetch_one(pool)
         .await
     {
         Ok(r) => {
             if r.height < height {
-                let uc = query!(
+                query!(
                     "UPDATE leaderboard SET height = $1, ts = NOW(), update_count = update_count + 1 WHERE user_id = $2 RETURNING update_count;",
                     height,
                     user_id
                 )
                 .fetch_one(pool)
                 .await?;
-                if (uc.update_count + 8) % 10 == 0 || true {
-                    query!(r#"--sql
-                    WITH ranked_leaderboard AS (
-                        SELECT
-                            user_id,
-                            height,
-                            rank() OVER (ORDER BY height DESC) AS global_rank
-                        FROM
-                            leaderboard
-                    )
-                    INSERT INTO leaderboard_archive (user_id, height, rank_at_time) SELECT user_id, height, global_rank FROM ranked_leaderboard WHERE user_id = $1;"#, user_id).execute(pool).await?;
+                let r = query!(r#"--sql
+                INSERT INTO leaderboard_archive (user_id, height, rank_at_time) SELECT user_id, height, rank FROM ranked_lb_view WHERE user_id = $1
+                    RETURNING rank_at_time;"#, user_id).fetch_one(pool).await?;
+                if r.rank_at_time < 4 {
+                    return Ok(PBUpdateRes { is_top_3: true });
                 }
-            } else {
+            } else if r.height - height > 50. {
                 warn!(
                     "Player {:?} tried to update PB height to {:?} but current PB is {:?}",
                     user_id, height, r.height
                 );
+            } else {
+                // info!("Player {:?} tried to update PB height to {:?} but current PB is {:?}", user_id, height, r.height);
             }
-            Ok(())
+            Ok(PBUpdateRes { is_top_3: false })
         }
         Err(sqlx::Error::RowNotFound) => {
             query!(
@@ -273,7 +275,7 @@ pub async fn update_user_pb_height(pool: &Pool<Postgres>, user_id: &Uuid, height
             )
             .execute(pool)
             .await?;
-            Ok(())
+            Ok(PBUpdateRes { is_top_3: false })
         }
         Err(e) => Err(e),
     };
@@ -303,11 +305,11 @@ pub async fn get_global_lb(pool: &Pool<Postgres>, start: i32, end: i32) -> Resul
     if end < start {
         return Ok(vec![]);
     }
-    let limit = end - start + 1;
+    let limit = end - start;
     let r = query!(
         "SELECT user_id as wsid, height, ts, rank, display_name FROM ranked_lb_view LIMIT $1 OFFSET $2;",
-        limit as i32,
-        start as i32
+        limit as i64,
+        (start as i64 - 1).max(0),
     )
     .fetch_all(pool)
     .await?;

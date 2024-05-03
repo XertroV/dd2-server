@@ -5,8 +5,6 @@ After=network.target
 [Service]
 ExecStart=/root/plugin-server/run.sh
 Restart=always
-StandardOutput=append:/var/log/dd2_server_output.log
-StandardError=append:/var/log/dd2_server_error.log
 User=root
 Group=root
 

@@ -302,6 +302,9 @@ pub enum Response {
                       // floors_fallen: u32,
                       // height_fallen: u32,
     },
+    Top3 {
+        top3: Vec<LeaderboardEntry>,
+    },
 }
 
 impl Response {
@@ -317,6 +320,7 @@ impl Response {
             Response::GlobalLB { .. } => 129,
             Response::FriendsLB { .. } => 130,
             Response::GlobalOverview { .. } => 131,
+            Response::Top3 { .. } => 132,
         }
     }
 
@@ -332,6 +336,7 @@ impl Response {
             Response::GlobalLB { .. } => "GlobalLB",
             Response::FriendsLB { .. } => "FriendsLB",
             Response::GlobalOverview { .. } => "GlobalOverview",
+            Response::Top3 { .. } => "Top3",
         }
     }
 

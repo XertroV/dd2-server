@@ -1,12 +1,13 @@
 use tokio::sync::mpsc::error::SendError;
 
-use crate::router::Response;
+use crate::{router::Response, ToPlayerMgr};
 
 #[derive(Debug)]
 pub enum Error {
     StrErr(String),
     SqlxErr(sqlx::Error),
     SendErr(SendError<Response>),
+    SendErrToMgr(SendError<ToPlayerMgr>),
     B64(base64::DecodeError),
 }
 
@@ -25,6 +26,12 @@ impl From<sqlx::Error> for Error {
 impl From<SendError<Response>> for Error {
     fn from(e: SendError<Response>) -> Self {
         Error::SendErr(e)
+    }
+}
+
+impl From<SendError<ToPlayerMgr>> for Error {
+    fn from(e: SendError<ToPlayerMgr>) -> Self {
+        Error::SendErrToMgr(e)
     }
 }
 

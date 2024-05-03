@@ -158,8 +158,6 @@ pub async fn run_http_server(pool: Arc<Pool<Postgres>>) -> Result<(), Box<dyn st
         .or(get_global_overview)
         .or(get_server_info)
         .or(get_lb_pos_of_user)
-        // .or(lm_analysis_local_route)
-        // .or(version_route)
         .with(warp::log("dips++"));
 
     #[cfg(debug_assertions)]

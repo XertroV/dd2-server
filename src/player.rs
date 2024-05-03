@@ -15,11 +15,11 @@ use crate::api_error::Error;
 use crate::consts::DD2_MAP_UID;
 use crate::op_auth::{check_token, TokenResp};
 use crate::queries::{
-    self, context_mark_succeeded, create_session, get_user_stats, insert_context, insert_context_packed, insert_finish, insert_gc_nod,
-    insert_respawn, insert_start_fall, insert_vehicle_state, register_or_login, resume_session, update_fall_with_end,
-    update_user_pb_height, update_users_stats, Session, User,
+    self, context_mark_succeeded, create_session, get_global_lb, get_global_overview, get_server_info, get_user_stats, insert_context,
+    insert_context_packed, insert_finish, insert_gc_nod, insert_respawn, insert_start_fall, insert_vehicle_state, register_or_login,
+    resume_session, update_fall_with_end, update_user_pb_height, update_users_stats, Session, User,
 };
-use crate::router::{write_response, Map, PlayerCtx, Request, Response, Stats};
+use crate::router::{write_response, LeaderboardEntry, Map, PlayerCtx, Request, Response, Stats};
 use crate::ToPlayerMgr;
 
 pub struct Player {
@@ -27,7 +27,7 @@ pub struct Player {
     tx_mgr: UnboundedSender<ToPlayerMgr>,
     rx: Mutex<UnboundedReceiver<ToPlayer>>,
     queue_rx: Mutex<UnboundedReceiver<Response>>,
-    queue_tx: UnboundedSender<Response>,
+    pub queue_tx: UnboundedSender<Response>,
     // stream: Arc<Mutex<TcpStream>>,
     has_shutdown: OnceCell<bool>,
     session: OnceCell<LoginSession>,
@@ -55,20 +55,20 @@ impl Player {
         }
     }
 
-    pub fn get_session(&self) -> &LoginSession {
-        self.session.get().unwrap()
+    pub fn get_session(&self) -> Option<&LoginSession> {
+        self.session.get()
     }
 
-    pub fn display_name(&self) -> &str {
-        self.get_session().display_name()
+    pub fn display_name(&self) -> Option<&str> {
+        self.get_session().map(|s| s.display_name())
     }
 
-    pub fn user_id(&self) -> &Uuid {
-        self.get_session().user_id()
+    pub fn user_id(&self) -> Option<&Uuid> {
+        self.get_session().map(|s| s.user_id())
     }
 
-    pub fn session_id(&self) -> &Uuid {
-        self.get_session().session_id()
+    pub fn session_id(&self) -> Option<&Uuid> {
+        self.get_session().map(|s| s.session_id())
     }
 
     pub fn is_connected(&self) -> bool {
@@ -120,6 +120,18 @@ impl Player {
             );
             p.session.set(ls).unwrap();
 
+            if let Ok(r) = get_global_lb(&pool, 1, 4).await {
+                let top3 = r.into_iter().map(|r| r.into()).collect::<Vec<LeaderboardEntry>>();
+                let top3 = Response::Top3 { top3 };
+                let _ = p.queue_tx.send(top3.clone());
+            };
+            if let Ok(j) = get_global_overview(&pool).await {
+                let _ = p.queue_tx.send(Response::GlobalOverview { j });
+            };
+            if let Ok(j) = get_server_info(&pool).await {
+                let _ = p.queue_tx.send(Response::ServerInfo { nb_players_live: j });
+            };
+
             // required loops: read player socket, write player socket, read incoming msgs
             // clone tx_mgr for where it's required
             // if passes, start loops
@@ -136,7 +148,7 @@ impl Player {
         let msg = match msg {
             Ok(msg) => msg,
             Err(err) => {
-                return Err(format!("[{}] Error reading from socket: {:?}", p.display_name(), err).into());
+                return Err(format!("[{:?}] Error reading from socket: {:?}", s_read.peer_addr(), err).into());
             }
         };
         match msg {
@@ -221,6 +233,7 @@ impl Player {
                         ToPlayer::NotifyRecord() => {
                             // notify record
                         }
+                        ToPlayer::Top3(t3) => {}
                     },
                     None => {
                         break;
@@ -326,7 +339,7 @@ impl Player {
     }
 
     pub async fn get_friends_lb(pool: &Pool<Postgres>, p: Arc<Player>, friends: &[Uuid]) -> Result<(), Error> {
-        let lb = queries::get_friends_lb(pool, p.user_id(), friends).await?;
+        let lb = queries::get_friends_lb(pool, p.user_id().unwrap(), friends).await?;
         Ok(p.queue_tx.send(Response::FriendsLB {
             entries: lb.into_iter().map(|e| e.into()).collect(),
         })?)
@@ -340,7 +353,7 @@ impl Player {
     }
 
     pub async fn get_stats(pool: &Pool<Postgres>, p: Arc<Player>) -> Result<(), Error> {
-        match get_user_stats(pool, p.get_session().user_id()).await {
+        match get_user_stats(pool, p.user_id().unwrap()).await {
             Ok((stats, rank)) => Ok(p.queue_tx.send(Response::Stats { stats, rank })?),
             // nothing to return
             Err(sqlx::Error::RowNotFound) => Ok(()),
@@ -358,7 +371,7 @@ impl Player {
         let ctx_id_lock = p.context_id.lock().await;
         let ctx_id = ctx_id_lock.as_ref();
         let is_official = p.context.lock().await.as_ref().map(|ctx| ctx.is_official()).unwrap_or(false);
-        Ok(insert_vehicle_state(pool, p.get_session().session_id(), ctx_id, is_official, pos, rotq, vel).await?)
+        Ok(insert_vehicle_state(pool, p.session_id().unwrap(), ctx_id, is_official, pos, rotq, vel).await?)
     }
 
     pub async fn update_context(
@@ -384,7 +397,7 @@ impl Player {
             }
             None => None,
         };
-        let new_id = insert_context_packed(pool, p.get_session().session_id(), &new_ctx, &previous_ctx, map_id, bi).await?;
+        let new_id = insert_context_packed(pool, p.session_id().unwrap(), &new_ctx, &previous_ctx, map_id, bi).await?;
         if let Some(previous_ctx) = previous_ctx {
             context_mark_succeeded(pool, &previous_ctx, &new_id).await?;
         }
@@ -404,7 +417,7 @@ impl Player {
 
         match p.context_id.lock().await.as_ref() {
             Some(ctx_id) => {
-                insert_gc_nod(pool, p.get_session().session_id(), ctx_id, &x).await?;
+                insert_gc_nod(pool, p.session_id().unwrap(), ctx_id, &x).await?;
             }
             None => {
                 if (data.len() > 0x20) {
@@ -416,17 +429,17 @@ impl Player {
     }
 
     pub async fn report_respawn(pool: &Pool<Postgres>, p: Arc<Player>, race_time: i32) -> Result<(), Error> {
-        insert_respawn(pool, p.session_id(), race_time).await?;
+        insert_respawn(pool, p.session_id().unwrap(), race_time).await?;
         Ok(())
     }
 
     pub async fn report_finish(pool: &Pool<Postgres>, p: Arc<Player>, race_time: i32) -> Result<(), Error> {
-        insert_finish(pool, p.session_id(), race_time).await?;
+        insert_finish(pool, p.session_id().unwrap(), race_time).await?;
         Ok(())
     }
 
     pub async fn on_report_stats(pool: &Pool<Postgres>, p: Arc<Player>, stats: Stats) -> Result<(), Error> {
-        Ok(update_users_stats(pool, p.user_id(), &stats).await?)
+        Ok(update_users_stats(pool, p.user_id().unwrap(), &stats).await?)
     }
 
     pub async fn on_report_pb_height(pool: &Pool<Postgres>, p: Arc<Player>, h: f32) -> Result<(), Error> {
@@ -440,18 +453,18 @@ impl Player {
                         None => warn!("Dropping PB height b/c no map"),
                         Some(map) => {
                             if map.uid != DD2_MAP_UID {
-                                warn!("Dropping PB height b/c not DD2; user: {}", p.get_session().display_name());
+                                warn!("Dropping PB height b/c not DD2; user: {}", p.display_name().unwrap());
                                 return Ok(());
                             } else {
                                 if !check_flags_sf_mi(ctx.sf, ctx.mi) {
-                                    warn!("Dropping PB height b/c invalid sf/mi; user: {}", p.get_session().display_name());
+                                    warn!("Dropping PB height b/c invalid sf/mi; user: {}", p.display_name().unwrap());
                                     return Ok(());
                                 } else {
                                     if !ctx.is_official() {
-                                        warn!("Dropping PB height b/c not official; user: {}", p.get_session().display_name());
+                                        warn!("Dropping PB height b/c not official; user: {}", p.display_name().unwrap());
                                         return Ok(());
                                     } else {
-                                        warn!("Dropping PB height b/c unknown reason; user: {}", p.get_session().display_name());
+                                        warn!("Dropping PB height b/c unknown reason; user: {}", p.display_name().unwrap());
                                     }
                                 }
                             }
@@ -463,8 +476,11 @@ impl Player {
             // warn!("Dropping PB height b/c not official; user: {}", p.display_name());
             return Ok(());
         }
-        update_user_pb_height(pool, p.get_session().user_id(), h as f64).await?;
-        info!("updated user pb height: {}: {}", p.display_name(), h);
+        let res = update_user_pb_height(pool, p.user_id().unwrap(), h as f64).await?;
+        info!("updated user pb height: {}: {}", p.display_name().unwrap(), h);
+        if res.is_top_3 {
+            p.tx_mgr.send(ToPlayerMgr::NewTop3())?;
+        }
         Ok(())
     }
 
@@ -477,7 +493,7 @@ impl Player {
         start_time: i32,
     ) -> Result<(), Error> {
         // insert
-        Ok(insert_start_fall(pool, p.user_id(), p.session_id(), floor, pos, speed, start_time).await?)
+        Ok(insert_start_fall(pool, p.user_id().unwrap(), p.session_id().unwrap(), floor, pos, speed, start_time).await?)
     }
 
     pub async fn on_report_fall_end(
@@ -487,13 +503,14 @@ impl Player {
         pos: (f32, f32, f32),
         end_time: i32,
     ) -> Result<(), Error> {
-        update_fall_with_end(pool, p.user_id(), floor, pos, end_time).await?;
+        update_fall_with_end(pool, p.user_id().unwrap(), floor, pos, end_time).await?;
         Ok(())
     }
 }
 
 pub enum ToPlayer {
     NotifyRecord(),
+    Top3(Vec<LeaderboardEntry>),
 }
 
 #[derive(Debug, Clone)]

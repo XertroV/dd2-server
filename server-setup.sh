@@ -29,8 +29,6 @@ ufw allow 22
 ufw allow 80/tcp
 ufw allow 443/tcp
 ufw allow 17677/tcp
-ufw allow 27677/tcp
-ufw allow 19796/tcp
 ufw enable || ufw reload | tee /dev/null
 
 PG_PASSWORD="$(openssl rand -hex 20)"
