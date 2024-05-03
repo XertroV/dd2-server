@@ -86,7 +86,7 @@ pub async fn run_http_server(pool: Arc<Pool<Postgres>>) -> Result<(), Box<dyn st
 
     let api_routes = warp::path!("api" / "routes")
         .and(warp::path::end())
-        .map(|| "Routes: /leaderboard/global, /overview, /server_info");
+        .map(|| "Routes: /leaderboard/global, /leaderboard/<wsid>, /overview, /server_info");
 
     let ping_path = warp::path!("mlping.Script.txt")
         .and(warp::path::end())
@@ -125,6 +125,12 @@ pub async fn run_http_server(pool: Arc<Pool<Postgres>>) -> Result<(), Box<dyn st
         .and_then(|pool: Arc<Pool<Postgres>>| async move { api::handle_get_server_info(&pool).await });
     let req_pool = pool.clone();
 
+    let get_lb_pos_of_user = warp::path!("leaderboard" / String)
+        .and(warp::path::end())
+        .map(move |s| (s, req_pool.clone()))
+        .and_then(|(s, pool): (String, Arc<Pool<Postgres>>)| async move { api::handle_get_user_lb_pos(pool.as_ref(), s).await });
+    let req_pool = pool.clone();
+
     // info!("Enabling route: get /mlping_intro");
     // let ping_path = warp::path!("mlping_intro")
     //     .and(warp::path::end())
@@ -151,6 +157,7 @@ pub async fn run_http_server(pool: Arc<Pool<Postgres>>) -> Result<(), Box<dyn st
         .or(get_global_lb)
         .or(get_global_overview)
         .or(get_server_info)
+        .or(get_lb_pos_of_user)
         // .or(lm_analysis_local_route)
         // .or(version_route)
         .with(warp::log("dips++"));
