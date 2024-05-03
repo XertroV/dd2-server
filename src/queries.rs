@@ -4,6 +4,7 @@ pub use context::*;
 pub use players::*;
 pub use stats::*;
 
+pub mod api;
 mod auth;
 mod clips;
 mod context;

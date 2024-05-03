@@ -4,7 +4,10 @@ use chrono::{DateTime, NaiveDateTime, Utc};
 use log::{info, warn};
 use sqlx::{prelude::FromRow, query, query_as, types::Uuid, Pool, Postgres};
 
-use crate::router::{LeaderboardEntry, Stats};
+use crate::{
+    consts::DD2_MAP_UID,
+    router::{LeaderboardEntry, Stats},
+};
 
 pub async fn log_ml_ping(pool: &Pool<Postgres>, ip_v4: &str, ip_v6: &str, is_intro: bool, user_agent: &str) -> Result<(), sqlx::Error> {
     query!(
@@ -181,6 +184,7 @@ pub async fn update_fall_with_end(
 }
 
 pub async fn insert_respawn(pool: &Pool<Postgres>, session_id: &Uuid, race_time: i32) -> Result<(), sqlx::Error> {
+    // info!("Inserting respawn for session {:?} at race time {:?}", session_id, race_time);
     query!(
         "INSERT INTO respawns (session_token, race_time) VALUES ($1, $2);",
         session_id,
@@ -239,9 +243,23 @@ pub async fn update_user_pb_height(pool: &Pool<Postgres>, user_id: &Uuid, height
                 )
                 .fetch_one(pool)
                 .await?;
-                if (uc.update_count + 2) % 10 == 0 {
-                    query!("INSERT INTO leaderboard_archive (user_id, height, rank_at_time) SELECT user_id, height, rank() over (ORDER BY height DESC) as rank_at_time FROM leaderboard WHERE user_id = $1;", user_id).execute(pool).await?;
+                if (uc.update_count + 8) % 10 == 0 || true {
+                    query!(r#"--sql
+                    WITH ranked_leaderboard AS (
+                        SELECT
+                            user_id,
+                            height,
+                            rank() OVER (ORDER BY height DESC) AS global_rank
+                        FROM
+                            leaderboard
+                    )
+                    INSERT INTO leaderboard_archive (user_id, height, rank_at_time) SELECT user_id, height, global_rank FROM ranked_leaderboard WHERE user_id = $1;"#, user_id).execute(pool).await?;
                 }
+            } else {
+                warn!(
+                    "Player {:?} tried to update PB height to {:?} but current PB is {:?}",
+                    user_id, height, r.height
+                );
             }
             Ok(())
         }
@@ -293,6 +311,28 @@ pub async fn get_global_lb(pool: &Pool<Postgres>, start: i32, end: i32) -> Resul
     Ok(r)
 }
 
+pub async get_user_in_lb(pool: &Pool<Postgres>, user_id: &Uuid) -> Result<Option<LBEntry>, sqlx::Error> {
+    let r = query_as!(
+        LBEntry,
+        r#"--sql
+        query!(r#"--sql
+                    WITH ranked_leaderboard AS (
+                        SELECT
+                            user_id as wsid,
+                            height,
+                            ts,
+                            rank() OVER (ORDER BY height DESC) AS global_rank
+                        FROM
+                            leaderboard
+                    )
+                    SELECT user_id as wsid, height, ts, global_rank FROM ranked_leaderboard WHERE user_id = $1;"#,
+        user_id
+    )
+    .fetch_optional(pool)
+    .await?;
+    Ok(r)
+}
+
 pub async fn get_friends_lb(pool: &Pool<Postgres>, user_id: &Uuid, friends: &[Uuid]) -> Result<Vec<LBEntry>, sqlx::Error> {
     let r = query_as!(
         LBEntry,
@@ -304,9 +344,61 @@ pub async fn get_friends_lb(pool: &Pool<Postgres>, user_id: &Uuid, friends: &[Uu
     Ok(r)
 }
 
-// pub async fn get_global_overview(pool: &Pool<Postgres>) -> Result<(u32, u32), sqlx::Error> {
-//     let r = query!("SELECT * FROM cached_json WHERE key = $1;", "global_overview")
-//         .fetch_one(pool)
-//         .await?;
-//     Ok((r.count as u32, 0))
-// }
+pub async fn get_global_overview(pool: &Pool<Postgres>) -> Result<serde_json::Value, sqlx::Error> {
+    let r = query!("SELECT * FROM cached_json WHERE key = $1;", "global_overview")
+        .fetch_one(pool)
+        .await?;
+    Ok(r.value)
+}
+
+pub async fn update_global_overview(pool: &Pool<Postgres>) -> Result<serde_json::Value, sqlx::Error> {
+    let players = query!("SELECT COUNT(*) FROM users;").fetch_one(pool).await?.count;
+    let sessions = query!("SELECT COUNT(*) FROM sessions;").fetch_one(pool).await?.count;
+    let rjf = query!("SELECT SUM(nb_resets) as resets, SUM(nb_jumps) as jumps, SUM(nb_falls) as falls, SUM(nb_floors_fallen) as floors_fallen, SUM(total_dist_fallen) as height_fallen FROM stats;").fetch_one(pool).await?;
+    let map_loads = query!("SELECT load_count FROM maps WHERE uid = $1;", DD2_MAP_UID)
+        .fetch_one(pool)
+        .await
+        .map(|r| r.load_count)
+        .unwrap_or(0);
+    let new_overview = serde_json::json!({
+        "players": players,
+        "sessions": sessions,
+        "resets": rjf.resets,
+        "jumps": rjf.jumps,
+        "falls": rjf.falls,
+        "floors_fallen": rjf.floors_fallen,
+        "height_fallen": rjf.height_fallen,
+        "map_loads": map_loads,
+        "ts": SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
+    });
+    query!(
+        "INSERT INTO cached_json (key, value) VALUES ($1, $2) ON CONFLICT (key) DO UPDATE SET value = $2;",
+        "global_overview",
+        new_overview
+    )
+    .execute(pool)
+    .await?;
+    Ok(new_overview)
+}
+
+pub async fn update_server_stats(pool: &Pool<Postgres>, nb_players_live: usize) -> Result<(), sqlx::Error> {
+    query!(
+        "INSERT INTO cached_json (key, value) VALUES ($1, $2) ON CONFLICT (key) DO UPDATE SET value = $2;",
+        "server_stats",
+        serde_json::json!({
+            "nb_players_live": nb_players_live,
+            "ts": SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
+        })
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn get_server_info(pool: &Pool<Postgres>) -> Result<u32, sqlx::Error> {
+    let r = query!("SELECT value FROM cached_json WHERE key = $1;", "server_stats")
+        .fetch_one(pool)
+        .await?;
+    let v: serde_json::Value = r.value;
+    Ok(v["nb_players_live"].as_i64().unwrap_or(0) as u32)
+}

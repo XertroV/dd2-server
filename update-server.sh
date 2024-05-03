@@ -7,7 +7,7 @@
 
 cargo build --release || exit 1
 
-SERVERNAME="DD2-server1"
+SERVERNAME="DipsPP-server1"
 
 # ssh $SERVERNAME "mkdir -p ~/plugin-server"
 # rsync -avz config.json $SERVERNAME:~/plugin-server/

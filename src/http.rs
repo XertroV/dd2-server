@@ -5,21 +5,74 @@ use std::{
 };
 
 use base64::prelude::*;
+#[cfg(not(debug_assertions))]
 use lets_encrypt_warp::lets_encrypt;
 use log::{info, warn};
 use sqlx::{Pool, Postgres};
 use warp::{
+    http::Response,
+    reject,
     reply::{Reply, WithStatus},
-    Filter,
+    Filter, Rejection,
 };
 
-use crate::queries::log_ml_ping;
+use crate::queries::{api, log_ml_ping};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 fn with_db(db: Arc<Pool<Postgres>>) -> impl Filter<Extract = (Arc<Pool<Postgres>>,), Error = std::convert::Infallible> + Clone {
     warp::any().map(move || db.clone())
 }
+
+// fn domain_filter<T>(allowed_domain: &'static str) -> impl Filter<Extract = (Response<T>,), Error = Rejection> + Clone {
+//     warp::header::<String>("host")
+//         .and_then(move |host: String| {
+//             let allowed_domain = allowed_domain.to_string();
+//             async move {
+//                 if host.starts_with(&allowed_domain) {
+//                     Ok(())
+//                 } else {
+//                     Err(warp::reject::custom(DomainMismatch))
+//                 }
+//             }
+//         })
+//         .untuple_one()
+//         .or(warp::any().map(warp::reply).map(|x| {
+//             Response::builder()
+//                 .status(301)
+//                 .header("Location", "http://example.com")
+//                 .body("Redirecting to the correct domain".into())
+//                 .unwrap()
+//         }))
+//         .unify()
+// }
+fn domain_filter(allowed_domain: &'static str) -> impl Filter<Extract = (impl Reply,), Error = Rejection> + Clone {
+    warp::header::<String>("host")
+        .and_then(move |host: String| {
+            let allowed_domain = allowed_domain.to_string();
+            async move {
+                if host.starts_with(&allowed_domain) {
+                    Ok::<_, Rejection>(())
+                } else {
+                    Err(reject::custom(DomainMismatch))
+                }
+            }
+        })
+        .map(|_| warp::reply::with_status("Correct domain", warp::http::StatusCode::OK))
+        .recover(|_| async {
+            Ok::<_, Rejection>(
+                warp::reply::with_status(
+                    warp::reply::html("Redirecting to correct domain"),
+                    warp::http::StatusCode::MOVED_PERMANENTLY,
+                )
+                .into_response(),
+            )
+        })
+}
+
+#[derive(Debug)]
+struct DomainMismatch;
+impl warp::reject::Reject for DomainMismatch {}
 
 pub async fn run_http_server(pool: Arc<Pool<Postgres>>) -> Result<(), Box<dyn std::error::Error>> {
     // only for dev mode
@@ -31,7 +84,10 @@ pub async fn run_http_server(pool: Arc<Pool<Postgres>>) -> Result<(), Box<dyn st
     let pool_ping = pool.clone();
     let ping_pool2 = pool.clone();
 
-    info!("Enabling route: get /mlping");
+    let api_routes = warp::path!("api" / "routes")
+        .and(warp::path::end())
+        .map(|| "Routes: /leaderboard/global, /overview, /server_info");
+
     let ping_path = warp::path!("mlping.Script.txt")
         .and(warp::path::end())
         .and(warp::addr::remote())
@@ -49,6 +105,25 @@ pub async fn run_http_server(pool: Arc<Pool<Postgres>>) -> Result<(), Box<dyn st
         .and_then(|(ip, hdr, pool): (Option<SocketAddr>, String, Arc<Pool<Postgres>>)| async move {
             handle_mlping(&pool, &ip, true, &hdr).await
         });
+    let req_pool = pool.clone();
+
+    let get_global_lb = warp::path!("leaderboard" / "global")
+        .and(warp::path::end())
+        .map(move || req_pool.clone())
+        .and_then(|pool: Arc<Pool<Postgres>>| async move { api::handle_get_global_lb(&pool).await });
+    let req_pool = pool.clone();
+
+    let get_global_overview = warp::path!("overview")
+        .and(warp::path::end())
+        .map(move || req_pool.clone())
+        .and_then(|pool: Arc<Pool<Postgres>>| async move { api::handle_get_global_overview(&pool).await });
+    let req_pool = pool.clone();
+
+    let get_server_info = warp::path!("server_info")
+        .and(warp::path::end())
+        .map(move || req_pool.clone())
+        .and_then(|pool: Arc<Pool<Postgres>>| async move { api::handle_get_server_info(&pool).await });
+    let req_pool = pool.clone();
 
     // info!("Enabling route: get /mlping_intro");
     // let ping_path = warp::path!("mlping_intro")
@@ -71,7 +146,11 @@ pub async fn run_http_server(pool: Arc<Pool<Postgres>>) -> Result<(), Box<dyn st
 
     let site = ping_path
         .or(intro_ping_path)
+        .or(api_routes)
         .or(version_route)
+        .or(get_global_lb)
+        .or(get_global_overview)
+        .or(get_server_info)
         // .or(lm_analysis_local_route)
         // .or(version_route)
         .with(warp::log("dips++"));

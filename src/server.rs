@@ -7,6 +7,7 @@ use dotenv::dotenv;
 use env_logger::Env;
 use log::{error, info, warn};
 use player::Player;
+use queries::{update_global_overview, update_server_stats};
 use serde_json;
 use sqlx::{
     postgres::{PgPool, PgPoolOptions},
@@ -68,7 +69,7 @@ async fn main() {
 async fn listen(bind_addr: &str, pool: Arc<Pool<Postgres>>) {
     let listener = TcpListener::bind(bind_addr).await.unwrap();
     info!("Listening on: {}", bind_addr);
-    let (player_mgr, player_mgr_tx) = PlayerMgr::new();
+    let (player_mgr, player_mgr_tx) = PlayerMgr::new(pool.clone());
     let player_mgr = Arc::new(player_mgr);
     PlayerMgr::start(player_mgr.clone());
     loop {
@@ -106,16 +107,18 @@ pub struct PlayerMgr {
     players: Mutex<Vec<Arc<Player>>>,
     rx: Mutex<UnboundedReceiver<ToPlayerMgr>>,
     state: Mutex<PlayerMgrState>,
+    pool: Arc<Pool<Postgres>>,
 }
 
 impl PlayerMgr {
-    pub fn new() -> (Self, UnboundedSender<ToPlayerMgr>) {
+    pub fn new(pool: Arc<Pool<Postgres>>) -> (Self, UnboundedSender<ToPlayerMgr>) {
         let (tx, rx) = unbounded_channel();
         (
             Self {
                 players: Mutex::new(Vec::new()),
                 rx: rx.into(),
                 state: Mutex::new(PlayerMgrState::default()),
+                pool,
             },
             tx,
         )
@@ -142,6 +145,10 @@ impl PlayerMgr {
     }
 
     pub fn start(mgr: Arc<Self>) {
+        let orig_mgr = mgr;
+
+        // receive msgs loop
+        let mgr = orig_mgr.clone();
         tokio::spawn(async move {
             let mut rx = mgr.rx.lock().await;
             loop {
@@ -161,6 +168,51 @@ impl PlayerMgr {
                         break;
                     }
                 }
+            }
+        });
+
+        // watch for dead players loop
+        let mgr = orig_mgr.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                let mut players = mgr.players.lock().await;
+                for i in (0..players.len()).rev() {
+                    if !players[i].is_connected() {
+                        players.remove(i);
+                    }
+                }
+            }
+        });
+
+        // update global stats
+        let mgr = orig_mgr.clone();
+        tokio::spawn(async move {
+            loop {
+                match update_global_overview(&mgr.pool).await {
+                    Ok(_o) => {
+                        // info!("Updated global overview: {:?}", _o);
+                    }
+                    Err(e) => {
+                        error!("Error updating global overview: {:?}", e);
+                    }
+                }
+                tokio::time::sleep(Duration::from_secs(15)).await;
+            }
+        });
+
+        // update server stats
+        let mgr = orig_mgr.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                let nb_players_live = mgr.players.lock().await.len();
+                match update_server_stats(&mgr.pool, nb_players_live).await {
+                    Ok(_o) => {}
+                    Err(e) => {
+                        error!("Error updating server stats: {:?}", e);
+                    }
+                };
             }
         });
     }

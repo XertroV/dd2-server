@@ -72,7 +72,7 @@ impl Player {
     }
 
     pub fn is_connected(&self) -> bool {
-        self.has_shutdown.get().is_none()
+        self.has_shutdown.get().is_none() || self.tx.is_closed() || self.queue_tx.is_closed()
     }
 
     pub fn start(pool: Arc<Pool<Postgres>>, p: Arc<Player>, stream: TcpStream) {
@@ -112,7 +112,12 @@ impl Player {
                     return;
                 }
             };
-            info!("Player {} authenticated / resumed: {}", ls.display_name(), ls.resumed);
+            info!(
+                "Player {} ({}) authenticated / resumed: {}",
+                ls.display_name(),
+                ls.user.web_services_user_id,
+                ls.resumed
+            );
             p.session.set(ls).unwrap();
 
             // required loops: read player socket, write player socket, read incoming msgs
@@ -131,7 +136,7 @@ impl Player {
         let msg = match msg {
             Ok(msg) => msg,
             Err(err) => {
-                return Err(format!("Error reading from socket: {:?}", err).into());
+                return Err(format!("[{}] Error reading from socket: {:?}", p.display_name(), err).into());
             }
         };
         match msg {
@@ -267,8 +272,8 @@ impl Player {
                     Request::GetMyStats {} => Player::get_stats(&pool, p.clone()).await,
                     Request::GetGlobalLB { start, end } => Player::get_global_lb(&pool, p.clone(), start as i32, end as i32).await,
                     Request::GetFriendsLB { friends } => todo!(), // Player::get_friends_lb(&pool, p.clone(), &friends).await,
-                    Request::GetGlobalOverview {} => todo!(),     // Player::get_global_overview(&pool, p.clone()).await,
-                    Request::GetServerStats {} => todo!(),        // Player::get_server_stats(&pool, p.clone()).await,
+                    Request::GetGlobalOverview {} => Player::get_global_overview(&pool, p.clone()).await,
+                    Request::GetServerStats {} => Player::get_server_stats(&pool, p.clone()).await,
                     Request::StressMe {} => (0..100)
                         .map(|_| p.queue_tx.send(Response::Ping {}))
                         .collect::<Result<_, _>>()
@@ -310,10 +315,15 @@ impl Player {
 
 /// handle messages impls
 impl Player {
-    // pub async fn get_global_overview(pool: &Pool<Postgres>, p: Arc<Player>) -> Result<(), Error> {
-    //     let overview = queries::get_global_overview(pool).await?;
-    //     Ok(p.queue_tx.send(Response::GlobalOverview { overview })?)
-    // }
+    pub async fn get_server_stats(pool: &Pool<Postgres>, p: Arc<Player>) -> Result<(), Error> {
+        let nb_players_live = queries::get_server_info(pool).await?;
+        Ok(p.queue_tx.send(Response::ServerInfo { nb_players_live })?)
+    }
+
+    pub async fn get_global_overview(pool: &Pool<Postgres>, p: Arc<Player>) -> Result<(), Error> {
+        let overview = queries::get_global_overview(pool).await?;
+        Ok(p.queue_tx.send(Response::GlobalOverview { j: overview })?)
+    }
 
     pub async fn get_friends_lb(pool: &Pool<Postgres>, p: Arc<Player>, friends: &[Uuid]) -> Result<(), Error> {
         let lb = queries::get_friends_lb(pool, p.user_id(), friends).await?;
@@ -406,17 +416,17 @@ impl Player {
     }
 
     pub async fn report_respawn(pool: &Pool<Postgres>, p: Arc<Player>, race_time: i32) -> Result<(), Error> {
-        insert_respawn(pool, p.get_session().session_id(), race_time).await?;
+        insert_respawn(pool, p.session_id(), race_time).await?;
         Ok(())
     }
 
     pub async fn report_finish(pool: &Pool<Postgres>, p: Arc<Player>, race_time: i32) -> Result<(), Error> {
-        insert_finish(pool, p.get_session().session_id(), race_time).await?;
+        insert_finish(pool, p.session_id(), race_time).await?;
         Ok(())
     }
 
     pub async fn on_report_stats(pool: &Pool<Postgres>, p: Arc<Player>, stats: Stats) -> Result<(), Error> {
-        Ok(update_users_stats(pool, p.get_session().user_id(), &stats).await?)
+        Ok(update_users_stats(pool, p.user_id(), &stats).await?)
     }
 
     pub async fn on_report_pb_height(pool: &Pool<Postgres>, p: Arc<Player>, h: f32) -> Result<(), Error> {
@@ -467,16 +477,7 @@ impl Player {
         start_time: i32,
     ) -> Result<(), Error> {
         // insert
-        Ok(insert_start_fall(
-            pool,
-            p.get_session().user_id(),
-            p.get_session().user_id(),
-            floor,
-            pos,
-            speed,
-            start_time,
-        )
-        .await?)
+        Ok(insert_start_fall(pool, p.user_id(), p.session_id(), floor, pos, speed, start_time).await?)
     }
 
     pub async fn on_report_fall_end(
@@ -486,7 +487,7 @@ impl Player {
         pos: (f32, f32, f32),
         end_time: i32,
     ) -> Result<(), Error> {
-        update_fall_with_end(pool, p.get_session().user_id(), floor, pos, end_time).await?;
+        update_fall_with_end(pool, p.user_id(), floor, pos, end_time).await?;
         Ok(())
     }
 }

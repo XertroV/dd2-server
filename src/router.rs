@@ -274,14 +274,6 @@ pub enum Response {
     Ping {},
     ServerInfo {
         nb_players_live: u32,
-        nb_players_total: u32,
-        nb_sessions: u32,
-        nb_resets: u32,
-        nb_jumps: u32,
-        nb_map_loads: u32,
-        nb_falls: u32,
-        nb_floors_fallen: u32,
-        total_height_fallen: u32,
     },
 
     NewRecord {
