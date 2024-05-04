@@ -109,6 +109,7 @@ pub enum Request {
     } = 130,
     GetGlobalOverview {} = 131,
     GetServerStats {} = 132,
+    GetMyRank {} = 133,
 
     StressMe {} = 255,
 }
@@ -134,6 +135,7 @@ impl Request {
             Request::GetFriendsLB { .. } => 130,
             Request::GetGlobalOverview {} => 131,
             Request::GetServerStats {} => 132,
+            Request::GetMyRank {} => 133,
             Request::StressMe { .. } => 255,
         }
     }
@@ -158,6 +160,7 @@ impl Request {
             Request::GetFriendsLB { .. } => "GetFriendsLB",
             Request::GetGlobalOverview {} => "GetGlobalOverview",
             Request::GetServerStats {} => "GetServerStats",
+            Request::GetMyRank {} => "GetMyRank",
             Request::StressMe { .. } => "StressMe",
         }
     }
@@ -305,6 +308,9 @@ pub enum Response {
     Top3 {
         top3: Vec<LeaderboardEntry>,
     },
+    MyRank {
+        r: Option<LeaderboardEntry>,
+    },
 }
 
 impl Response {
@@ -321,6 +327,7 @@ impl Response {
             Response::FriendsLB { .. } => 130,
             Response::GlobalOverview { .. } => 131,
             Response::Top3 { .. } => 132,
+            Response::MyRank { .. } => 133,
         }
     }
 
@@ -337,6 +344,7 @@ impl Response {
             Response::FriendsLB { .. } => "FriendsLB",
             Response::GlobalOverview { .. } => "GlobalOverview",
             Response::Top3 { .. } => "Top3",
+            Response::MyRank { .. } => "MyRank",
         }
     }
 

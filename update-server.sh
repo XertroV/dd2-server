@@ -10,8 +10,8 @@ cargo build --release || exit 1
 
 function sync_server() {
     SERVERNAME=$1
-    ssh $SERVERNAME "mkdir -p ~/plugin-server"
-    rsync -avz config.json $SERVERNAME:~/plugin-server/ &
+    # ssh $SERVERNAME "mkdir -p ~/plugin-server"
+    # rsync -avz config.json $SERVERNAME:~/plugin-server/ &
     rsync -avz update.sh $SERVERNAME:~/plugin-server/update.sh &
     rsync -avz logs.sh $SERVERNAME:~/plugin-server/logs.sh &
     rsync -avz run.sh $SERVERNAME:~/plugin-server/run.sh &

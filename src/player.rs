@@ -15,9 +15,9 @@ use crate::api_error::Error;
 use crate::consts::DD2_MAP_UID;
 use crate::op_auth::{check_token, TokenResp};
 use crate::queries::{
-    self, context_mark_succeeded, create_session, get_global_lb, get_global_overview, get_server_info, get_user_stats, insert_context,
-    insert_context_packed, insert_finish, insert_gc_nod, insert_respawn, insert_start_fall, insert_vehicle_state, register_or_login,
-    resume_session, update_fall_with_end, update_user_pb_height, update_users_stats, Session, User,
+    self, context_mark_succeeded, create_session, get_global_lb, get_global_overview, get_server_info, get_user_in_lb, get_user_stats,
+    insert_context, insert_context_packed, insert_finish, insert_gc_nod, insert_respawn, insert_start_fall, insert_vehicle_state,
+    register_or_login, resume_session, update_fall_with_end, update_user_pb_height, update_users_stats, Session, User,
 };
 use crate::router::{write_response, LeaderboardEntry, Map, PlayerCtx, Request, Response, Stats};
 use crate::ToPlayerMgr;
@@ -287,6 +287,7 @@ impl Player {
                     Request::GetFriendsLB { friends } => todo!(), // Player::get_friends_lb(&pool, p.clone(), &friends).await,
                     Request::GetGlobalOverview {} => Player::get_global_overview(&pool, p.clone()).await,
                     Request::GetServerStats {} => Player::get_server_stats(&pool, p.clone()).await,
+                    Request::GetMyRank {} => Player::get_my_rank(&pool, p.clone()).await,
                     Request::StressMe {} => (0..100)
                         .map(|_| p.queue_tx.send(Response::Ping {}))
                         .collect::<Result<_, _>>()
@@ -328,6 +329,15 @@ impl Player {
 
 /// handle messages impls
 impl Player {
+    pub async fn get_my_rank(pool: &Pool<Postgres>, p: Arc<Player>) -> Result<(), Error> {
+        let lb_entry: Option<LeaderboardEntry> = match get_user_in_lb(pool, p.user_id().unwrap()).await {
+            Ok(r) => Ok::<Option<LeaderboardEntry>, Error>(r.map(|r| r.into())),
+            Err(sqlx::Error::RowNotFound) => Ok(None),
+            Err(e) => Err(e.into()),
+        }?;
+        Ok(p.queue_tx.send(Response::MyRank { r: lb_entry })?)
+    }
+
     pub async fn get_server_stats(pool: &Pool<Postgres>, p: Arc<Player>) -> Result<(), Error> {
         let nb_players_live = queries::get_server_info(pool).await?;
         Ok(p.queue_tx.send(Response::ServerInfo { nb_players_live })?)
