@@ -76,14 +76,21 @@ async fn listen(bind_addr: &str, pool: Arc<Pool<Postgres>>) {
     let player_mgr = Arc::new(player_mgr);
     PlayerMgr::start(player_mgr.clone());
     loop {
-        let (stream, _) = listener.accept().await.unwrap();
-        info!("New connection from {:?}", stream.peer_addr().unwrap());
-        let player_mgr = player_mgr.clone();
-        let player_mgr_tx = player_mgr_tx.clone();
-        let pool = pool.clone();
-        tokio::spawn(async move {
-            run_connection(pool, stream, player_mgr, player_mgr_tx).await;
-        });
+        match listener.accept().await {
+            Ok((stream, _addr)) => {
+                info!("New connection from {:?}", stream.peer_addr().unwrap());
+                let player_mgr = player_mgr.clone();
+                let player_mgr_tx = player_mgr_tx.clone();
+                let pool = pool.clone();
+                tokio::spawn(async move {
+                    run_connection(pool, stream, player_mgr, player_mgr_tx).await;
+                });
+            }
+            Err(e) => {
+                warn!("Failed to accept connection: {:?}", e);
+            }
+        }
+        tokio::task::yield_now().await;
     }
 }
 

@@ -110,7 +110,13 @@ pub async fn run_http_server(pool: Arc<Pool<Postgres>>) -> Result<(), Box<dyn st
     let get_global_lb = warp::path!("leaderboard" / "global")
         .and(warp::path::end())
         .map(move || req_pool.clone())
-        .and_then(|pool: Arc<Pool<Postgres>>| async move { api::handle_get_global_lb(&pool).await });
+        .and_then(|pool: Arc<Pool<Postgres>>| async move { api::handle_get_global_lb(&pool, 0).await });
+    let req_pool = pool.clone();
+
+    let get_global_lb_page = warp::path!("leaderboard" / "global" / u32)
+        .and(warp::path::end())
+        .map(move |op| (op, req_pool.clone()))
+        .and_then(|(op, pool): (u32, Arc<Pool<Postgres>>)| async move { api::handle_get_global_lb(&pool, op).await });
     let req_pool = pool.clone();
 
     let get_global_overview = warp::path!("overview")
@@ -155,6 +161,7 @@ pub async fn run_http_server(pool: Arc<Pool<Postgres>>) -> Result<(), Box<dyn st
         .or(api_routes)
         .or(version_route)
         .or(get_global_lb)
+        .or(get_global_lb_page)
         .or(get_global_overview)
         .or(get_server_info)
         .or(get_lb_pos_of_user)

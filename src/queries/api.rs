@@ -12,8 +12,10 @@ use crate::router::LeaderboardEntry;
 
 use super::get_global_lb;
 
-pub async fn handle_get_global_lb(pool: &Arc<Pool<Postgres>>) -> Result<Json, warp::Rejection> {
-    let r = get_global_lb(pool, 0, 100).await;
+pub async fn handle_get_global_lb(pool: &Arc<Pool<Postgres>>, page: u32) -> Result<Json, warp::Rejection> {
+    let start = (page * 100) as i32;
+    let end = (start + 100) as i32;
+    let r = get_global_lb(pool, start, end).await;
     match r {
         Ok(r) => Ok(warp::reply::json(
             &r.into_iter().map(|r| Into::<LeaderboardEntry>::into(r)).collect::<Vec<_>>(),
