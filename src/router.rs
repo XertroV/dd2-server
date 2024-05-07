@@ -12,6 +12,7 @@ use tokio::{
     },
     sync::{Mutex, OnceCell},
 };
+use tokio_util::sync::CancellationToken;
 
 use crate::{consts::DD2_MAP_UID, player::check_flags_sf_mi};
 
@@ -38,6 +39,13 @@ pub struct Database {}
 pub struct Method {
     name: String,
     handler: fn(Request) -> Response,
+}
+
+pub enum ToPlayerMgr {
+    RecheckRecords(),
+    AuthFailed(),
+    SocketError(),
+    NewTop3(),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -74,7 +82,7 @@ pub enum Request {
         vel: [f32; 3],
     } = 32,
     ReportRespawn {
-        race_time: i32,
+        race_time: i64,
     } = 33,
     ReportFinish {
         race_time: i32,
@@ -165,7 +173,10 @@ impl Request {
         }
     }
 
-    pub async fn read_from_socket(stream: &mut OwnedReadHalf) -> io::Result<Self> {
+    pub async fn read_from_socket(stream: &mut OwnedReadHalf, ct: CancellationToken) -> io::Result<Self> {
+        // await 9 bytes to read
+        let ct2 = ct.clone();
+        await_bytes(stream, ct2, 9).await?;
         let len = stream.read_u32_le().await?;
         let ty = stream.read_u8().await?;
         let str_len = stream.read_u32_le().await?;
@@ -173,6 +184,8 @@ impl Request {
             warn!("Invalid request length: {} != {}", len, 5 + str_len);
             return Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid request length"));
         }
+        let ct2 = ct.clone();
+        await_bytes(stream, ct2, str_len as usize).await?;
         let mut buf: Vec<u8> = vec![0; str_len as usize];
         stream.read_exact(&mut buf).await?;
         let req: Request = match serde_json::from_slice(&buf) {
@@ -189,6 +202,34 @@ impl Request {
         }
         Ok(req)
     }
+}
+
+async fn await_bytes(read: &mut OwnedReadHalf, ct: CancellationToken, n_bytes: usize) -> io::Result<()> {
+    let mut buf: Vec<u8> = vec![0; n_bytes];
+    tokio::select! {
+        r = read.readable() => {
+            if r.is_err() {
+                return Err(r.unwrap_err());
+            }
+        }
+        _ = ct.cancelled() => return Err(io::Error::new(io::ErrorKind::Interrupted, "Cancelled")),
+    }
+    // loop {
+    //     tokio::select! {
+    //         _ = ct.cancelled() => return Err(io::Error::new(io::ErrorKind::Interrupted, "Cancelled")),
+    //         n = read.peek(&mut buf[..]) => {
+    //             let n = n?;
+    //             if n < n_bytes {
+    //                 warn!("Not enough bytes to read: {} < {}", n, n_bytes);
+    //                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    //                 continue;
+    //             }
+    //             break;
+    //         }
+    //     }
+    // }
+    // Ok(buf)
+    Ok(())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

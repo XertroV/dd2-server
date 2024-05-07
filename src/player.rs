@@ -1,3 +1,5 @@
+use std::future::IntoFuture;
+use std::net::Shutdown;
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -10,6 +12,9 @@ use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc::{error::SendError, unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio::sync::{Mutex, OnceCell};
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 
 use crate::api_error::Error;
 use crate::consts::DD2_MAP_UID;
@@ -72,10 +77,17 @@ impl Player {
     }
 
     pub fn is_connected(&self) -> bool {
-        self.has_shutdown.get().is_none() || self.tx.is_closed() || self.queue_tx.is_closed()
+        !self.has_shutdown.initialized()
     }
 
-    pub fn start(pool: Arc<Pool<Postgres>>, p: Arc<Player>, stream: TcpStream) {
+    pub fn init_shutdown(&self) {
+        if self.has_shutdown.initialized() {
+            return;
+        }
+        let _ = self.has_shutdown.set(true);
+    }
+
+    pub async fn start(pool: Arc<Pool<Postgres>>, p: Arc<Player>, stream: TcpStream) -> JoinHandle<()> {
         tokio::spawn(async move {
             let (mut s_read, mut s_write) = stream.into_split();
             // auth player first
@@ -120,7 +132,7 @@ impl Player {
             );
             p.session.set(ls).unwrap();
 
-            if let Ok(r) = get_global_lb(&pool, 1, 4).await {
+            if let Ok(r) = get_global_lb(&pool, 1, 6).await {
                 let top3 = r.into_iter().map(|r| r.into()).collect::<Vec<LeaderboardEntry>>();
                 let top3 = Response::Top3 { top3 };
                 let _ = p.queue_tx.send(top3.clone());
@@ -136,15 +148,23 @@ impl Player {
             // clone tx_mgr for where it's required
             // if passes, start loops
             // otherwise notify mgr to remove player
-            Player::loop_read(pool.clone(), p.clone(), s_read);
-            Player::loop_write(p.clone(), s_write);
-            Player::loop_from_mgr(p.clone());
-        });
+            let tracker = TaskTracker::new();
+
+            let j1 = Player::loop_read(pool.clone(), p.clone(), s_read);
+            let j2 = Player::loop_write(p.clone(), s_write);
+            let j3 = Player::loop_from_mgr(p.clone());
+
+            tracker.spawn(async { j1.await });
+            tracker.spawn(async { j2.await });
+            tracker.spawn(async { j3.await });
+
+            tracker.wait().await;
+        })
     }
 
     pub async fn run_auth(pool: Arc<Pool<Postgres>>, p: Arc<Player>, s_read: &mut OwnedReadHalf) -> Result<LoginSession, Error> {
         // let mut stream = p.stream.lock().await;
-        let msg = Request::read_from_socket(s_read).await;
+        let msg = Request::read_from_socket(s_read, CancellationToken::new()).await;
         let msg = match msg {
             Ok(msg) => msg,
             Err(err) => {
@@ -223,7 +243,7 @@ impl Player {
         })
     }
 
-    pub fn loop_from_mgr(p: Arc<Player>) {
+    pub fn loop_from_mgr(p: Arc<Player>) -> JoinHandle<()> {
         tokio::spawn(async move {
             let tx_mgr = p.tx_mgr.clone();
             let mut rx = p.rx.lock().await;
@@ -234,20 +254,36 @@ impl Player {
                             // notify record
                         }
                         ToPlayer::Top3(t3) => {}
+                        ToPlayer::Send(_) => {}
+                        ToPlayer::Shutdown() => {
+                            rx.close();
+                            if p.has_shutdown.initialized() {
+                                return;
+                            }
+                            let _ = p.has_shutdown.set(true);
+                            return;
+                        }
                     },
                     None => {
                         break;
                     }
                 }
             }
-        });
+        })
     }
 
-    pub fn loop_read(pool: Arc<Pool<Postgres>>, p: Arc<Player>, mut s_read: OwnedReadHalf) {
+    pub fn loop_read(pool: Arc<Pool<Postgres>>, p: Arc<Player>, mut s_read: OwnedReadHalf) -> JoinHandle<()> {
         tokio::spawn(async move {
             let tx_mgr = p.tx_mgr.clone();
             while !p.has_shutdown.initialized() {
-                let msg = Request::read_from_socket(&mut s_read).await;
+                let msg = tokio::select! {
+                    r = Request::read_from_socket(&mut s_read, CancellationToken::new()) => Some(r),
+                    _ = tokio::time::sleep(tokio::time::Duration::from_secs(10)) => None,
+                };
+                if msg.is_none() {
+                    continue;
+                }
+                let msg = msg.unwrap();
                 let msg = match msg {
                     Ok(msg) => msg,
                     Err(err) => {
@@ -255,7 +291,7 @@ impl Player {
                         // notify mgr to remove player
                         let _ = p.tx_mgr.send(ToPlayerMgr::SocketError());
                         let _ = p.has_shutdown.set(true);
-                        return;
+                        break;
                     }
                 };
                 let res = match msg {
@@ -300,10 +336,12 @@ impl Player {
                     }
                 }
             }
-        });
+            drop(s_read);
+        })
+        .into_future()
     }
 
-    pub fn loop_write(p: Arc<Player>, mut s_write: OwnedWriteHalf) {
+    pub fn loop_write(p: Arc<Player>, mut s_write: OwnedWriteHalf) -> JoinHandle<()> {
         tokio::spawn(async move {
             let mut queue_rx = p.queue_rx.lock().await;
             while !p.has_shutdown.initialized() {
@@ -323,7 +361,8 @@ impl Player {
                 }
             }
             let _ = s_write.shutdown().await;
-        });
+            drop(s_write);
+        })
     }
 }
 
@@ -438,7 +477,11 @@ impl Player {
         Ok(())
     }
 
-    pub async fn report_respawn(pool: &Pool<Postgres>, p: Arc<Player>, race_time: i32) -> Result<(), Error> {
+    pub async fn report_respawn(pool: &Pool<Postgres>, p: Arc<Player>, race_time: i64) -> Result<(), Error> {
+        let race_time = match race_time > i32::MAX as i64 {
+            true => -1,
+            false => race_time as i32,
+        };
         insert_respawn(pool, p.session_id().unwrap(), race_time).await?;
         Ok(())
     }
@@ -521,6 +564,8 @@ impl Player {
 pub enum ToPlayer {
     NotifyRecord(),
     Top3(Vec<LeaderboardEntry>),
+    Shutdown(),
+    Send(Response),
 }
 
 #[derive(Debug, Clone)]

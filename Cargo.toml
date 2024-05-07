@@ -7,6 +7,10 @@ edition = "2021"
 name = "dd2-server"
 path = "src/server.rs"
 
+[[bin]]
+name = "dd2-server2"
+path = "src/server2.rs"
+
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
@@ -35,3 +39,9 @@ base64 = "0.22.1"
 warp = "0.3.7"
 lets-encrypt-warp = "0.3.0"
 hex = "0.4.3"
+tokio-graceful-shutdown = "0.15.0"
+miette = { version = "7.2.0", features = ["fancy"] }
+tokio-util = { version = "0.7.11", features = ["rt"] }
+thiserror = "1.0.59"
+supports-color = "3.0.0"
+hostname = "0.4.0"

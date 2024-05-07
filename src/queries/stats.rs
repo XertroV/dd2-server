@@ -87,7 +87,7 @@ pub async fn get_user_stats(pool: &Pool<Postgres>, user_id: &Uuid) -> Result<(St
     let r = query!("SELECT seconds_spent_in_map, nb_jumps, nb_falls, nb_floors_fallen, last_pb_set_ts, total_dist_fallen, pb_height, pb_floor, nb_resets, ggs_triggered, title_gags_triggered, title_gags_special_triggered, bye_byes_triggered, monument_triggers, reached_floor_count, floor_voice_lines_played, update_count, rank as rank_at_time FROM ranked_stats WHERE user_id = $1;", user_id)
         .fetch_one(pool)
         .await?;
-    let s = Stats {
+    let mut s = Stats {
         seconds_spent_in_map: r.seconds_spent_in_map.unwrap_or_default(),
         nb_jumps: r.nb_jumps.unwrap_or_default() as u32,
         nb_falls: r.nb_falls.unwrap_or_default() as u32,
@@ -104,6 +104,13 @@ pub async fn get_user_stats(pool: &Pool<Postgres>, user_id: &Uuid) -> Result<(St
         monument_triggers: r.monument_triggers.unwrap_or_default(),
         reached_floor_count: r.reached_floor_count.unwrap_or_default(),
         floor_voice_lines_played: r.floor_voice_lines_played.unwrap_or_default(),
+    };
+    let r2 = get_user_in_lb(pool, user_id).await?;
+    match r2 {
+        Some(lbe) => {
+            s.pb_height = lbe.height as f32;
+        }
+        None => {}
     };
     Ok((s, r.rank_at_time.unwrap_or(u32::MAX as i64) as u32))
 }
@@ -396,14 +403,15 @@ pub async fn update_global_overview(pool: &Pool<Postgres>) -> Result<serde_json:
     Ok(new_overview)
 }
 
-pub async fn update_server_stats(pool: &Pool<Postgres>, nb_players_live: usize) -> Result<(), sqlx::Error> {
+pub async fn update_server_stats(pool: &Pool<Postgres>, nb_players_live: i32) -> Result<(), sqlx::Error> {
+    let h = hostname::get();
+    let server_id = h
+        .map(|h| h.into_string().unwrap_or("cannot_decode".to_string()))
+        .unwrap_or("unknown".to_string());
     query!(
-        "INSERT INTO cached_json (key, value) VALUES ($1, $2) ON CONFLICT (key) DO UPDATE SET value = $2;",
-        "server_stats",
-        serde_json::json!({
-            "nb_players_live": nb_players_live,
-            "ts": SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
-        })
+        "INSERT INTO server_player_counts (server_id, player_count, updated_at) VALUES ($1, $2, NOW()) ON CONFLICT (server_id) DO UPDATE SET player_count = $2, updated_at = NOW();",
+        server_id,
+        nb_players_live,
     )
     .execute(pool)
     .await?;
@@ -411,9 +419,8 @@ pub async fn update_server_stats(pool: &Pool<Postgres>, nb_players_live: usize) 
 }
 
 pub async fn get_server_info(pool: &Pool<Postgres>) -> Result<u32, sqlx::Error> {
-    let r = query!("SELECT value FROM cached_json WHERE key = $1;", "server_stats")
+    let r = query!("SELECT SUM(player_count) FROM server_player_counts WHERE updated_at > NOW() - INTERVAL '60 seconds';")
         .fetch_one(pool)
         .await?;
-    let v: serde_json::Value = r.value;
-    Ok(v["nb_players_live"].as_i64().unwrap_or(0) as u32)
+    Ok(r.sum.unwrap_or(0) as u32)
 }

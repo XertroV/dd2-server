@@ -8,6 +8,7 @@ use env_logger::Env;
 use log::{error, info, warn};
 use player::Player;
 use queries::{get_global_lb, update_global_overview, update_server_stats};
+use router::ToPlayerMgr;
 use serde_json;
 use sqlx::{
     postgres::{PgPool, PgPoolOptions},
@@ -16,8 +17,10 @@ use sqlx::{
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, Interest},
     net::{TcpListener, TcpStream},
-    sync::mpsc::{unbounded_channel, Receiver, Sender, UnboundedReceiver, UnboundedSender},
-    sync::Mutex,
+    sync::{
+        mpsc::{unbounded_channel, Receiver, Sender, UnboundedReceiver, UnboundedSender},
+        Mutex, Semaphore,
+    },
 };
 
 use crate::{
@@ -34,11 +37,12 @@ mod player;
 mod queries;
 mod router;
 
+const MAX_CONNECTIONS: u32 = 2048;
+
 #[tokio::main(flavor = "multi_thread", worker_threads = 10)]
 async fn main() {
     dotenv().ok();
     env_logger::Builder::from_env(Env::default().default_filter_or("info")).init();
-
     info!("Starting DD2 Server for UID: {}", DD2_MAP_UID);
 
     // init db from env var
@@ -63,31 +67,46 @@ async fn main() {
     init_op_config().await;
     let bind_addr = "0.0.0.0:17677";
     warn!("Starting server on: {}", bind_addr);
+
     tokio::select! {
         _ = run_http_server(db.clone()) => {},
         _ = listen(bind_addr, db.clone()) => {},
     };
 }
 
-async fn listen(bind_addr: &str, pool: Arc<Pool<Postgres>>) {
+async fn listen(bind_addr: &str, pool: Arc<Pool<Postgres>>) -> Result<(), Box<dyn std::error::Error>> {
+    let limit_connections = Arc::new(Semaphore::new(MAX_CONNECTIONS as usize));
     let listener = TcpListener::bind(bind_addr).await.unwrap();
     info!("Listening on: {}", bind_addr);
-    let (player_mgr, player_mgr_tx) = PlayerMgr::new(pool.clone());
+    let (player_mgr, player_mgr_tx) = PlayerMgr::new(pool.clone(), limit_connections.clone());
     let player_mgr = Arc::new(player_mgr);
     PlayerMgr::start(player_mgr.clone());
     loop {
-        match listener.accept().await {
-            Ok((stream, _addr)) => {
-                info!("New connection from {:?}", stream.peer_addr().unwrap());
-                let player_mgr = player_mgr.clone();
-                let player_mgr_tx = player_mgr_tx.clone();
-                let pool = pool.clone();
-                tokio::spawn(async move {
-                    run_connection(pool, stream, player_mgr, player_mgr_tx).await;
-                });
-            }
-            Err(e) => {
-                warn!("Failed to accept connection: {:?}", e);
+        let permit = limit_connections.clone().acquire_owned().await.unwrap();
+        let mut backoff = 1;
+        loop {
+            match listener.accept().await {
+                Ok((stream, _addr)) => {
+                    backoff = 1;
+                    info!("New connection from {:?}", stream.peer_addr().unwrap());
+                    let player_mgr = player_mgr.clone();
+                    let player_mgr_tx = player_mgr_tx.clone();
+                    let pool = pool.clone();
+                    tokio::spawn(async move {
+                        run_connection(pool, stream, player_mgr, player_mgr_tx).await;
+                        drop(permit);
+                    });
+                    break;
+                }
+                Err(e) => {
+                    if backoff > 64 {
+                        error!("Failed to accept connection: {:?}", e);
+                        break;
+                    }
+                    warn!("Failed to accept connection: {:?}", e);
+                    tokio::time::sleep(Duration::from_secs(backoff)).await;
+                    backoff *= 2;
+                }
             }
         }
         tokio::task::yield_now().await;
@@ -110,7 +129,16 @@ async fn run_connection(
     };
     info!("Ready: {:?}", r);
     let p = Player::new(player_mgr_tx, ip_address);
-    player_mgr.add_player(pool, p, stream).await;
+    let p = player_mgr.add_player(pool, p, stream).await;
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_secs(1)) => {
+                if !p.is_connected() {
+                    break;
+                }
+            }
+        }
+    }
 }
 
 pub struct PlayerMgr {
@@ -118,10 +146,11 @@ pub struct PlayerMgr {
     rx: Mutex<UnboundedReceiver<ToPlayerMgr>>,
     state: Mutex<PlayerMgrState>,
     pool: Arc<Pool<Postgres>>,
+    limit_conns: Arc<Semaphore>,
 }
 
 impl PlayerMgr {
-    pub fn new(pool: Arc<Pool<Postgres>>) -> (Self, UnboundedSender<ToPlayerMgr>) {
+    pub fn new(pool: Arc<Pool<Postgres>>, limit_conns: Arc<Semaphore>) -> (Self, UnboundedSender<ToPlayerMgr>) {
         let (tx, rx) = unbounded_channel();
         (
             Self {
@@ -129,24 +158,27 @@ impl PlayerMgr {
                 rx: rx.into(),
                 state: Mutex::new(PlayerMgrState::default()),
                 pool,
+                limit_conns,
             },
             tx,
         )
     }
 
-    pub async fn add_player(&self, pool: Arc<Pool<Postgres>>, player: Player, stream: TcpStream) {
+    pub async fn add_player(&self, pool: Arc<Pool<Postgres>>, player: Player, stream: TcpStream) -> Arc<Player> {
         let player: Arc<_> = player.into();
         self.players.lock().await.push(player.clone());
-        Player::start(pool, player, stream);
+        Player::start(pool, player.clone(), stream);
+        player
     }
 
     pub fn watch_remove_players_dc(mgr: Arc<Self>) {
         tokio::spawn(async move {
             loop {
-                tokio::time::sleep(Duration::from_secs(5)).await;
+                tokio::time::sleep(Duration::from_secs(1)).await;
                 let mut players = mgr.players.lock().await;
                 for i in (0..players.len()).rev() {
                     if !players[i].is_connected() {
+                        players[i].init_shutdown();
                         players.remove(i);
                     }
                 }
@@ -190,10 +222,11 @@ impl PlayerMgr {
         let mgr = orig_mgr.clone();
         tokio::spawn(async move {
             loop {
-                tokio::time::sleep(Duration::from_millis(100)).await;
+                tokio::time::sleep(Duration::from_millis(500)).await;
                 let mut players = mgr.players.lock().await;
                 for i in (0..players.len()).rev() {
                     if !players[i].is_connected() {
+                        let _ = players[i].tx.send(ToPlayer::Shutdown());
                         let p = players.remove(i);
                         info!("Removing disconnected player: {:?}", p.display_name());
                     }
@@ -223,7 +256,7 @@ impl PlayerMgr {
             loop {
                 tokio::time::sleep(Duration::from_secs(5)).await;
                 let nb_players_live = mgr.players.lock().await.len();
-                match update_server_stats(&mgr.pool, nb_players_live).await {
+                match update_server_stats(&mgr.pool, nb_players_live as i32).await {
                     Ok(_o) => {}
                     Err(e) => {
                         error!("Error updating server stats: {:?}", e);
@@ -275,11 +308,4 @@ impl PlayerMgr {
 #[derive(Default)]
 pub struct PlayerMgrState {
     last_record_check: Option<SystemTime>,
-}
-
-pub enum ToPlayerMgr {
-    RecheckRecords(),
-    AuthFailed(),
-    SocketError(),
-    NewTop3(),
 }
