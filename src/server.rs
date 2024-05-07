@@ -274,7 +274,7 @@ impl PlayerMgr {
         // let mgr = orig_mgr.clone();
         // tokio::spawn(async move {
         //     loop {
-        //         if let Ok(r) = get_global_lb(&mgr.pool, 1, 6).await {
+        //         if let Ok(r) = get_global_lb(&mgr.pool, 1, 11).await {
         //             let top3 = r.into_iter().map(|r| r.into()).collect::<Vec<LeaderboardEntry>>();
         //             let top3 = router::Response::Top3 { top3 };
         //             let nb_players_live = get_server_info(&mgr.pool).await.unwrap_or_default();

@@ -141,7 +141,7 @@ impl PlayerMgr {
                 }
             };
 
-            let r = get_global_lb(&pool, 1, 6).await;
+            let r = get_global_lb(&pool, 1, 11).await;
             let r = match r {
                 Ok(r) => r,
                 Err(e) => {
@@ -582,7 +582,7 @@ impl XPlayer {
         let pool = self.pool.clone();
         let queue_tx = self.queue_tx.clone();
         tracker.spawn(async move {
-            if let Ok(r) = get_global_lb(&pool, 1, 6).await {
+            if let Ok(r) = get_global_lb(&pool, 1, 11).await {
                 let top3 = r.into_iter().map(|r| r.into()).collect::<Vec<LeaderboardEntry>>();
                 let top3 = Response::Top3 { top3 };
                 let _ = queue_tx.send(top3.clone());

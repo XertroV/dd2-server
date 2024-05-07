@@ -457,7 +457,7 @@ pub async fn get_users_latest_height(pool: &Pool<Postgres>, user_id: &Uuid) -> R
         r#"--sql
         WITH latest_session AS (
             SELECT u.display_name, s.* FROM sessions as s
-            LEFT JOIN users as u ON s.user_id = u.web_services_user_id
+            INNER JOIN users as u ON s.user_id = u.web_services_user_id
             WHERE s.user_id = $1
             ORDER BY s.session_token DESC LIMIT 1
         ),

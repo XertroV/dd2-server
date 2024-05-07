@@ -132,7 +132,7 @@ impl Player {
             );
             p.session.set(ls).unwrap();
 
-            if let Ok(r) = get_global_lb(&pool, 1, 6).await {
+            if let Ok(r) = get_global_lb(&pool, 1, 11).await {
                 let top3 = r.into_iter().map(|r| r.into()).collect::<Vec<LeaderboardEntry>>();
                 let top3 = Response::Top3 { top3 };
                 let _ = p.queue_tx.send(top3.clone());
@@ -615,10 +615,13 @@ pub fn context_map_plain_to_cypher(plain: i32) -> i32 {
     ret
 }
 
+// return true if not in editor
 pub fn check_flags_sf_mi(sf: u64, mi: u64) -> bool {
-    let scene_flags = decode_context_flags(sf);
-    // todo
-    true
+    let sfs = decode_context_flags(sf);
+    if sfs[5] || sfs[7] || sfs[8] || sfs[9] || sfs[11] {
+        return false;
+    }
+    sfs[2] || sfs[3] || sfs[4]
 }
 
 /*
