@@ -101,8 +101,19 @@ pub async fn insert_context_packed(
     .await
 }
 
+fn decode_map_hash(hash: &str) -> Vec<u8> {
+    match hash.len() == 64 {
+        true => match hex::decode(hash) {
+            Ok(h) => h,
+            Err(e) => hash[0..hash.len().min(32)].into(),
+        },
+        false => hash[..hash.len().min(32)].into(),
+    }
+}
+
 pub async fn get_or_insert_map(pool: &Pool<Postgres>, uid: &str, name: &str, hash: &str) -> Result<i32, sqlx::Error> {
-    let r = query!("SELECT map_id FROM maps WHERE uid = $1;", uid)
+    let h = decode_map_hash(hash);
+    let r = query!("SELECT map_id FROM maps WHERE uid = $1 AND hash = $2;", uid, h)
         .fetch_one(pool)
         .await
         .map(|r| r.map_id);
@@ -117,13 +128,7 @@ pub async fn get_or_insert_map(pool: &Pool<Postgres>, uid: &str, name: &str, has
 }
 
 async fn insert_map(pool: &Pool<Postgres>, uid: &str, name: &str, hash: &str) -> Result<i32, sqlx::Error> {
-    let h = match hash.len() == 64 {
-        true => match hex::decode(hash) {
-            Ok(h) => h,
-            Err(e) => hash[0..hash.len().min(32)].into(),
-        },
-        false => hash[..hash.len().min(32)].into(),
-    };
+    let h = decode_map_hash(hash);
     let r = query!(
         "INSERT INTO maps (uid, name, hash) VALUES ($1, $2, $3) RETURNING map_id;",
         uid,

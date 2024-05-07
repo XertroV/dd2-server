@@ -506,7 +506,11 @@ impl Player {
                         None => warn!("Dropping PB height b/c no map"),
                         Some(map) => {
                             if map.uid != DD2_MAP_UID {
-                                warn!("Dropping PB height b/c not DD2; user: {}", p.display_name().unwrap());
+                                warn!(
+                                    "Dropping PB height b/c not DD2; user: {}, uid: {}",
+                                    p.display_name().unwrap(),
+                                    map.uid
+                                );
                                 return Ok(());
                             } else {
                                 if !check_flags_sf_mi(ctx.sf, ctx.mi) {
@@ -695,6 +699,9 @@ pub fn encode_context_flags(arr: &[bool; 15]) -> u64 {
 
 pub fn decode_context_flags(flags: u64) -> [bool; 15] {
     let mut plain = [false; 15];
+    if flags == 0 {
+        return plain;
+    }
     let mut flags = flags;
     for i in 0..15 {
         if CONTEXT_COEFFICIENTS[i] < 2 {

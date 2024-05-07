@@ -386,9 +386,9 @@ pub async fn update_global_overview(pool: &Pool<Postgres>) -> Result<serde_json:
     let sessions = query!("SELECT COUNT(*) FROM sessions;").fetch_one(pool).await?.count;
     let rjf = query!("SELECT SUM(nb_resets) as resets, SUM(nb_jumps) as jumps, SUM(nb_falls) as falls, SUM(nb_floors_fallen) as floors_fallen, SUM(total_dist_fallen) as height_fallen FROM stats;").fetch_one(pool).await?;
     let falls_raw = query!("SELECT COUNT(*) FROM falls;").fetch_one(pool).await?.count;
-    let jumps_count = query!("SELECT COUNT(*) FROM falls_only_jumps;").fetch_one(pool).await?.count;
-    let falls_count = query!("SELECT COUNT(*) FROM falls_no_jumps;").fetch_one(pool).await?.count;
-    let falls_minor = query!("SELECT COUNT(*) FROM falls_minor;").fetch_one(pool).await?.count;
+    // let jumps_count = query!("SELECT COUNT(*) FROM falls_only_jumps;").fetch_one(pool).await?.count;
+    // let falls_count = query!("SELECT COUNT(*) FROM falls_no_jumps;").fetch_one(pool).await?.count;
+    // let falls_minor = query!("SELECT COUNT(*) FROM falls_minor;").fetch_one(pool).await?.count;
     let nb_players_live = get_server_info(pool).await.unwrap_or(0);
 
     let map_loads = query!("SELECT load_count FROM maps WHERE uid = $1;", DD2_MAP_UID)
@@ -407,9 +407,9 @@ pub async fn update_global_overview(pool: &Pool<Postgres>) -> Result<serde_json:
         "map_loads": map_loads,
         "ts": SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
         "falls_raw": falls_raw,
-        "jumps_count": jumps_count,
-        "falls_count": falls_count,
-        "falls_minor": falls_minor,
+        // "jumps_count": jumps_count,
+        // "falls_count": falls_count,
+        // "falls_minor": falls_minor,
         "nb_players_live": nb_players_live,
     });
     query!(

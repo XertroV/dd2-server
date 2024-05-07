@@ -443,24 +443,27 @@ impl XPlayer {
             let res = match msg {
                 Request::Authenticate { .. } => Ok(()),  // ignore
                 Request::ResumeSession { .. } => Ok(()), // ignore
-                Request::ReportContext { sf, mi, map, i, bi } => match (parse_u64_str(&sf), parse_u64_str(&mi)) {
-                    (Ok(sf), Ok(mi)) => {
-                        XPlayer::update_context(
-                            &pool,
-                            session_token,
-                            &mut ctx,
-                            &mut ctx_id,
-                            &mut previous_ctx_id,
-                            sf,
-                            mi,
-                            map.as_ref(),
-                            i.unwrap_or(false),
-                            bi,
-                        )
-                        .await
+                Request::ReportContext { sf, mi, map, i, bi } => {
+                    debug!("Report context: sf/mi/map/i/bi: {}/{}/{:?}/{:?}/{:?}", sf, mi, map, i, bi);
+                    match (parse_u64_str(&sf), parse_u64_str(&mi)) {
+                        (Ok(sf), Ok(mi)) => {
+                            XPlayer::update_context(
+                                &pool,
+                                session_token,
+                                &mut ctx,
+                                &mut ctx_id,
+                                &mut previous_ctx_id,
+                                sf,
+                                mi,
+                                map.as_ref(),
+                                i.unwrap_or(false),
+                                bi,
+                            )
+                            .await
+                        }
+                        _ => Err(format!("Invalid sf/mi: {}/{}", sf, mi).into()),
                     }
-                    _ => Err("Invalid sf/mi".to_string().into()),
-                },
+                }
                 Request::ReportGCNodMsg { data } => XPlayer::on_report_gcnod_msg(&pool, session_token, ctx_id.as_ref(), &data).await,
                 Request::Ping {} => queue_tx.send(Response::Ping {}).map_err(Into::into),
                 Request::ReportVehicleState { vel, pos, rotq } => {
@@ -721,6 +724,7 @@ impl XPlayer {
         if let Some(ctx_id) = ctx_id.as_ref() {
             let _ = previous_ctx.insert(ctx_id.clone());
         }
+        debug!("New context with sf: {}, mi: {}", sf, mi);
         let new_ctx = PlayerCtx::new(sf, mi, map.cloned(), has_vl_item);
         let map_id = match map {
             Some(map) => {
