@@ -2,6 +2,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use chrono::{DateTime, NaiveDateTime, Utc};
 use log::{info, warn};
+use serde::{Deserialize, Serialize};
 use sqlx::{prelude::FromRow, query, query_as, types::Uuid, Pool, Postgres};
 
 use crate::{
@@ -442,4 +443,83 @@ pub async fn get_server_info(pool: &Pool<Postgres>) -> Result<u32, sqlx::Error> 
         .fetch_one(pool)
         .await?;
     Ok(r.sum.unwrap_or(0) as u32)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlayerHeightLog {
+    pub display_name: String,
+    pub user_id: String,
+    pub last_5_points: Vec<(f64, i64)>,
+}
+
+pub async fn get_users_latest_height(pool: &Pool<Postgres>, user_id: &Uuid) -> Result<PlayerHeightLog, sqlx::Error> {
+    let r = query!(
+        r#"--sql
+        WITH latest_session AS (
+            SELECT u.display_name, s.* FROM sessions as s
+            LEFT JOIN users as u ON s.user_id = u.web_services_user_id
+            WHERE s.user_id = $1
+            ORDER BY s.session_token DESC LIMIT 1
+        ),
+        latest_official_vs AS (
+            SELECT l.display_name, l.user_id, vs.ts, vs.pos[2] as height
+            FROM latest_session AS l
+            LEFT JOIN vehicle_states AS vs ON vs.session_token = l.session_token AND vs.is_official = true
+            ORDER BY vs.ts DESC LIMIT 5
+        )
+        SELECT * from latest_official_vs;
+    "#,
+        user_id
+    )
+    .fetch_all(pool)
+    .await?;
+    let last_5_points = r
+        .iter()
+        .map(|r| (r.height.unwrap_or_default(), r.ts.and_utc().timestamp()))
+        .collect();
+    Ok(PlayerHeightLog {
+        display_name: r.get(0).map(|r| r.display_name.to_string()).unwrap_or_else(|| "? unknown ?".into()),
+        user_id: user_id.to_string(),
+        last_5_points,
+    })
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PlayerAtHeight {
+    pub display_name: String,
+    pub user_id: String,
+    pub height: f64,
+    pub ts: i64,
+}
+
+pub async fn get_live_leaderboard(pool: &Pool<Postgres>) -> Result<Vec<PlayerAtHeight>, sqlx::Error> {
+    let r = query!(
+        r#"--sql
+        WITH recent_points AS (
+            SELECT * FROM vehicle_states
+            WHERE ts > NOW() - INTERVAL '120 seconds' AND is_official = true
+            ORDER BY ts
+        ),
+        rankings AS (
+            SELECT *,
+                    ROW_NUMBER() OVER (PARTITION BY session_token ORDER BY ts DESC) AS rn
+            FROM recent_points
+        )
+        SELECT u.display_name, s.user_id, r.pos[2] as height, r.ts FROM rankings r
+        LEFT JOIN sessions s on s.session_token = r.session_token
+        LEFT JOIN users u on s.user_id = u.web_services_user_id
+        WHERE rn = 1
+        ORDER BY height DESC;
+    "#
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(r.into_iter()
+        .map(|r| PlayerAtHeight {
+            display_name: r.display_name,
+            user_id: r.user_id.map(|u| u.to_string()).unwrap_or_else(|| "? unknown ?".to_string()),
+            height: r.height.unwrap_or_default(),
+            ts: r.ts.and_utc().timestamp(),
+        })
+        .collect())
 }

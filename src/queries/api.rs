@@ -10,7 +10,7 @@ use warp::{
 
 use crate::router::LeaderboardEntry;
 
-use super::get_global_lb;
+use super::{get_global_lb, get_users_latest_height, stats};
 
 pub async fn handle_get_global_lb(pool: &Arc<Pool<Postgres>>, page: u32) -> Result<Json, warp::Rejection> {
     let start = (page * 100) as i32;
@@ -71,6 +71,34 @@ pub async fn handle_get_user_lb_pos(pool: &Pool<Postgres>, user: String) -> Resu
         None => serde_json::json!(null),
     };
     Ok(warp::reply::json(&r))
+}
+
+pub async fn handle_get_user_live_heights(pool: &Pool<Postgres>, user: String) -> Result<Json, warp::Rejection> {
+    let user_id = match Uuid::parse_str(&user) {
+        Ok(id) => id,
+        Err(e) => {
+            return Err(warp::reject::custom(ApiErrRejection::new("Invalid user id")));
+        }
+    };
+    let r = get_users_latest_height(pool, &user_id).await;
+    match r {
+        Ok(r) => Ok(warp::reply::json(&r)),
+        Err(e) => {
+            eprintln!("Error: {:?}", e);
+            Err(warp::reject::custom(Into::<ApiErrRejection>::into(e)))
+        }
+    }
+}
+
+pub async fn get_live_leaderboard(pool: &Pool<Postgres>) -> Result<Json, warp::Rejection> {
+    let r = stats::get_live_leaderboard(pool).await;
+    match r {
+        Ok(r) => Ok(warp::reply::json(&r)),
+        Err(e) => {
+            eprintln!("Error: {:?}", e);
+            Err(warp::reject::custom(Into::<ApiErrRejection>::into(e)))
+        }
+    }
 }
 
 #[derive(Debug)]
