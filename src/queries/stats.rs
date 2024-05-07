@@ -464,7 +464,7 @@ pub async fn get_users_latest_height(pool: &Pool<Postgres>, user_id: &Uuid) -> R
         latest_official_vs AS (
             SELECT l.display_name, l.user_id, vs.ts, vs.pos[2] as height
             FROM latest_session AS l
-            LEFT JOIN vehicle_states AS vs ON vs.session_token = l.session_token AND vs.is_official = true
+            INNER JOIN vehicle_states AS vs ON vs.session_token = l.session_token AND vs.is_official = true
             ORDER BY vs.ts DESC LIMIT 5
         )
         SELECT * from latest_official_vs;
