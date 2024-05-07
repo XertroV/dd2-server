@@ -251,6 +251,9 @@ pub async fn update_user_pb_height(pool: &Pool<Postgres>, user_id: &Uuid, height
     {
         Ok(r) => {
             if r.height < height {
+                if height - r.height > 50. {
+                    warn!("Player {:?} has large update to PB height: {:?} -> {:?}", user_id, r.height, height);
+                }
                 query!(
                     "UPDATE leaderboard SET height = $1, ts = NOW(), update_count = update_count + 1 WHERE user_id = $2 RETURNING update_count;",
                     height,
@@ -261,7 +264,7 @@ pub async fn update_user_pb_height(pool: &Pool<Postgres>, user_id: &Uuid, height
                 let r = query!(r#"--sql
                 INSERT INTO leaderboard_archive (user_id, height, rank_at_time) SELECT user_id, height, rank FROM ranked_lb_view WHERE user_id = $1
                     RETURNING rank_at_time;"#, user_id).fetch_one(pool).await?;
-                if r.rank_at_time < 4 {
+                if r.rank_at_time < 10 {
                     return Ok(PBUpdateRes { is_top_3: true });
                 }
             } else if r.height - height > 50. {
@@ -295,6 +298,7 @@ pub struct LBEntry {
     pub rank: Option<i64>,
     pub ts: NaiveDateTime,
     pub display_name: Option<String>,
+    pub update_count: i32,
 }
 impl Into<LeaderboardEntry> for LBEntry {
     fn into(self) -> LeaderboardEntry {
@@ -304,6 +308,7 @@ impl Into<LeaderboardEntry> for LBEntry {
             rank: self.rank.unwrap_or(99999) as u32,
             ts: self.ts.and_utc().timestamp() as u32,
             name: self.display_name.unwrap_or_else(|| "?".to_string()),
+            update_count: self.update_count,
         }
     }
 }
@@ -314,7 +319,7 @@ pub async fn get_global_lb(pool: &Pool<Postgres>, start: i32, end: i32) -> Resul
     }
     let limit = end - start;
     let r = query!(
-        "SELECT user_id as wsid, height, ts, rank, display_name FROM ranked_lb_view LIMIT $1 OFFSET $2;",
+        "SELECT user_id as wsid, height, ts, rank, display_name, update_count FROM ranked_lb_view LIMIT $1 OFFSET $2;",
         limit as i64,
         (start as i64 - 1).max(0),
     )
@@ -327,6 +332,7 @@ pub async fn get_global_lb(pool: &Pool<Postgres>, start: i32, end: i32) -> Resul
             rank: e.rank,
             ts: e.ts.unwrap(),
             display_name: e.display_name,
+            update_count: e.update_count.unwrap_or_default(),
         })
         .collect())
 }
@@ -334,7 +340,7 @@ pub async fn get_global_lb(pool: &Pool<Postgres>, start: i32, end: i32) -> Resul
 pub async fn get_user_in_lb(pool: &Pool<Postgres>, user_id: &Uuid) -> Result<Option<LBEntry>, sqlx::Error> {
     let r = query!(
         r#"--sql
-        SELECT user_id as wsid, height, ts, rank, display_name FROM ranked_lb_view WHERE user_id = $1;"#,
+        SELECT user_id as wsid, height, ts, rank, display_name, update_count FROM ranked_lb_view WHERE user_id = $1;"#,
         user_id
     )
     .fetch_optional(pool)
@@ -345,12 +351,13 @@ pub async fn get_user_in_lb(pool: &Pool<Postgres>, user_id: &Uuid) -> Result<Opt
         rank: e.rank,
         ts: e.ts.unwrap(),
         display_name: e.display_name,
+        update_count: e.update_count.unwrap_or_default(),
     }))
 }
 
 pub async fn get_friends_lb(pool: &Pool<Postgres>, user_id: &Uuid, friends: &[Uuid]) -> Result<Vec<LBEntry>, sqlx::Error> {
     let r = query!(
-        "SELECT user_id as wsid, height, ts, rank, display_name FROM ranked_lb_view WHERE user_id = ANY($1) ORDER BY height DESC;",
+        "SELECT user_id as wsid, height, ts, rank, display_name, update_count FROM ranked_lb_view WHERE user_id = ANY($1) ORDER BY height DESC;",
         friends
     )
     .fetch_all(pool)
@@ -362,6 +369,7 @@ pub async fn get_friends_lb(pool: &Pool<Postgres>, user_id: &Uuid, friends: &[Uu
             rank: e.rank,
             ts: e.ts.unwrap(),
             display_name: e.display_name,
+            update_count: e.update_count.unwrap_or_default(),
         })
         .collect())
 }
@@ -377,6 +385,12 @@ pub async fn update_global_overview(pool: &Pool<Postgres>) -> Result<serde_json:
     let players = query!("SELECT COUNT(*) FROM users;").fetch_one(pool).await?.count;
     let sessions = query!("SELECT COUNT(*) FROM sessions;").fetch_one(pool).await?.count;
     let rjf = query!("SELECT SUM(nb_resets) as resets, SUM(nb_jumps) as jumps, SUM(nb_falls) as falls, SUM(nb_floors_fallen) as floors_fallen, SUM(total_dist_fallen) as height_fallen FROM stats;").fetch_one(pool).await?;
+    let falls_raw = query!("SELECT COUNT(*) FROM falls;").fetch_one(pool).await?.count;
+    let jumps_count = query!("SELECT COUNT(*) FROM falls_only_jumps;").fetch_one(pool).await?.count;
+    let falls_count = query!("SELECT COUNT(*) FROM falls_no_jumps;").fetch_one(pool).await?.count;
+    let falls_minor = query!("SELECT COUNT(*) FROM falls_minor;").fetch_one(pool).await?.count;
+    let nb_players_live = get_server_info(pool).await.unwrap_or(0);
+
     let map_loads = query!("SELECT load_count FROM maps WHERE uid = $1;", DD2_MAP_UID)
         .fetch_one(pool)
         .await
@@ -392,6 +406,11 @@ pub async fn update_global_overview(pool: &Pool<Postgres>) -> Result<serde_json:
         "height_fallen": rjf.height_fallen,
         "map_loads": map_loads,
         "ts": SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
+        "falls_raw": falls_raw,
+        "jumps_count": jumps_count,
+        "falls_count": falls_count,
+        "falls_minor": falls_minor,
+        "nb_players_live": nb_players_live,
     });
     query!(
         "INSERT INTO cached_json (key, value) VALUES ($1, $2) ON CONFLICT (key) DO UPDATE SET value = $2;",

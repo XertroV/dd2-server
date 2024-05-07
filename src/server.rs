@@ -115,7 +115,7 @@ async fn listen(bind_addr: &str, pool: Arc<Pool<Postgres>>) -> Result<(), Box<dy
 
 async fn run_connection(
     pool: Arc<Pool<Postgres>>,
-    stream: TcpStream,
+    mut stream: TcpStream,
     player_mgr: Arc<PlayerMgr>,
     player_mgr_tx: UnboundedSender<ToPlayerMgr>,
 ) {
@@ -127,18 +127,22 @@ async fn run_connection(
             return;
         }
     };
-    info!("Ready: {:?}", r);
-    let p = Player::new(player_mgr_tx, ip_address);
-    let p = player_mgr.add_player(pool, p, stream).await;
-    loop {
-        tokio::select! {
-            _ = tokio::time::sleep(Duration::from_secs(1)) => {
-                if !p.is_connected() {
-                    break;
-                }
-            }
-        }
+    warn!("Player connected via deprecated server: {:?}, {:?}", ip_address, r);
+    let s = stream.shutdown().await;
+    if let Err(e) = s {
+        warn!("Failed to shutdown stream: {:?}", e);
     }
+    // let p = Player::new(player_mgr_tx, ip_address);
+    // let p = player_mgr.add_player(pool, p, stream).await;
+    // loop {
+    //     tokio::select! {
+    //         _ = tokio::time::sleep(Duration::from_secs(1)) => {
+    //             if !p.is_connected() {
+    //                 break;
+    //             }
+    //         }
+    //     }
+    // }
 }
 
 pub struct PlayerMgr {
@@ -246,7 +250,7 @@ impl PlayerMgr {
                         error!("Error updating global overview: {:?}", e);
                     }
                 }
-                tokio::time::sleep(Duration::from_secs(15)).await;
+                tokio::time::sleep(Duration::from_secs(7)).await;
             }
         });
 
@@ -256,6 +260,7 @@ impl PlayerMgr {
             loop {
                 tokio::time::sleep(Duration::from_secs(5)).await;
                 let nb_players_live = mgr.players.lock().await.len();
+                info!("Updating server(v1) stats: {:?}", nb_players_live);
                 match update_server_stats(&mgr.pool, nb_players_live as i32).await {
                     Ok(_o) => {}
                     Err(e) => {
@@ -265,29 +270,29 @@ impl PlayerMgr {
             }
         });
 
-        // send top3 to all players every 2 min
-        let mgr = orig_mgr.clone();
-        tokio::spawn(async move {
-            loop {
-                if let Ok(r) = get_global_lb(&mgr.pool, 1, 6).await {
-                    let top3 = r.into_iter().map(|r| r.into()).collect::<Vec<LeaderboardEntry>>();
-                    let top3 = router::Response::Top3 { top3 };
-                    let nb_players_live = get_server_info(&mgr.pool).await.unwrap_or_default();
-                    let server_info = router::Response::ServerInfo { nb_players_live };
-                    info!("Sending top3 to all players: {:?}", &top3);
-                    // let top3 = serde_json::to_string(&top3).unwrap();
-                    let players = mgr.players.lock().await;
-                    for p in players.iter() {
-                        let _ = p.queue_tx.send(top3.clone());
-                        let _ = p.queue_tx.send(server_info.clone());
-                    }
-                };
-                tokio::select! {
-                    _ = tokio::time::sleep(Duration::from_secs(120)) => {},
-                    _ = new_top3_rx.recv() => {},
-                }
-            }
-        });
+        // // send top3 to all players every 2 min
+        // let mgr = orig_mgr.clone();
+        // tokio::spawn(async move {
+        //     loop {
+        //         if let Ok(r) = get_global_lb(&mgr.pool, 1, 6).await {
+        //             let top3 = r.into_iter().map(|r| r.into()).collect::<Vec<LeaderboardEntry>>();
+        //             let top3 = router::Response::Top3 { top3 };
+        //             let nb_players_live = get_server_info(&mgr.pool).await.unwrap_or_default();
+        //             let server_info = router::Response::ServerInfo { nb_players_live };
+        //             info!("Sending top3 to all players: {:?}", &top3);
+        //             // let top3 = serde_json::to_string(&top3).unwrap();
+        //             let players = mgr.players.lock().await;
+        //             for p in players.iter() {
+        //                 let _ = p.queue_tx.send(top3.clone());
+        //                 let _ = p.queue_tx.send(server_info.clone());
+        //             }
+        //         };
+        //         tokio::select! {
+        //             _ = tokio::time::sleep(Duration::from_secs(120)) => {},
+        //             _ = new_top3_rx.recv() => {},
+        //         }
+        //     }
+        // });
     }
 
     pub fn start_recheck_records(mgr: Arc<Self>) {

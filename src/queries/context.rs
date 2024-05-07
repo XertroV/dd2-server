@@ -40,6 +40,7 @@ pub async fn insert_context(
     context_id: &Option<Uuid>,
     session_token: &Uuid,
     flags: &[bool; 15],
+    raw_flags: u64,
     has_vl_item: bool,
     map_id: Option<i32>,
     managers: i64,
@@ -48,10 +49,11 @@ pub async fn insert_context(
 ) -> Result<Uuid, sqlx::Error> {
     let context_id = context_id.unwrap_or_else(Uuid::now_v7);
     let r = query!(
-        "INSERT INTO contexts (context_id, session_token, flags, has_vl_item, map_id, managers, block_count, item_count, predecessor) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING context_id;",
+        "INSERT INTO contexts (context_id, session_token, flags, flags_raw, has_vl_item, map_id, managers, block_count, item_count, predecessor) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING context_id;",
         context_id,
         session_token,
         flags,
+        raw_flags as i64,
         has_vl_item,
         map_id,
         managers,
@@ -89,7 +91,8 @@ pub async fn insert_context_packed(
         &None,
         session_token,                     // &context.session_token,
         &decode_context_flags(context.sf), // context.is_editor,
-        context.i,                         // context.has_vl_item,
+        context.sf,
+        context.i, // context.has_vl_item,
         map_id,
         context.mi as i64,
         bi,

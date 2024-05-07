@@ -86,7 +86,7 @@ pub async fn run_http_server(pool: Arc<Pool<Postgres>>) -> Result<(), Box<dyn st
 
     let api_routes = warp::path!("api" / "routes")
         .and(warp::path::end())
-        .map(|| "Routes: /leaderboard/global, /leaderboard/<wsid>, /overview, /server_info");
+        .map(|| "Routes: /leaderboard/global, /leaderboard/global/<page>, /leaderboard/<wsid>, /overview, /server_info");
 
     let ping_path = warp::path!("mlping.Script.txt")
         .and(warp::path::end())
@@ -170,7 +170,7 @@ pub async fn run_http_server(pool: Arc<Pool<Postgres>>) -> Result<(), Box<dyn st
     #[cfg(debug_assertions)]
     warp::serve(site).run(soc_addr).await;
     #[cfg(not(debug_assertions))]
-    lets_encrypt(site, "dipspp.letsencrypt@xk.io", "dips-plus-plus-server.xk.io").await;
+    lets_encrypt(site, "dipspp.letsencrypt@xk.io", "dips-plus-plus.xk.io").await;
 
     info!("Server shutting down.");
 

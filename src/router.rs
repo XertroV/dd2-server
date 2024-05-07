@@ -441,6 +441,7 @@ pub struct LeaderboardEntry {
     pub height: f32,
     pub ts: u32,
     pub name: String,
+    pub update_count: i32,
 }
 
 pub async fn write_response(stream: &mut OwnedWriteHalf, resp: Response) -> io::Result<()> {
