@@ -70,80 +70,80 @@ async fn main() {
 
     tokio::select! {
         _ = run_http_server(db.clone()) => {},
-        _ = listen(bind_addr, db.clone()) => {},
+        // _ = listen(bind_addr, db.clone()) => {},
     };
 }
 
-async fn listen(bind_addr: &str, pool: Arc<Pool<Postgres>>) -> Result<(), Box<dyn std::error::Error>> {
-    let limit_connections = Arc::new(Semaphore::new(MAX_CONNECTIONS as usize));
-    let listener = TcpListener::bind(bind_addr).await.unwrap();
-    info!("Listening on: {}", bind_addr);
-    let (player_mgr, player_mgr_tx) = PlayerMgr::new(pool.clone(), limit_connections.clone());
-    let player_mgr = Arc::new(player_mgr);
-    PlayerMgr::start(player_mgr.clone());
-    loop {
-        let permit = limit_connections.clone().acquire_owned().await.unwrap();
-        let mut backoff = 1;
-        loop {
-            match listener.accept().await {
-                Ok((stream, _addr)) => {
-                    backoff = 1;
-                    info!("New connection from {:?}", stream.peer_addr().unwrap());
-                    let player_mgr = player_mgr.clone();
-                    let player_mgr_tx = player_mgr_tx.clone();
-                    let pool = pool.clone();
-                    tokio::spawn(async move {
-                        run_connection(pool, stream, player_mgr, player_mgr_tx).await;
-                        drop(permit);
-                    });
-                    break;
-                }
-                Err(e) => {
-                    if backoff > 64 {
-                        error!("Failed to accept connection: {:?}", e);
-                        break;
-                    }
-                    warn!("Failed to accept connection: {:?}", e);
-                    tokio::time::sleep(Duration::from_secs(backoff)).await;
-                    backoff *= 2;
-                }
-            }
-        }
-        tokio::task::yield_now().await;
-    }
-}
+// async fn listen(bind_addr: &str, pool: Arc<Pool<Postgres>>) -> Result<(), Box<dyn std::error::Error>> {
+//     let limit_connections = Arc::new(Semaphore::new(MAX_CONNECTIONS as usize));
+//     let listener = TcpListener::bind(bind_addr).await.unwrap();
+//     info!("Listening on: {}", bind_addr);
+//     let (player_mgr, player_mgr_tx) = PlayerMgr::new(pool.clone(), limit_connections.clone());
+//     let player_mgr = Arc::new(player_mgr);
+//     PlayerMgr::start(player_mgr.clone());
+//     loop {
+//         let permit = limit_connections.clone().acquire_owned().await.unwrap();
+//         let mut backoff = 1;
+//         loop {
+//             match listener.accept().await {
+//                 Ok((stream, _addr)) => {
+//                     backoff = 1;
+//                     info!("New connection from {:?}", stream.peer_addr().unwrap());
+//                     let player_mgr = player_mgr.clone();
+//                     let player_mgr_tx = player_mgr_tx.clone();
+//                     let pool = pool.clone();
+//                     tokio::spawn(async move {
+//                         run_connection(pool, stream, player_mgr, player_mgr_tx).await;
+//                         drop(permit);
+//                     });
+//                     break;
+//                 }
+//                 Err(e) => {
+//                     if backoff > 64 {
+//                         error!("Failed to accept connection: {:?}", e);
+//                         break;
+//                     }
+//                     warn!("Failed to accept connection: {:?}", e);
+//                     tokio::time::sleep(Duration::from_secs(backoff)).await;
+//                     backoff *= 2;
+//                 }
+//             }
+//         }
+//         tokio::task::yield_now().await;
+//     }
+// }
 
-async fn run_connection(
-    pool: Arc<Pool<Postgres>>,
-    mut stream: TcpStream,
-    player_mgr: Arc<PlayerMgr>,
-    player_mgr_tx: UnboundedSender<ToPlayerMgr>,
-) {
-    let r = stream.ready(Interest::READABLE | Interest::WRITABLE).await.unwrap();
-    let ip_address = match stream.peer_addr() {
-        Ok(addr) => addr.ip().to_string(),
-        Err(_) => {
-            warn!("Failed to get peer address: {:?}", stream);
-            return;
-        }
-    };
-    warn!("Player connected via deprecated server: {:?}, {:?}", ip_address, r);
-    let s = stream.shutdown().await;
-    if let Err(e) = s {
-        warn!("Failed to shutdown stream: {:?}", e);
-    }
-    // let p = Player::new(player_mgr_tx, ip_address);
-    // let p = player_mgr.add_player(pool, p, stream).await;
-    // loop {
-    //     tokio::select! {
-    //         _ = tokio::time::sleep(Duration::from_secs(1)) => {
-    //             if !p.is_connected() {
-    //                 break;
-    //             }
-    //         }
-    //     }
-    // }
-}
+// async fn run_connection(
+//     pool: Arc<Pool<Postgres>>,
+//     mut stream: TcpStream,
+//     player_mgr: Arc<PlayerMgr>,
+//     player_mgr_tx: UnboundedSender<ToPlayerMgr>,
+// ) {
+//     let r = stream.ready(Interest::READABLE | Interest::WRITABLE).await.unwrap();
+//     let ip_address = match stream.peer_addr() {
+//         Ok(addr) => addr.ip().to_string(),
+//         Err(_) => {
+//             warn!("Failed to get peer address: {:?}", stream);
+//             return;
+//         }
+//     };
+//     warn!("Player connected via deprecated server: {:?}, {:?}", ip_address, r);
+//     let s = stream.shutdown().await;
+//     if let Err(e) = s {
+//         warn!("Failed to shutdown stream: {:?}", e);
+//     }
+//     // let p = Player::new(player_mgr_tx, ip_address);
+//     // let p = player_mgr.add_player(pool, p, stream).await;
+//     // loop {
+//     //     tokio::select! {
+//     //         _ = tokio::time::sleep(Duration::from_secs(1)) => {
+//     //             if !p.is_connected() {
+//     //                 break;
+//     //             }
+//     //         }
+//     //     }
+//     // }
+// }
 
 pub struct PlayerMgr {
     players: Mutex<Vec<Arc<Player>>>,
@@ -171,7 +171,7 @@ impl PlayerMgr {
     pub async fn add_player(&self, pool: Arc<Pool<Postgres>>, player: Player, stream: TcpStream) -> Arc<Player> {
         let player: Arc<_> = player.into();
         self.players.lock().await.push(player.clone());
-        Player::start(pool, player.clone(), stream);
+        // Player::start(pool, player.clone(), stream);
         player
     }
 
@@ -180,12 +180,12 @@ impl PlayerMgr {
             loop {
                 tokio::time::sleep(Duration::from_secs(1)).await;
                 let mut players = mgr.players.lock().await;
-                for i in (0..players.len()).rev() {
-                    if !players[i].is_connected() {
-                        players[i].init_shutdown();
-                        players.remove(i);
-                    }
-                }
+                // for i in (0..players.len()).rev() {
+                //     if !players[i].is_connected() {
+                //         players[i].init_shutdown();
+                //         players.remove(i);
+                //     }
+                // }
             }
         });
     }
@@ -225,17 +225,17 @@ impl PlayerMgr {
         // watch for dead players loop
         let mgr = orig_mgr.clone();
         tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(Duration::from_millis(500)).await;
-                let mut players = mgr.players.lock().await;
-                for i in (0..players.len()).rev() {
-                    if !players[i].is_connected() {
-                        let _ = players[i].tx.send(ToPlayer::Shutdown());
-                        let p = players.remove(i);
-                        info!("Removing disconnected player: {:?}", p.display_name());
-                    }
-                }
-            }
+            // loop {
+            //     tokio::time::sleep(Duration::from_millis(500)).await;
+            //     let mut players = mgr.players.lock().await;
+            //     for i in (0..players.len()).rev() {
+            //         if !players[i].is_connected() {
+            //             let _ = players[i].tx.send(ToPlayer::Shutdown());
+            //             let p = players.remove(i);
+            //             info!("Removing disconnected player: {:?}", p.display_name());
+            //         }
+            //     }
+            // }
         });
 
         // update global stats
