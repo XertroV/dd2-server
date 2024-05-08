@@ -3,6 +3,7 @@ use std::{
     time::{Duration, SystemTime},
 };
 
+use donations::{get_donations_from_matcherino, update_donations_in_db};
 use dotenv::dotenv;
 use env_logger::Env;
 use log::{error, info, warn};
@@ -31,6 +32,7 @@ use crate::{
 mod api_error;
 mod consts;
 mod db;
+mod donations;
 mod http;
 mod op_auth;
 mod player;
@@ -67,6 +69,10 @@ async fn main() {
     init_op_config().await;
     let bind_addr = "0.0.0.0:17677";
     warn!("Starting server on: {}", bind_addr);
+
+    let limit_connections = Arc::new(Semaphore::new(MAX_CONNECTIONS as usize));
+    let (player_mgr, player_mgr_tx) = PlayerMgr::new(db.clone(), limit_connections.clone());
+    PlayerMgr::start(player_mgr.into());
 
     tokio::select! {
         _ = run_http_server(db.clone()) => {},
@@ -270,6 +276,22 @@ impl PlayerMgr {
             }
         });
 
+        let mgr = orig_mgr.clone();
+        tokio::spawn(async move {
+            loop {
+                info!("Updating donations");
+                match update_donations(&mgr.pool).await {
+                    Ok(r) => {
+                        info!("Updated donations: {:?}", r);
+                    }
+                    Err(e) => {
+                        error!("Error updating donations: {:?}", e);
+                    }
+                }
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            }
+        });
+
         // // send top3 to all players every 2 min
         // let mgr = orig_mgr.clone();
         // tokio::spawn(async move {
@@ -313,4 +335,10 @@ impl PlayerMgr {
 #[derive(Default)]
 pub struct PlayerMgrState {
     last_record_check: Option<SystemTime>,
+}
+
+pub async fn update_donations(pool: &Pool<Postgres>) -> Result<(), Box<dyn std::error::Error>> {
+    let donations = get_donations_from_matcherino().await?;
+    let new_donations = update_donations_in_db(pool, &donations).await?;
+    Ok(())
 }

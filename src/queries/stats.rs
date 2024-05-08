@@ -46,7 +46,7 @@ pub async fn update_users_stats(pool: &Pool<Postgres>, user_id: &Uuid, stats: &S
     ).fetch_one(pool).await;
     match r {
         Ok(r) => {
-            if (r.update_count + 8) % 10 == 0 {
+            if (r.update_count + 2) % 10 == 0 {
                 // insert into stats_archive
                 query!(r#"--sql
                 INSERT INTO stats_archive (user_id, seconds_spent_in_map, nb_jumps, nb_falls, nb_floors_fallen, last_pb_set_ts, total_dist_fallen, pb_height, pb_floor, nb_resets, ggs_triggered, title_gags_triggered, title_gags_special_triggered, bye_byes_triggered, monument_triggers, reached_floor_count, floor_voice_lines_played, update_count, rank_at_time)
