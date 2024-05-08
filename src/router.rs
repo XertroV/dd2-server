@@ -121,7 +121,7 @@ pub enum Request {
     GetPlayersPb {
         wsid: String,
     } = 134,
-
+    GetDonations {} = 135,
     StressMe {} = 255,
 }
 
@@ -148,6 +148,7 @@ impl Request {
             Request::GetServerStats {} => 132,
             Request::GetMyRank {} => 133,
             Request::GetPlayersPb { .. } => 134,
+            Request::GetDonations { .. } => 135,
             Request::StressMe { .. } => 255,
         }
     }
@@ -174,6 +175,7 @@ impl Request {
             Request::GetServerStats {} => "GetServerStats",
             Request::GetMyRank {} => "GetMyRank",
             Request::GetPlayersPb { .. } => "GetPlayersPb",
+            Request::GetDonations { .. } => "GetDonations",
             Request::StressMe { .. } => "StressMe",
         }
     }
@@ -364,6 +366,10 @@ pub enum Response {
         height: f64,
         rank: i64,
     },
+    Donations {
+        donors: Vec<Donor>,
+        donations: Vec<Donation>,
+    },
 }
 
 impl Response {
@@ -382,6 +388,7 @@ impl Response {
             Response::Top3 { .. } => 132,
             Response::MyRank { .. } => 133,
             Response::PlayersPB { .. } => 134,
+            Response::Donations { .. } => 135,
         }
     }
 
@@ -400,6 +407,7 @@ impl Response {
             Response::Top3 { .. } => "Top3",
             Response::MyRank { .. } => "MyRank",
             Response::PlayersPB { .. } => "PlayersPB",
+            Response::Donations { .. } => "Donations",
         }
     }
 
@@ -456,6 +464,25 @@ pub struct LeaderboardEntry {
     pub ts: u32,
     pub name: String,
     pub update_count: i32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Donor {
+    pub name: String,
+    pub amount: f64,
+}
+
+impl From<(String, f64)> for Donor {
+    fn from((name, amount): (String, f64)) -> Self {
+        Donor { name, amount }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Donation {
+    pub name: String,
+    pub amount: f64,
+    pub ts: i64,
 }
 
 pub async fn write_response(stream: &mut OwnedWriteHalf, resp: Response) -> io::Result<()> {

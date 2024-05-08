@@ -1,5 +1,6 @@
 use api_error::Error as ApiError;
 use base64::Engine;
+use donations::get_donations_and_donors;
 use dotenv::dotenv;
 use env_logger::Env;
 use log::{debug, error, info, warn};
@@ -53,6 +54,7 @@ use crate::{
 mod api_error;
 mod consts;
 mod db;
+mod donations;
 mod http;
 mod op_auth;
 mod player;
@@ -503,6 +505,7 @@ impl XPlayer {
                 Request::GetServerStats {} => XPlayer::get_server_stats(&pool, &queue_tx).await,
                 Request::GetMyRank {} => XPlayer::get_my_rank(&pool, user_id, &queue_tx).await,
                 Request::GetPlayersPb { wsid } => XPlayer::get_players_pb(&pool, wsid, &queue_tx).await,
+                Request::GetDonations {} => XPlayer::get_donations(&pool, &queue_tx).await.map_err(|e| e.into()),
                 Request::StressMe {} => (0..100)
                     .map(|_| queue_tx.send(Response::Ping {}))
                     .collect::<Result<_, _>>()
@@ -765,6 +768,14 @@ impl XPlayer {
             }
         }
         Ok(())
+    }
+
+    pub async fn get_donations(pool: &Pool<Postgres>, queue_tx: &UnboundedSender<Response>) -> Result<(), ApiError> {
+        let (donations, donors) = get_donations_and_donors(pool).await?;
+        Ok(queue_tx.send(Response::Donations {
+            donations,
+            donors: donors.into_iter().map(|d| d.into()).collect(),
+        })?)
     }
 
     pub async fn get_players_pb(pool: &Pool<Postgres>, wsid: String, queue_tx: &UnboundedSender<Response>) -> Result<(), ApiError> {

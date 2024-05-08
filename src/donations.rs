@@ -1,15 +1,18 @@
 use chrono::NaiveDateTime;
 use log::info;
+use num_traits::cast::ToPrimitive;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::types::chrono::DateTime;
 use sqlx::{query, types::BigDecimal, Pool, Postgres};
 use std::str::FromStr;
 
+use crate::router::Donation;
+
 const MATCHERINO_URL: &str = "https://api.matcherino.com/__api/bounties/findById?id=111501";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Donation {
+pub struct DonationFull {
     pub id: i32,
     pub action: String,
     pub authProvider: String,
@@ -26,34 +29,23 @@ pub struct Donation {
     pub supercellCharacter: String,
 }
 
-pub async fn get_donations_from_matcherino() -> Result<Vec<Donation>, Box<dyn std::error::Error>> {
+pub async fn get_donations_from_matcherino() -> Result<Vec<DonationFull>, Box<dyn std::error::Error>> {
     let resp = reqwest::get(MATCHERINO_URL).await?.json::<Value>().await?;
     let body = resp.get("body").ok_or("No body in response")?;
     let txs = body.get("transactions").ok_or("No transactions")?;
     let txs = txs.as_array().ok_or("Transactions not an array")?;
     let mut ret = vec![];
     for tx in txs {
-        let donation: Donation = serde_json::from_value(tx.clone())?;
+        let donation: DonationFull = serde_json::from_value(tx.clone())?;
         ret.push(donation);
     }
     Ok(ret)
 }
 
-/**
- * CREATE TABLE donations (
-    id INTEGER PRIMARY KEY,
-    auth_provider VARCHAR(32) NOT NULL,
-    user_name VARCHAR(128) NOT NULL,
-    display_name VARCHAR(128) NOT NULL,
-    comment TEXT NOT NULL,
-    amount DECIMAL(10, 2) NOT NULL,
-    avatar TEXT,
-    donated_at TIMESTAMP NOT NULL,
-    created_at TIMESTAMP NOT NULL DEFAULT NOW()
-);
- */
-
-pub async fn update_donations_in_db(pool: &Pool<Postgres>, donos: &Vec<Donation>) -> Result<Vec<Donation>, Box<dyn std::error::Error>> {
+pub async fn update_donations_in_db(
+    pool: &Pool<Postgres>,
+    donos: &Vec<DonationFull>,
+) -> Result<Vec<DonationFull>, Box<dyn std::error::Error>> {
     let mut ret = vec![];
     for dono in donos {
         let r = query!("SELECT EXISTS(SELECT 1 FROM donations WHERE id = $1);", dono.id)
@@ -85,4 +77,21 @@ pub async fn update_donations_in_db(pool: &Pool<Postgres>, donos: &Vec<Donation>
         info!("Total for {:?}: {:?}", dono.userName, r.total);
     }
     Ok(ret)
+}
+
+pub async fn get_donations_and_donors(pool: &Pool<Postgres>) -> Result<(Vec<Donation>, Vec<(String, f64)>), sqlx::Error> {
+    let r = query!("SELECT display_name, amount, donated_at FROM donations ORDER BY donated_at DESC;")
+        .fetch_all(pool)
+        .await?;
+    let donos: Vec<Donation> = r
+        .into_iter()
+        .map(|r| Donation {
+            name: r.display_name,
+            amount: r.amount.to_f64().unwrap_or(-1.),
+            ts: r.donated_at.and_utc().timestamp(),
+        })
+        .collect();
+    let totals = query!("SELECT user_name, total FROM user_dono_totals;").fetch_all(pool).await?;
+    let totals: Vec<(String, f64)> = totals.into_iter().map(|r| (r.user_name, r.total.to_f64().unwrap())).collect();
+    Ok((donos, totals))
 }

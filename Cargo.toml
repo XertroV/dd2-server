@@ -46,3 +46,4 @@ tokio-util = { version = "0.7.11", features = ["rt"] }
 thiserror = "1.0.59"
 supports-color = "3.0.0"
 hostname = "0.4.0"
+num-traits = "0.2.19"
