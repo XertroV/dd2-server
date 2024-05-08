@@ -432,7 +432,11 @@ impl XPlayer {
                 },
             };
             let msg = match msg {
-                Ok(msg) => msg,
+                Ok(Some(msg)) => msg,
+                Ok(None) => {
+                    // unknown msg
+                    continue;
+                }
                 Err(err) => {
                     warn!("Error reading from socket: {:?}", err);
                     // notify mgr to remove player
@@ -618,18 +622,18 @@ impl XPlayer {
             }
         };
         match msg {
-            Request::Authenticate {
+            Some(Request::Authenticate {
                 token,
                 plugin_info,
                 game_info,
                 gamer_info,
-            } => self.login_via_token(token, plugin_info, game_info, gamer_info).await,
-            Request::ResumeSession {
+            }) => self.login_via_token(token, plugin_info, game_info, gamer_info).await,
+            Some(Request::ResumeSession {
                 session_token,
                 plugin_info,
                 game_info,
                 gamer_info,
-            } => self.login_via_session(session_token, plugin_info, game_info, gamer_info).await,
+            }) => self.login_via_session(session_token, plugin_info, game_info, gamer_info).await,
             _ => {
                 return Err(format!("Invalid request {:?}", msg).into());
             }

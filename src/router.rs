@@ -178,7 +178,7 @@ impl Request {
         }
     }
 
-    pub async fn read_from_socket(stream: &mut OwnedReadHalf, ct: CancellationToken) -> io::Result<Self> {
+    pub async fn read_from_socket(stream: &mut OwnedReadHalf, ct: CancellationToken) -> io::Result<Option<Self>> {
         // await 9 bytes to read
         let ct2 = ct.clone();
         await_bytes(stream, ct2, 9).await?;
@@ -198,14 +198,16 @@ impl Request {
             Err(err) => {
                 let s = String::from_utf8_lossy(&buf);
                 warn!("Error deserializing request: {:?} for {}", err, s);
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "Error deserializing request"));
+                // fail but keep the connection, useful for testing new messages without restarting prod
+                return Ok(None);
+                // return Err(io::Error::new(io::ErrorKind::InvalidData, "Error deserializing request"));
             }
         };
         if req.ty() != ty {
             warn!("Invalid request type: {} != {}", ty, req.ty());
             return Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid request type"));
         }
-        Ok(req)
+        Ok(Some(req))
     }
 }
 
