@@ -386,7 +386,7 @@ pub async fn update_global_overview(pool: &Pool<Postgres>) -> Result<serde_json:
     let players = query!("SELECT COUNT(*) FROM users;").fetch_one(pool).await?.count;
     let sessions = query!("SELECT COUNT(*) FROM sessions;").fetch_one(pool).await?.count;
     let rjf = query!("SELECT SUM(nb_resets) as resets, SUM(nb_jumps) as jumps, SUM(nb_falls) as falls, SUM(nb_floors_fallen) as floors_fallen, SUM(total_dist_fallen) as height_fallen FROM stats;").fetch_one(pool).await?;
-    let falls_raw = query!("SELECT COUNT(*) FROM falls;").fetch_one(pool).await?.count;
+    let falls_raw = query!("SELECT MAX(id) FROM falls;").fetch_one(pool).await?.max;
     // let jumps_count = query!("SELECT COUNT(*) FROM falls_only_jumps;").fetch_one(pool).await?.count;
     // let falls_count = query!("SELECT COUNT(*) FROM falls_no_jumps;").fetch_one(pool).await?.count;
     // let falls_minor = query!("SELECT COUNT(*) FROM falls_minor;").fetch_one(pool).await?.count;
