@@ -324,6 +324,7 @@ impl Player {
                     Request::GetGlobalOverview {} => Player::get_global_overview(&pool, p.clone()).await,
                     Request::GetServerStats {} => Player::get_server_stats(&pool, p.clone()).await,
                     Request::GetMyRank {} => Player::get_my_rank(&pool, p.clone()).await,
+                    Request::GetPlayersPb { .. } => todo!(),
                     Request::StressMe {} => (0..100)
                         .map(|_| p.queue_tx.send(Response::Ping {}))
                         .collect::<Result<_, _>>()

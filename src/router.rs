@@ -118,6 +118,9 @@ pub enum Request {
     GetGlobalOverview {} = 131,
     GetServerStats {} = 132,
     GetMyRank {} = 133,
+    GetPlayersPb {
+        wsid: String,
+    } = 134,
 
     StressMe {} = 255,
 }
@@ -144,6 +147,7 @@ impl Request {
             Request::GetGlobalOverview {} => 131,
             Request::GetServerStats {} => 132,
             Request::GetMyRank {} => 133,
+            Request::GetPlayersPb { .. } => 134,
             Request::StressMe { .. } => 255,
         }
     }
@@ -169,6 +173,7 @@ impl Request {
             Request::GetGlobalOverview {} => "GetGlobalOverview",
             Request::GetServerStats {} => "GetServerStats",
             Request::GetMyRank {} => "GetMyRank",
+            Request::GetPlayersPb { .. } => "GetPlayersPb",
             Request::StressMe { .. } => "StressMe",
         }
     }
@@ -352,6 +357,11 @@ pub enum Response {
     MyRank {
         r: Option<LeaderboardEntry>,
     },
+    PlayersPB {
+        name: String,
+        height: f64,
+        rank: i64,
+    },
 }
 
 impl Response {
@@ -369,6 +379,7 @@ impl Response {
             Response::GlobalOverview { .. } => 131,
             Response::Top3 { .. } => 132,
             Response::MyRank { .. } => 133,
+            Response::PlayersPB { .. } => 134,
         }
     }
 
@@ -386,6 +397,7 @@ impl Response {
             Response::GlobalOverview { .. } => "GlobalOverview",
             Response::Top3 { .. } => "Top3",
             Response::MyRank { .. } => "MyRank",
+            Response::PlayersPB { .. } => "PlayersPB",
         }
     }
 

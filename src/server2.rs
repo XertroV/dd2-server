@@ -498,6 +498,7 @@ impl XPlayer {
                 Request::GetGlobalOverview {} => XPlayer::get_global_overview(&pool, &queue_tx).await,
                 Request::GetServerStats {} => XPlayer::get_server_stats(&pool, &queue_tx).await,
                 Request::GetMyRank {} => XPlayer::get_my_rank(&pool, user_id, &queue_tx).await,
+                Request::GetPlayersPb { wsid } => XPlayer::get_players_pb(&pool, wsid, &queue_tx).await,
                 Request::StressMe {} => (0..100)
                     .map(|_| queue_tx.send(Response::Ping {}))
                     .collect::<Result<_, _>>()
@@ -760,6 +761,23 @@ impl XPlayer {
             }
         }
         Ok(())
+    }
+
+    pub async fn get_players_pb(pool: &Pool<Postgres>, wsid: String, queue_tx: &UnboundedSender<Response>) -> Result<(), ApiError> {
+        let user_id = match Uuid::from_str(&wsid) {
+            Ok(u) => u,
+            Err(_) => return Ok(()), // ignore bad wsids
+        };
+        let pb = get_user_in_lb(pool, &user_id).await?;
+        if let Some(pb) = pb {
+            return Ok(queue_tx.send(Response::PlayersPB {
+                name: pb.display_name.unwrap_or(wsid),
+                height: pb.height,
+                rank: pb.rank.unwrap_or(99999),
+            })?);
+        };
+        Ok(())
+        // otherwise ignore, nothing to respond with
     }
 
     pub async fn get_my_rank(pool: &Pool<Postgres>, user_id: &Uuid, queue_tx: &UnboundedSender<Response>) -> Result<(), ApiError> {

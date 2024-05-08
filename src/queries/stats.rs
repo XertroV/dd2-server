@@ -391,12 +391,13 @@ pub async fn update_global_overview(pool: &Pool<Postgres>) -> Result<serde_json:
     // let falls_count = query!("SELECT COUNT(*) FROM falls_no_jumps;").fetch_one(pool).await?.count;
     // let falls_minor = query!("SELECT COUNT(*) FROM falls_minor;").fetch_one(pool).await?.count;
     let nb_players_live = get_server_info(pool).await.unwrap_or(0);
+    let live_lb = get_live_leaderboard(pool).await?;
 
-    let map_loads = query!("SELECT load_count FROM maps WHERE uid = $1;", DD2_MAP_UID)
-        .fetch_one(pool)
-        .await
-        .map(|r| r.load_count)
-        .unwrap_or(0);
+    // let map_loads = query!("SELECT SUM(load_count) FROM maps WHERE uid = $1;", DD2_MAP_UID)
+    //     .fetch_one(pool)
+    //     .await
+    //     .map(|r| r.load_count)
+    //     .unwrap_or(0);
     let new_overview = serde_json::json!({
         "players": players,
         "sessions": sessions,
@@ -405,13 +406,14 @@ pub async fn update_global_overview(pool: &Pool<Postgres>) -> Result<serde_json:
         "falls": rjf.falls,
         "floors_fallen": rjf.floors_fallen,
         "height_fallen": rjf.height_fallen,
-        "map_loads": map_loads,
+        // "map_loads": map_loads,
         "ts": SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
         "falls_raw": falls_raw,
         // "jumps_count": jumps_count,
         // "falls_count": falls_count,
         // "falls_minor": falls_minor,
         "nb_players_live": nb_players_live,
+        "nb_players_climbing": live_lb.len() as i32,
     });
     query!(
         "INSERT INTO cached_json (key, value) VALUES ($1, $2) ON CONFLICT (key) DO UPDATE SET value = $2;",
@@ -435,6 +437,17 @@ pub async fn update_server_stats(pool: &Pool<Postgres>, nb_players_live: i32) ->
     )
     .execute(pool)
     .await?;
+    let nb_players_live = get_server_info(pool).await?;
+    query!(
+        "INSERT INTO server_connected_stats (nb_players) VALUES ($1);",
+        nb_players_live as i32
+    )
+    .execute(pool)
+    .await?;
+    let lb = get_live_leaderboard(pool).await?;
+    query!("INSERT INTO active_players_stats (nb_players) VALUES ($1);", lb.len() as i32)
+        .execute(pool)
+        .await?;
     Ok(())
 }
 
@@ -459,7 +472,7 @@ pub async fn get_users_latest_height(pool: &Pool<Postgres>, user_id: &Uuid) -> R
             SELECT u.display_name, s.* FROM sessions as s
             INNER JOIN users as u ON s.user_id = u.web_services_user_id
             WHERE s.user_id = $1
-            ORDER BY s.session_token DESC LIMIT 1
+            ORDER BY s.created_ts DESC LIMIT 1
         ),
         latest_official_vs AS (
             SELECT l.display_name, l.user_id, vs.ts, vs.pos[2] as height
@@ -490,6 +503,7 @@ pub struct PlayerAtHeight {
     pub user_id: String,
     pub height: f64,
     pub ts: i64,
+    pub rank: i64,
 }
 
 pub async fn get_live_leaderboard(pool: &Pool<Postgres>) -> Result<Vec<PlayerAtHeight>, sqlx::Error> {
@@ -497,29 +511,36 @@ pub async fn get_live_leaderboard(pool: &Pool<Postgres>) -> Result<Vec<PlayerAtH
         r#"--sql
         WITH recent_points AS (
             SELECT * FROM vehicle_states
-            WHERE ts > NOW() - INTERVAL '120 seconds' AND is_official = true
+            WHERE ts > NOW() - INTERVAL '180 seconds' AND is_official = true
             ORDER BY ts
         ),
         rankings AS (
             SELECT *,
                     ROW_NUMBER() OVER (PARTITION BY session_token ORDER BY ts DESC) AS rn
             FROM recent_points
+        ),
+        rankings2 AS (
+            SELECT s.user_id, r.pos[2] as height, r.ts, r.rn,
+                    ROW_NUMBER() OVER (PARTITION BY s.user_id ORDER BY r.ts DESC) AS rn2
+            FROM rankings r
+            INNER JOIN sessions s ON s.session_token = r.session_token
         )
-        SELECT u.display_name, s.user_id, r.pos[2] as height, r.ts FROM rankings r
-        LEFT JOIN sessions s on s.session_token = r.session_token
-        LEFT JOIN users u on s.user_id = u.web_services_user_id
-        WHERE rn = 1
+        SELECT u.display_name, r.user_id, r.height, r.ts FROM rankings2 r
+        LEFT JOIN users u on r.user_id = u.web_services_user_id
+        WHERE rn = 1 AND rn2 = 1
         ORDER BY height DESC;
     "#
     )
     .fetch_all(pool)
     .await?;
     Ok(r.into_iter()
-        .map(|r| PlayerAtHeight {
+        .enumerate()
+        .map(|(i, r)| PlayerAtHeight {
             display_name: r.display_name,
             user_id: r.user_id.map(|u| u.to_string()).unwrap_or_else(|| "? unknown ?".to_string()),
             height: r.height.unwrap_or_default(),
             ts: r.ts.and_utc().timestamp(),
+            rank: (i + 1) as i64,
         })
         .collect())
 }
