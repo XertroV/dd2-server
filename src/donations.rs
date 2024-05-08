@@ -80,7 +80,7 @@ pub async fn update_donations_in_db(
 }
 
 pub async fn get_donations_and_donors(pool: &Pool<Postgres>) -> Result<(Vec<Donation>, Vec<(String, f64)>), sqlx::Error> {
-    let r = query!("SELECT display_name, amount, donated_at FROM donations ORDER BY donated_at DESC;")
+    let r = query!("SELECT display_name, amount, donated_at, comment FROM donations ORDER BY donated_at DESC;")
         .fetch_all(pool)
         .await?;
     let donos: Vec<Donation> = r
@@ -89,9 +89,18 @@ pub async fn get_donations_and_donors(pool: &Pool<Postgres>) -> Result<(Vec<Dona
             name: r.display_name,
             amount: r.amount.to_f64().unwrap_or(-1.),
             ts: r.donated_at.and_utc().timestamp(),
+            comment: r.comment,
         })
         .collect();
-    let totals = query!("SELECT user_name, total FROM user_dono_totals;").fetch_all(pool).await?;
-    let totals: Vec<(String, f64)> = totals.into_iter().map(|r| (r.user_name, r.total.to_f64().unwrap())).collect();
+    let totals = query!(
+        r#"--sql
+    SELECT DISTINCT d.display_name, total FROM user_dono_totals u
+    INNER JOIN donations d ON u.user_name = d.user_name
+    ORDER BY total DESC;
+    "#
+    )
+    .fetch_all(pool)
+    .await?;
+    let totals: Vec<(String, f64)> = totals.into_iter().map(|r| (r.display_name, r.total.to_f64().unwrap())).collect();
     Ok((donos, totals))
 }

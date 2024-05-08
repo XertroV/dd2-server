@@ -482,6 +482,7 @@ impl From<(String, f64)> for Donor {
 pub struct Donation {
     pub name: String,
     pub amount: f64,
+    pub comment: String,
     pub ts: i64,
 }
 
