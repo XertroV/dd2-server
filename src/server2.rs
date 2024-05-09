@@ -657,9 +657,16 @@ impl XPlayer {
     }
 
     async fn check_min_plugin_version(&self, plugin_info: &str) -> Result<(), api_error::Error> {
-        if plugin_info_extract_version(plugin_info).as_str() < "0.4.8" {
+        let version = plugin_info_extract_version(plugin_info);
+        let parts = version_str_to_parts(&version);
+        let parts = match parts {
+            Ok(p) => p,
+            Err(_) => vec![0, 0, 0],
+        };
+        let minv = vec![0, 4, 8];
+        if version_less(&parts, &minv) {
             tokio::time::sleep(Duration::from_secs(10)).await;
-            return Err(format!("Update Plugin! Version too low: {}", plugin_info_extract_version(plugin_info)).into());
+            return Err(format!("Update Plugin! Version too low: {}", version_to_string(&parts)).into());
         }
         Ok(())
     }
@@ -718,6 +725,23 @@ impl XPlayer {
             plugin_ver,
         })
     }
+}
+
+pub fn version_less(v1: &[u32], v2: &[u32]) -> bool {
+    for (a, b) in v1.iter().zip(v2.iter()) {
+        if a < b {
+            return true;
+        }
+    }
+    false
+}
+
+pub fn version_to_string(v: &[u32]) -> String {
+    v.iter().map(|i| i.to_string()).collect::<Vec<String>>().join(".")
+}
+
+pub fn version_str_to_parts(version: &str) -> Result<Vec<u32>, ()> {
+    version.split('.').map(|s| s.parse().map_err(|_| ())).collect()
 }
 
 pub fn plugin_info_extract_version(plugin_info: &str) -> String {
