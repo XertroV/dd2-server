@@ -27,7 +27,7 @@ use std::{
 };
 use thiserror::Error;
 use tokio::{
-    io::{self, AsyncReadExt, AsyncWriteExt, Interest},
+    io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, Interest},
     net::{
         tcp::{OwnedReadHalf, OwnedWriteHalf},
         TcpListener, TcpStream,
@@ -73,7 +73,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         s.start(SubsystemBuilder::new("AcceptConns", accept_conns));
     })
     .catch_signals()
-    .handle_shutdown_requests(Duration::from_millis(1000))
+    .handle_shutdown_requests(Duration::from_millis(500))
     .await
     .map_err(Into::into)
 }
@@ -98,6 +98,12 @@ async fn accept_conns(subsys: SubsystemHandle) -> miette::Result<()> {
     subsys.start(SubsystemBuilder::new("PlayerMgr", |a| {
         PlayerMgr::new(db, limit_conns, listener).run(a)
     }));
+
+    // tokio::select! {
+    //     _ = subsys.on_shutdown_requested() => {
+    //         info!("[accept_cons]: shutdown");
+    //     },
+    // }
 
     // listener
     Ok(())
@@ -321,10 +327,10 @@ impl XPlayer {
         let (mut read, mut write) = stream.into_split();
         tokio::select! {
             _ = cancel_t.cancelled() => {
-                info!("Player shutdown requested");
+                info!("Player shutdown (cancelled)");
             },
             _ = self.handle(subsys, read, write) => {
-                info!("Player shutdown requested");
+                info!("Player shutdown (handle ended)");
             },
         }
         let Self {
@@ -631,17 +637,30 @@ impl XPlayer {
                 plugin_info,
                 game_info,
                 gamer_info,
-            }) => self.login_via_token(token, plugin_info, game_info, gamer_info).await,
+            }) => {
+                self.check_min_plugin_version(&plugin_info)?;
+                self.login_via_token(token, plugin_info, game_info, gamer_info).await
+            }
             Some(Request::ResumeSession {
                 session_token,
                 plugin_info,
                 game_info,
                 gamer_info,
-            }) => self.login_via_session(session_token, plugin_info, game_info, gamer_info).await,
+            }) => {
+                self.check_min_plugin_version(&plugin_info)?;
+                self.login_via_session(session_token, plugin_info, game_info, gamer_info).await
+            }
             _ => {
                 return Err(format!("Invalid request {:?}", msg).into());
             }
         }
+    }
+
+    fn check_min_plugin_version(&self, plugin_info: &str) -> Result<(), api_error::Error> {
+        if plugin_info_extract_version(plugin_info).as_str() < "0.4.8" {
+            return Err(format!("Update Plugin! Version too low: {}", plugin_info_extract_version(plugin_info)).into());
+        }
+        Ok(())
     }
 
     pub async fn login_via_token(
@@ -706,7 +725,7 @@ pub fn plugin_info_extract_version(plugin_info: &str) -> String {
         .find(|&l| l.starts_with("Version:"))
         .and_then(|vl| vl.split(":").last())
         .map(|s| s.to_string())
-        .unwrap_or_else(|| "unk".into())
+        .unwrap_or_else(|| "0.0.0".into())
 }
 
 /**
@@ -804,6 +823,8 @@ impl XPlayer {
                 height: pb.height,
                 rank: pb.rank.unwrap_or(99999),
             })?);
+        } else {
+            info!("No PB found for wsid: {}", wsid);
         };
         Ok(())
         // otherwise ignore, nothing to respond with
