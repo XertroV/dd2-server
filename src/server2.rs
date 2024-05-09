@@ -377,10 +377,11 @@ impl XPlayer {
             }
         };
         info!(
-            "Player {} ({}) authenticated / resumed: {}",
+            "Player {} ({}) authenticated / resumed: {} / PLUGIN_VER: {}",
             ls.display_name(),
             ls.user.web_services_user_id,
-            ls.resumed
+            ls.resumed,
+            ls.plugin_ver
         );
         self.session.set(ls).unwrap();
 
@@ -665,10 +666,12 @@ impl XPlayer {
         };
         let user = register_or_login(&self.pool, &wsid, &token_resp.display_name).await?;
         let session = create_session(&self.pool, user.id(), &plugin_info, &game_info, &gamer_info, &self.ip_address).await?;
+        let plugin_ver = plugin_info_extract_version(&plugin_info);
         Ok(LoginSession {
             user,
             session,
             resumed: false,
+            plugin_ver,
         })
     }
 
@@ -685,14 +688,25 @@ impl XPlayer {
                 return Err(format!("Invalid session_token: {:?}", err).into());
             }
         };
+        let plugin_ver = plugin_info_extract_version(&plugin_info);
         // check for sesison and resume
         let (s, u) = resume_session(&self.pool, &session_token, &plugin_info, &game_info, &gamer_info, &self.ip_address).await?;
         Ok(LoginSession {
             user: u,
             session: s,
             resumed: true,
+            plugin_ver,
         })
     }
+}
+
+pub fn plugin_info_extract_version(plugin_info: &str) -> String {
+    plugin_info
+        .lines()
+        .find(|&l| l.starts_with("Version:"))
+        .and_then(|vl| vl.split(":").last())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "unk".into())
 }
 
 /**

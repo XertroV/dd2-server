@@ -32,6 +32,7 @@ pub struct LoginSession {
     pub user: User,
     pub session: Session,
     pub resumed: bool,
+    pub plugin_ver: String,
 }
 impl LoginSession {
     pub fn display_name(&self) -> &str {
