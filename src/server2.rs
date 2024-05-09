@@ -638,7 +638,7 @@ impl XPlayer {
                 game_info,
                 gamer_info,
             }) => {
-                self.check_min_plugin_version(&plugin_info)?;
+                self.check_min_plugin_version(&plugin_info).await?;
                 self.login_via_token(token, plugin_info, game_info, gamer_info).await
             }
             Some(Request::ResumeSession {
@@ -647,7 +647,7 @@ impl XPlayer {
                 game_info,
                 gamer_info,
             }) => {
-                self.check_min_plugin_version(&plugin_info)?;
+                self.check_min_plugin_version(&plugin_info).await?;
                 self.login_via_session(session_token, plugin_info, game_info, gamer_info).await
             }
             _ => {
@@ -656,8 +656,9 @@ impl XPlayer {
         }
     }
 
-    fn check_min_plugin_version(&self, plugin_info: &str) -> Result<(), api_error::Error> {
+    async fn check_min_plugin_version(&self, plugin_info: &str) -> Result<(), api_error::Error> {
         if plugin_info_extract_version(plugin_info).as_str() < "0.4.8" {
+            tokio::time::sleep(Duration::from_secs(10)).await;
             return Err(format!("Update Plugin! Version too low: {}", plugin_info_extract_version(plugin_info)).into());
         }
         Ok(())
