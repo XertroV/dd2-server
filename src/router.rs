@@ -365,6 +365,9 @@ pub enum Response {
         name: String,
         height: f64,
         rank: i64,
+        wsid: String,
+        ts: i64,
+        update_count: i32,
     },
     Donations {
         donors: Vec<Donor>,

@@ -844,9 +844,12 @@ impl XPlayer {
         let pb = get_user_in_lb(pool, &user_id).await?;
         if let Some(pb) = pb {
             return Ok(queue_tx.send(Response::PlayersPB {
-                name: pb.display_name.unwrap_or(wsid),
+                name: pb.display_name.unwrap_or_else(|| wsid.clone()),
+                wsid,
                 height: pb.height,
                 rank: pb.rank.unwrap_or(99999),
+                ts: pb.ts.and_utc().timestamp(),
+                update_count: pb.update_count,
             })?);
         } else {
             info!("No PB found for wsid: {}", wsid);
