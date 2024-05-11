@@ -16,7 +16,7 @@ use router::{Map, PlayerCtx, Request, Response, Stats, ToPlayerMgr};
 use serde_json;
 use sqlx::{
     postgres::{PgPool, PgPoolOptions},
-    Pool, Postgres,
+    query, Pool, Postgres,
 };
 use std::{
     error::Error,
@@ -507,6 +507,7 @@ impl XPlayer {
                     Err(e) => Err(e),
                 },
                 Request::ReportPlayerColor { wsid, color } => XPlayer::on_report_color(&pool, wsid, color).await,
+                Request::ReportTwitch { twitch_name } => XPlayer::on_report_twitch(&pool, user_id, twitch_name).await,
                 // get requests
                 Request::GetMyStats {} => XPlayer::get_stats(&pool, user_id, &queue_tx).await,
                 Request::GetGlobalLB { start, end } => XPlayer::get_global_lb(&pool, &queue_tx, start as i32, end as i32).await,
@@ -517,6 +518,14 @@ impl XPlayer {
                 Request::GetPlayersPb { wsid } => XPlayer::get_players_pb(&pool, wsid, &queue_tx).await,
                 Request::GetDonations {} => XPlayer::get_donations(&pool, &queue_tx).await.map_err(|e| e.into()),
                 Request::GetGfmDonations {} => XPlayer::get_gfm_donations(&pool, &queue_tx).await.map_err(|e| e.into()),
+                Request::GetTwitch { wsid } => {
+                    XPlayer::get_twitch(
+                        &pool,
+                        wsid.and_then(|s| Uuid::from_str(&s).ok()).as_ref().unwrap_or(user_id),
+                        &queue_tx,
+                    )
+                    .await
+                }
                 Request::StressMe {} => (0..100)
                     .map(|_| queue_tx.send(Response::Ping {}))
                     .collect::<Result<_, _>>()
@@ -958,6 +967,35 @@ impl XPlayer {
             Err(_) => return Ok(()), // ignore bad wsid
         };
         Ok(update_user_color(pool, &user_id, color).await?)
+    }
+
+    pub async fn on_report_twitch(pool: &Pool<Postgres>, user_id: &Uuid, twitch_name: String) -> Result<(), ApiError> {
+        query!(
+            "INSERT INTO twitch_usernames (user_id, twitch_name) VALUES ($1, $2) ON CONFLICT (user_id) DO UPDATE SET twitch_name = $2;",
+            user_id,
+            &twitch_name
+        )
+        .execute(pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn get_twitch(pool: &Pool<Postgres>, user_id: &Uuid, queue_tx: &UnboundedSender<Response>) -> Result<(), ApiError> {
+        let r = query!("SELECT user_id, twitch_name FROM twitch_usernames WHERE user_id = $1;", user_id)
+            .fetch_one(pool)
+            .await;
+        let r = match r {
+            Ok(r) => r,
+            Err(e) => {
+                // ignore missing
+                return Ok(());
+            }
+        };
+        queue_tx.send(Response::TwitchName {
+            twitch_name: r.twitch_name,
+            user_id: r.user_id.to_string(),
+        })?;
+        Ok(())
     }
 
     pub async fn on_report_pb_height(

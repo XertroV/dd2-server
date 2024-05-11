@@ -111,6 +111,9 @@ pub enum Request {
         wsid: String,
         color: [f64; 3],
     } = 40,
+    ReportTwitch {
+        twitch_name: String,
+    } = 41,
     GetMyStats {} = 128,
     GetGlobalLB {
         start: u32,
@@ -127,6 +130,9 @@ pub enum Request {
     } = 134,
     GetDonations {} = 135,
     GetGfmDonations {} = 136,
+    GetTwitch {
+        wsid: Option<String>,
+    } = 137,
     StressMe {} = 255,
 }
 
@@ -147,6 +153,7 @@ impl Request {
             // Request::ReportMapLoad { .. } => 38,
             Request::ReportPBHeight { .. } => 39,
             Request::ReportPlayerColor { .. } => 40,
+            Request::ReportTwitch { .. } => 41,
             Request::GetMyStats { .. } => 128,
             Request::GetGlobalLB { .. } => 129,
             Request::GetFriendsLB { .. } => 130,
@@ -156,6 +163,8 @@ impl Request {
             Request::GetPlayersPb { .. } => 134,
             Request::GetDonations { .. } => 135,
             Request::GetGfmDonations { .. } => 136,
+            Request::GetTwitch { .. } => 137,
+
             Request::StressMe { .. } => 255,
         }
     }
@@ -176,6 +185,8 @@ impl Request {
             // Request::ReportMapLoad { .. } => "ReportMapLoad",
             Request::ReportPBHeight { .. } => "ReportPBHeight",
             Request::ReportPlayerColor { .. } => "ReportPlayerColor",
+            Request::ReportTwitch { .. } => "ReportTwitch",
+            // get
             Request::GetMyStats { .. } => "GetMyStats",
             Request::GetGlobalLB { .. } => "GetGlobalLB",
             Request::GetFriendsLB { .. } => "GetFriendsLB",
@@ -185,6 +196,7 @@ impl Request {
             Request::GetPlayersPb { .. } => "GetPlayersPb",
             Request::GetDonations { .. } => "GetDonations",
             Request::GetGfmDonations {} => "GetGfmDonations",
+            Request::GetTwitch { .. } => "GetTwitch",
             Request::StressMe { .. } => "StressMe",
         }
     }
@@ -385,6 +397,10 @@ pub enum Response {
     GfmDonations {
         total: f64,
     },
+    TwitchName {
+        user_id: String,
+        twitch_name: String,
+    },
 }
 
 impl Response {
@@ -405,6 +421,7 @@ impl Response {
             Response::PlayersPB { .. } => 134,
             Response::Donations { .. } => 135,
             Response::GfmDonations { .. } => 136,
+            Response::TwitchName { .. } => 137,
         }
     }
 
@@ -425,6 +442,7 @@ impl Response {
             Response::PlayersPB { .. } => "PlayersPB",
             Response::Donations { .. } => "Donations",
             Response::GfmDonations { .. } => "GfmDonations",
+            Response::TwitchName { .. } => "TwitchName",
         }
     }
 
