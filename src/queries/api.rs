@@ -8,7 +8,7 @@ use warp::{
     reply::{Json, Reply, WithStatus},
 };
 
-use crate::router::LeaderboardEntry;
+use crate::{donations, router::LeaderboardEntry};
 
 use super::{get_global_lb, get_users_latest_height, stats};
 
@@ -95,6 +95,25 @@ pub async fn get_live_leaderboard(pool: &Pool<Postgres>) -> Result<Json, warp::R
     match r {
         Ok(r) => Ok(warp::reply::json(&r)),
         Err(e) => {
+            eprintln!("Error: {:?}", e);
+            Err(warp::reject::custom(Into::<ApiErrRejection>::into(e)))
+        }
+    }
+}
+
+pub async fn handle_get_donations(pool: &Pool<Postgres>) -> Result<Json, warp::Rejection> {
+    let donations = donations::get_prize_pool_total(pool).await;
+    let gfm = donations::get_gfm_donations_latest(pool).await;
+    match (gfm, donations) {
+        (Ok(gfm_total), Ok(pp_total)) => Ok(warp::reply::json(&serde_json::json!({
+            "gfm_total": gfm_total,
+            "pp_total": pp_total
+        }))),
+        (Err(e), _) => {
+            eprintln!("Error: {:?}", e);
+            Err(warp::reject::custom(Into::<ApiErrRejection>::into(e)))
+        }
+        (_, Err(e)) => {
             eprintln!("Error: {:?}", e);
             Err(warp::reject::custom(Into::<ApiErrRejection>::into(e)))
         }

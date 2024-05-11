@@ -1,6 +1,6 @@
 use api_error::Error as ApiError;
 use base64::Engine;
-use donations::get_donations_and_donors;
+use donations::{get_donations_and_donors, get_gfm_donations_latest};
 use dotenv::dotenv;
 use env_logger::Env;
 use log::{debug, error, info, warn};
@@ -10,7 +10,7 @@ use player::{parse_u64_str, LoginSession, Player};
 use queries::{
     context_mark_succeeded, create_session, get_global_lb, get_global_overview, get_user_in_lb, get_user_stats, insert_context_packed,
     insert_finish, insert_gc_nod, insert_respawn, insert_start_fall, insert_vehicle_state, register_or_login, resume_session,
-    update_fall_with_end, update_global_overview, update_server_stats, update_users_stats, PBUpdateRes,
+    update_fall_with_end, update_global_overview, update_server_stats, update_user_color, update_users_stats, PBUpdateRes,
 };
 use router::{Map, PlayerCtx, Request, Response, Stats, ToPlayerMgr};
 use serde_json;
@@ -456,6 +456,7 @@ impl XPlayer {
             let res = match msg {
                 Request::Authenticate { .. } => Ok(()),  // ignore
                 Request::ResumeSession { .. } => Ok(()), // ignore
+                // report requests
                 Request::ReportContext { sf, mi, map, i, bi } => {
                     debug!("Report context: sf/mi/map/i/bi: {}/{}/{:?}/{:?}/{:?}", sf, mi, map, i, bi);
                     match (parse_u64_str(&sf), parse_u64_str(&mi)) {
@@ -493,7 +494,7 @@ impl XPlayer {
                 Request::ReportFallEnd { floor, pos, end_time } => {
                     XPlayer::on_report_fall_end(&pool, user_id, floor as i32, pos.into(), end_time as i32).await
                 }
-                Request::ReportStats { stats } => XPlayer::on_report_stats(&pool, user_id, stats).await,
+                Request::ReportStats { stats } => XPlayer::on_report_stats(&pool, user_id, stats, ctx.as_ref()).await,
                 // // Request::ReportMapLoad { uid } => Player::on_report_map_load(&pool, p.clone(), &uid).await,
                 Request::ReportPBHeight { h } => match XPlayer::on_report_pb_height(&pool, &session, ctx.as_ref(), h).await {
                     Ok(Some(res)) => {
@@ -505,6 +506,8 @@ impl XPlayer {
                     Ok(None) => Ok(()),
                     Err(e) => Err(e),
                 },
+                Request::ReportPlayerColor { wsid, color } => XPlayer::on_report_color(&pool, wsid, color).await,
+                // get requests
                 Request::GetMyStats {} => XPlayer::get_stats(&pool, user_id, &queue_tx).await,
                 Request::GetGlobalLB { start, end } => XPlayer::get_global_lb(&pool, &queue_tx, start as i32, end as i32).await,
                 Request::GetFriendsLB { friends } => todo!(), // Player::get_friends_lb(&pool, p.clone(), &friends).await,
@@ -513,6 +516,7 @@ impl XPlayer {
                 Request::GetMyRank {} => XPlayer::get_my_rank(&pool, user_id, &queue_tx).await,
                 Request::GetPlayersPb { wsid } => XPlayer::get_players_pb(&pool, wsid, &queue_tx).await,
                 Request::GetDonations {} => XPlayer::get_donations(&pool, &queue_tx).await.map_err(|e| e.into()),
+                Request::GetGfmDonations {} => XPlayer::get_gfm_donations(&pool, &queue_tx).await.map_err(|e| e.into()),
                 Request::StressMe {} => (0..100)
                     .map(|_| queue_tx.send(Response::Ping {}))
                     .collect::<Result<_, _>>()
@@ -828,6 +832,11 @@ impl XPlayer {
         Ok(())
     }
 
+    pub async fn get_gfm_donations(pool: &Pool<Postgres>, queue_tx: &UnboundedSender<Response>) -> Result<(), ApiError> {
+        let total = get_gfm_donations_latest(pool).await?;
+        Ok(queue_tx.send(Response::GfmDonations { total })?)
+    }
+
     pub async fn get_donations(pool: &Pool<Postgres>, queue_tx: &UnboundedSender<Response>) -> Result<(), ApiError> {
         let (donations, donors) = get_donations_and_donors(pool).await?;
         Ok(queue_tx.send(Response::Donations {
@@ -932,8 +941,23 @@ impl XPlayer {
         Ok(())
     }
 
-    pub async fn on_report_stats(pool: &Pool<Postgres>, user_id: &Uuid, stats: Stats) -> Result<(), ApiError> {
+    pub async fn on_report_stats(pool: &Pool<Postgres>, user_id: &Uuid, stats: Stats, ctx: Option<&PlayerCtx>) -> Result<(), ApiError> {
+        match ctx.map(|c| c.is_official()).unwrap_or(false) {
+            true => {}
+            false => {
+                warn!("Dropping stats b/c context unofficial. ctx: {:?}", ctx);
+                return Ok(());
+            }
+        }
         Ok(update_users_stats(pool, user_id, &stats).await?)
+    }
+
+    pub async fn on_report_color(pool: &Pool<Postgres>, wsid: String, color: [f64; 3]) -> Result<(), ApiError> {
+        let user_id = match Uuid::from_str(&wsid) {
+            Ok(u) => u,
+            Err(_) => return Ok(()), // ignore bad wsid
+        };
+        Ok(update_user_color(pool, &user_id, color).await?)
     }
 
     pub async fn on_report_pb_height(

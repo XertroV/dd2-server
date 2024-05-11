@@ -25,7 +25,7 @@ pub async fn log_ml_ping(pool: &Pool<Postgres>, ip_v4: &str, ip_v6: &str, is_int
 
 pub async fn update_users_stats(pool: &Pool<Postgres>, user_id: &Uuid, stats: &Stats) -> Result<(), sqlx::Error> {
     info!("Updating stats for user {:?}", user_id);
-    let r = query!("UPDATE stats SET nb_jumps = $1, nb_falls = $2, nb_floors_fallen = $3, last_pb_set_ts = $4, total_dist_fallen = $5, pb_height = $6, pb_floor = $7, nb_resets = $8, ggs_triggered = $9, title_gags_triggered = $10, title_gags_special_triggered = $11, bye_byes_triggered = $12, monument_triggers = $13, reached_floor_count = $14, floor_voice_lines_played = $15, seconds_spent_in_map = $16, update_count = update_count + 1, ts = NOW() WHERE user_id = $17 RETURNING update_count;",
+    let r = query!("UPDATE stats SET nb_jumps = $1, nb_falls = $2, nb_floors_fallen = $3, last_pb_set_ts = $4, total_dist_fallen = $5, pb_height = $6, pb_floor = $7, nb_resets = $8, ggs_triggered = $9, title_gags_triggered = $10, title_gags_special_triggered = $11, bye_byes_triggered = $12, monument_triggers = $13, reached_floor_count = $14, floor_voice_lines_played = $15, seconds_spent_in_map = $16, extra = $17, update_count = update_count + 1, ts = NOW() WHERE user_id = $18 RETURNING update_count;",
         stats.nb_jumps as i32,
         stats.nb_falls as i32,
         stats.nb_floors_fallen as i32,
@@ -42,6 +42,7 @@ pub async fn update_users_stats(pool: &Pool<Postgres>, user_id: &Uuid, stats: &S
         stats.reached_floor_count,
         stats.floor_voice_lines_played,
         stats.seconds_spent_in_map,
+        stats.extra,
         user_id
     ).fetch_one(pool).await;
     match r {
@@ -49,17 +50,17 @@ pub async fn update_users_stats(pool: &Pool<Postgres>, user_id: &Uuid, stats: &S
             if (r.update_count + 2) % 10 == 0 {
                 // insert into stats_archive
                 query!(r#"--sql
-                INSERT INTO stats_archive (user_id, seconds_spent_in_map, nb_jumps, nb_falls, nb_floors_fallen, last_pb_set_ts, total_dist_fallen, pb_height, pb_floor, nb_resets, ggs_triggered, title_gags_triggered, title_gags_special_triggered, bye_byes_triggered, monument_triggers, reached_floor_count, floor_voice_lines_played, update_count, rank_at_time)
-                    SELECT user_id, seconds_spent_in_map, nb_jumps, nb_falls, nb_floors_fallen, last_pb_set_ts, total_dist_fallen, pb_height, pb_floor, nb_resets, ggs_triggered, title_gags_triggered, title_gags_special_triggered, bye_byes_triggered, monument_triggers, reached_floor_count, floor_voice_lines_played, update_count, rank as rank_at_time
+                INSERT INTO stats_archive (user_id, seconds_spent_in_map, nb_jumps, nb_falls, nb_floors_fallen, last_pb_set_ts, total_dist_fallen, pb_height, pb_floor, nb_resets, ggs_triggered, title_gags_triggered, title_gags_special_triggered, bye_byes_triggered, monument_triggers, reached_floor_count, floor_voice_lines_played, update_count, rank_at_time, extra)
+                    SELECT user_id, seconds_spent_in_map, nb_jumps, nb_falls, nb_floors_fallen, last_pb_set_ts, total_dist_fallen, pb_height, pb_floor, nb_resets, ggs_triggered, title_gags_triggered, title_gags_special_triggered, bye_byes_triggered, monument_triggers, reached_floor_count, floor_voice_lines_played, update_count, rank as rank_at_time, extra
                     FROM ranked_stats WHERE user_id = $1;
                 "#, user_id).execute(pool).await?;
             }
-            // check that lb is up to date, should be close
-            update_user_pb_height(pool, user_id, stats.pb_height as f64).await?;
+            // ignore stats update; check that lb is up to date, should be close
+            // update_user_pb_height(pool, user_id, stats.pb_height as f64).await?;
             Ok(())
         }
         Err(sqlx::Error::RowNotFound) => {
-            query!("INSERT INTO stats (user_id, seconds_spent_in_map, nb_jumps, nb_falls, nb_floors_fallen, last_pb_set_ts, total_dist_fallen, pb_height, pb_floor, nb_resets, ggs_triggered, title_gags_triggered, title_gags_special_triggered, bye_byes_triggered, monument_triggers, reached_floor_count, floor_voice_lines_played) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17);",
+            query!("INSERT INTO stats (user_id, seconds_spent_in_map, nb_jumps, nb_falls, nb_floors_fallen, last_pb_set_ts, total_dist_fallen, pb_height, pb_floor, nb_resets, ggs_triggered, title_gags_triggered, title_gags_special_triggered, bye_byes_triggered, monument_triggers, reached_floor_count, floor_voice_lines_played, extra) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18);",
                 user_id,
                 stats.seconds_spent_in_map,
                 stats.nb_jumps as i32,
@@ -76,7 +77,8 @@ pub async fn update_users_stats(pool: &Pool<Postgres>, user_id: &Uuid, stats: &S
                 stats.bye_byes_triggered as i32,
                 stats.monument_triggers,
                 stats.reached_floor_count,
-                stats.floor_voice_lines_played
+                stats.floor_voice_lines_played,
+                stats.extra
             ).execute(pool).await?;
             Ok(())
         }
@@ -85,7 +87,7 @@ pub async fn update_users_stats(pool: &Pool<Postgres>, user_id: &Uuid, stats: &S
 }
 
 pub async fn get_user_stats(pool: &Pool<Postgres>, user_id: &Uuid) -> Result<(Stats, u32), sqlx::Error> {
-    let r = query!("SELECT seconds_spent_in_map, nb_jumps, nb_falls, nb_floors_fallen, last_pb_set_ts, total_dist_fallen, pb_height, pb_floor, nb_resets, ggs_triggered, title_gags_triggered, title_gags_special_triggered, bye_byes_triggered, monument_triggers, reached_floor_count, floor_voice_lines_played, update_count, rank as rank_at_time FROM ranked_stats WHERE user_id = $1;", user_id)
+    let r = query!("SELECT seconds_spent_in_map, nb_jumps, nb_falls, nb_floors_fallen, last_pb_set_ts, total_dist_fallen, pb_height, pb_floor, nb_resets, ggs_triggered, title_gags_triggered, title_gags_special_triggered, bye_byes_triggered, monument_triggers, reached_floor_count, floor_voice_lines_played, update_count, rank as rank_at_time, extra FROM ranked_stats WHERE user_id = $1;", user_id)
         .fetch_one(pool)
         .await?;
     let mut s = Stats {
@@ -105,6 +107,7 @@ pub async fn get_user_stats(pool: &Pool<Postgres>, user_id: &Uuid) -> Result<(St
         monument_triggers: r.monument_triggers.unwrap_or_default(),
         reached_floor_count: r.reached_floor_count.unwrap_or_default(),
         floor_voice_lines_played: r.floor_voice_lines_played.unwrap_or_default(),
+        extra: r.extra,
     };
     let r2 = get_user_in_lb(pool, user_id).await?;
     match r2 {
@@ -300,6 +303,7 @@ pub struct LBEntry {
     pub ts: NaiveDateTime,
     pub display_name: Option<String>,
     pub update_count: i32,
+    pub color: Option<[f64; 3]>,
 }
 impl Into<LeaderboardEntry> for LBEntry {
     fn into(self) -> LeaderboardEntry {
@@ -310,6 +314,7 @@ impl Into<LeaderboardEntry> for LBEntry {
             ts: self.ts.and_utc().timestamp() as u32,
             name: self.display_name.unwrap_or_else(|| "?".to_string()),
             update_count: self.update_count,
+            color: self.color.unwrap_or([1f64; 3]),
         }
     }
 }
@@ -320,7 +325,9 @@ pub async fn get_global_lb(pool: &Pool<Postgres>, start: i32, end: i32) -> Resul
     }
     let limit = end - start;
     let r = query!(
-        "SELECT user_id as wsid, height, ts, rank, display_name, update_count FROM ranked_lb_view LIMIT $1 OFFSET $2;",
+        r#"SELECT r.user_id as wsid, r.height, r.ts, r.rank, r.display_name, r.update_count, c.color FROM ranked_lb_view r
+            LEFT JOIN colors c ON c.user_id = r.user_id
+            LIMIT $1 OFFSET $2;"#,
         limit as i64,
         (start as i64 - 1).max(0),
     )
@@ -334,14 +341,24 @@ pub async fn get_global_lb(pool: &Pool<Postgres>, start: i32, end: i32) -> Resul
             ts: e.ts.unwrap(),
             display_name: e.display_name,
             update_count: e.update_count.unwrap_or_default(),
+            color: e.color.and_then(vec_to_color),
         })
         .collect())
 }
 
+pub fn vec_to_color(v: Vec<f64>) -> Option<[f64; 3]> {
+    if v.len() < 3 {
+        return None;
+    }
+    Some([v[0], v[1], v[2]])
+}
+
 pub async fn get_user_in_lb(pool: &Pool<Postgres>, user_id: &Uuid) -> Result<Option<LBEntry>, sqlx::Error> {
     let r = query!(
-        r#"--sql
-        SELECT user_id as wsid, height, ts, rank, display_name, update_count FROM ranked_lb_view WHERE user_id = $1;"#,
+        r#"SELECT r.user_id as wsid, r.height, r.ts, r.rank, r.display_name, r.update_count, c.color as "color?" FROM ranked_lb_view r
+        LEFT JOIN colors c ON r.user_id = c.user_id
+        WHERE r.user_id = $1;
+        "#,
         user_id
     )
     .fetch_optional(pool)
@@ -353,12 +370,15 @@ pub async fn get_user_in_lb(pool: &Pool<Postgres>, user_id: &Uuid) -> Result<Opt
         ts: e.ts.unwrap(),
         display_name: e.display_name,
         update_count: e.update_count.unwrap_or_default(),
+        color: e.color.and_then(vec_to_color),
     }))
 }
 
 pub async fn get_friends_lb(pool: &Pool<Postgres>, user_id: &Uuid, friends: &[Uuid]) -> Result<Vec<LBEntry>, sqlx::Error> {
     let r = query!(
-        "SELECT user_id as wsid, height, ts, rank, display_name, update_count FROM ranked_lb_view WHERE user_id = ANY($1) ORDER BY height DESC;",
+        r#"SELECT r.user_id as wsid, r.height, r.ts, r.rank, r.display_name, r.update_count, c.color FROM ranked_lb_view r
+        LEFT JOIN colors c ON c.user_id = r.user_id
+        WHERE r.user_id = ANY($1) ORDER BY r.height DESC;"#,
         friends
     )
     .fetch_all(pool)
@@ -371,6 +391,7 @@ pub async fn get_friends_lb(pool: &Pool<Postgres>, user_id: &Uuid, friends: &[Uu
             ts: e.ts.unwrap(),
             display_name: e.display_name,
             update_count: e.update_count.unwrap_or_default(),
+            color: e.color.and_then(vec_to_color),
         })
         .collect())
 }
@@ -543,4 +564,15 @@ pub async fn get_live_leaderboard(pool: &Pool<Postgres>) -> Result<Vec<PlayerAtH
             rank: (i + 1) as i64,
         })
         .collect())
+}
+
+pub async fn update_user_color(pool: &Pool<Postgres>, user_id: &Uuid, color: [f64; 3]) -> Result<(), sqlx::Error> {
+    query!(
+        "INSERT INTO colors (color, user_id) VALUES ($1, $2) ON CONFLICT (user_id) DO UPDATE SET color = $1;",
+        color.as_slice(),
+        user_id
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
 }

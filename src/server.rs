@@ -3,7 +3,7 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use donations::{get_donations_from_matcherino, update_donations_in_db};
+use donations::{get_and_update_donations_from_gfm, get_donations_from_matcherino, update_donations_in_db};
 use dotenv::dotenv;
 use env_logger::Env;
 use log::{error, info, warn};
@@ -257,6 +257,23 @@ impl PlayerMgr {
                     }
                 }
                 tokio::time::sleep(Duration::from_secs(7)).await;
+            }
+        });
+
+        // update GFM donations
+        let mgr = orig_mgr.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            loop {
+                match get_and_update_donations_from_gfm(&mgr.pool).await {
+                    Ok(_o) => {
+                        // info!("Updated GFM donations: {:?}", _o);
+                    }
+                    Err(e) => {
+                        error!("Error updating GFM donations: {:?}", e);
+                    }
+                }
+                tokio::time::sleep(Duration::from_secs(60 * 5)).await;
             }
         });
 

@@ -107,6 +107,10 @@ pub enum Request {
     ReportPBHeight {
         h: f32,
     } = 39,
+    ReportPlayerColor {
+        wsid: String,
+        color: [f64; 3],
+    } = 40,
     GetMyStats {} = 128,
     GetGlobalLB {
         start: u32,
@@ -122,6 +126,7 @@ pub enum Request {
         wsid: String,
     } = 134,
     GetDonations {} = 135,
+    GetGfmDonations {} = 136,
     StressMe {} = 255,
 }
 
@@ -141,6 +146,7 @@ impl Request {
             Request::ReportStats { .. } => 37,
             // Request::ReportMapLoad { .. } => 38,
             Request::ReportPBHeight { .. } => 39,
+            Request::ReportPlayerColor { .. } => 40,
             Request::GetMyStats { .. } => 128,
             Request::GetGlobalLB { .. } => 129,
             Request::GetFriendsLB { .. } => 130,
@@ -149,6 +155,7 @@ impl Request {
             Request::GetMyRank {} => 133,
             Request::GetPlayersPb { .. } => 134,
             Request::GetDonations { .. } => 135,
+            Request::GetGfmDonations { .. } => 136,
             Request::StressMe { .. } => 255,
         }
     }
@@ -168,6 +175,7 @@ impl Request {
             Request::ReportStats { .. } => "ReportStats",
             // Request::ReportMapLoad { .. } => "ReportMapLoad",
             Request::ReportPBHeight { .. } => "ReportPBHeight",
+            Request::ReportPlayerColor { .. } => "ReportPlayerColor",
             Request::GetMyStats { .. } => "GetMyStats",
             Request::GetGlobalLB { .. } => "GetGlobalLB",
             Request::GetFriendsLB { .. } => "GetFriendsLB",
@@ -176,6 +184,7 @@ impl Request {
             Request::GetMyRank {} => "GetMyRank",
             Request::GetPlayersPb { .. } => "GetPlayersPb",
             Request::GetDonations { .. } => "GetDonations",
+            Request::GetGfmDonations {} => "GetGfmDonations",
             Request::StressMe { .. } => "StressMe",
         }
     }
@@ -373,6 +382,9 @@ pub enum Response {
         donors: Vec<Donor>,
         donations: Vec<Donation>,
     },
+    GfmDonations {
+        total: f64,
+    },
 }
 
 impl Response {
@@ -392,6 +404,7 @@ impl Response {
             Response::MyRank { .. } => 133,
             Response::PlayersPB { .. } => 134,
             Response::Donations { .. } => 135,
+            Response::GfmDonations { .. } => 136,
         }
     }
 
@@ -411,6 +424,7 @@ impl Response {
             Response::MyRank { .. } => "MyRank",
             Response::PlayersPB { .. } => "PlayersPB",
             Response::Donations { .. } => "Donations",
+            Response::GfmDonations { .. } => "GfmDonations",
         }
     }
 
@@ -452,6 +466,7 @@ pub struct Stats {
     pub monument_triggers: JsonValue,
     pub reached_floor_count: JsonValue,
     pub floor_voice_lines_played: JsonValue,
+    pub extra: Option<JsonValue>,
 }
 
 // #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -467,6 +482,7 @@ pub struct LeaderboardEntry {
     pub ts: u32,
     pub name: String,
     pub update_count: i32,
+    pub color: [f64; 3],
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
