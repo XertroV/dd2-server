@@ -324,7 +324,7 @@ impl XPlayer {
     pub async fn run(mut self, subsys: SubsystemHandle) -> miette::Result<()> {
         let cancel_t = subsys.create_cancellation_token();
         let stream = self.stream.take().unwrap();
-        let (mut read, mut write) = stream.into_split();
+        let (read, write) = stream.into_split();
         tokio::select! {
             _ = cancel_t.cancelled() => {
                 info!("Player shutdown (cancelled)");
@@ -954,7 +954,7 @@ impl XPlayer {
         match ctx.map(|c| c.is_official()).unwrap_or(false) {
             true => {}
             false => {
-                warn!("Dropping stats b/c context unofficial. ctx: {:?}", ctx);
+                warn!("Dropping stats ({}) b/c context unofficial. ctx: {:?}", user_id, ctx);
                 return Ok(());
             }
         }
@@ -1005,6 +1005,11 @@ impl XPlayer {
         h: f32,
     ) -> Result<Option<PBUpdateRes>, ApiError> {
         if !ctx.map(|c| c.is_official()).unwrap_or(false) {
+            warn!(
+                "User has unofficial context but reported PB height: {} / {}",
+                ls.display_name(),
+                ls.user_id()
+            );
             match ctx {
                 None => warn!("Dropping PB height b/c no context"),
                 Some(ctx) => {

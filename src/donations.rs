@@ -127,8 +127,23 @@ pub async fn get_and_update_donations_from_gfm(pool: &Pool<Postgres>) -> Result<
 }
 
 async fn get_donations_from_gfm() -> Result<f64, Box<dyn std::error::Error>> {
-    let resp = reqwest::get(GFM_URL).await?.text().await?;
-    let p1 = resp.split(GFM_SPLIT1_PAT).nth(1).ok_or("Split1 failed")?;
+    let resp_full;
+    #[cfg(debug_assertions)]
+    {
+        resp_full = reqwest::get(GFM_URL).await?;
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        let proxy = reqwest::Proxy::all("socks5://127.0.0.1:4444").unwrap();
+        let client = reqwest::Client::builder().proxy(proxy).build().unwrap();
+        resp_full = client.get(GFM_URL).send().await?;
+    }
+    let status = resp_full.status();
+    let resp = &resp_full.text().await?.clone();
+    let p1 = resp
+        .split(GFM_SPLIT1_PAT)
+        .nth(1)
+        .ok_or(format!("Split1 failed; resp c: {}, text[..100]: {}", status, &resp[..100]))?;
     let p2 = p1.split(GFM_SPLIT2_PAT).next().ok_or("Split2 failed")?;
     Ok(f64::from_str(p2)?)
 }

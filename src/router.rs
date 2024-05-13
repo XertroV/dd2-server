@@ -154,6 +154,7 @@ impl Request {
             Request::ReportPBHeight { .. } => 39,
             Request::ReportPlayerColor { .. } => 40,
             Request::ReportTwitch { .. } => 41,
+            // get
             Request::GetMyStats { .. } => 128,
             Request::GetGlobalLB { .. } => 129,
             Request::GetFriendsLB { .. } => 130,

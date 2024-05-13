@@ -42,7 +42,7 @@ pub async fn update_users_stats(pool: &Pool<Postgres>, user_id: &Uuid, stats: &S
         stats.reached_floor_count,
         stats.floor_voice_lines_played,
         stats.seconds_spent_in_map,
-        stats.extra,
+        stats.extra.clone().unwrap_or(serde_json::Value::Object(serde_json::Map::new())),
         user_id
     ).fetch_one(pool).await;
     match r {
@@ -78,7 +78,7 @@ pub async fn update_users_stats(pool: &Pool<Postgres>, user_id: &Uuid, stats: &S
                 stats.monument_triggers,
                 stats.reached_floor_count,
                 stats.floor_voice_lines_played,
-                stats.extra
+                stats.extra.clone().unwrap_or(serde_json::Value::Object(serde_json::Map::new()))
             ).execute(pool).await?;
             Ok(())
         }
@@ -533,7 +533,7 @@ pub async fn get_live_leaderboard(pool: &Pool<Postgres>) -> Result<Vec<PlayerAtH
         WITH recent_points AS (
             SELECT * FROM vehicle_states
             WHERE ts > NOW() - INTERVAL '180 seconds' AND is_official = true
-            ORDER BY ts
+            ORDER BY ts DESC
         ),
         rankings AS (
             SELECT *,
@@ -541,14 +541,24 @@ pub async fn get_live_leaderboard(pool: &Pool<Postgres>) -> Result<Vec<PlayerAtH
             FROM recent_points
         ),
         rankings2 AS (
-            SELECT s.user_id, r.pos[2] as height, r.ts, r.rn,
+            SELECT s.user_id, s.session_token, r.pos[2] as height, r.ts, r.rn, r.context_id,
                     ROW_NUMBER() OVER (PARTITION BY s.user_id ORDER BY r.ts DESC) AS rn2
             FROM rankings r
             INNER JOIN sessions s ON s.session_token = r.session_token
+            WHERE r.rn = 1
+        ),
+        r_contexts AS (
+            SELECT r.*, c.flags, ROW_NUMBER() OVER (PARTITION BY r.user_id ORDER BY c.created_ts DESC) AS rn3
+            FROM rankings2 r
+            INNER JOIN contexts c ON r.context_id = c.context_id
+            LEFT JOIN shadow_bans sb ON r.user_id = sb.user_id
+            WHERE sb.user_id IS NULL
+            AND r.rn2 = 1
         )
-        SELECT u.display_name, r.user_id, r.height, r.ts FROM rankings2 r
+        SELECT u.display_name, r.user_id, r.height, r.ts, cl.color FROM r_contexts r
         LEFT JOIN users u on r.user_id = u.web_services_user_id
-        WHERE rn = 1 AND rn2 = 1
+        LEFT JOIN colors cl ON r.user_id = cl.user_id
+        WHERE rn = 1 AND rn2 = 1 AND rn3 = 1 AND NOT (r.flags[6] OR r.flags[8] OR r.flags[10] OR r.flags[12])
         ORDER BY height DESC;
     "#
     )
