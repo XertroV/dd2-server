@@ -2,3 +2,4 @@
 config.json
 .env
 ssl/
+*.key

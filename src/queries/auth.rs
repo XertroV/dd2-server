@@ -145,16 +145,14 @@ pub async fn register_or_login(pool: &Pool<Postgres>, account_id: &Uuid, display
     let user = match user {
         Ok(mut user) => {
             insert_name = user.display_name != display_name;
-            if insert_name {
-                user.display_name = display_name.to_string();
-                query!(
-                    "UPDATE users SET display_name = $1, last_login_ts = NOW() WHERE web_services_user_id = $2;",
-                    display_name,
-                    account_id
-                )
-                .execute(pool)
-                .await?;
-            }
+            user.display_name = display_name.to_string();
+            query!(
+                "UPDATE users SET display_name = $1, last_login_ts = NOW() WHERE web_services_user_id = $2;",
+                display_name,
+                account_id
+            )
+            .execute(pool)
+            .await?;
             user
         }
         Err(_) => {
