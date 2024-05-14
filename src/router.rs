@@ -265,24 +265,6 @@ async fn await_bytes(read: &mut OwnedReadHalf, ct: CancellationToken, n_bytes: u
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AuxGCNod {}
-
-bitflags! {
-    // todo: choose good coprimes
-    // context is a big mix of many redundant variables. we can always divide by 2 if possible. Can obfuscate by multiplying numbers and shifting right.
-    // also, send entire game camera nod every once in a while.
-    #[derive(Debug, Clone)]
-    pub struct CtxFlags: u64 {
-        const IN_MAP       = 3;
-        const IN_EDITOR    = 5;
-        const IN_MT_EDITOR = 7;
-        const IN_DD2_MAP   = 11;
-        const IN_DD2_LIKE  = 13;
-        const NOT_DD2      = 17;
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlayerCtx {
     pub sf: u64,
     pub mi: u64,
