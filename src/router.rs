@@ -69,6 +69,7 @@ pub enum Request {
         map: Option<Map>,
         i: Option<bool>,
         bi: [i32; 2],
+        e: Option<bool>,
     } = 3,
     ReportGCNodMsg {
         data: String,
@@ -287,17 +288,19 @@ pub struct PlayerCtx {
     pub mi: u64,
     pub map: Option<Map>,
     pub i: bool,
+    pub e: Option<bool>,
     #[serde(skip)]
     pub is_official: Arc<std::sync::Mutex<Option<bool>>>,
 }
 
 impl PlayerCtx {
-    pub fn new(sf: u64, mi: u64, map: Option<Map>, i: bool) -> Self {
+    pub fn new(sf: u64, mi: u64, map: Option<Map>, i: bool, e: Option<bool>) -> Self {
         PlayerCtx {
             sf,
             mi,
             map,
             i,
+            e,
             is_official: Arc::new(std::sync::Mutex::new(None)),
         }
     }
@@ -307,7 +310,7 @@ impl PlayerCtx {
         if let Some(v) = io.as_ref() {
             return *v;
         }
-        let ans = check_flags_sf_mi(self.sf, self.mi) && self.map.as_ref().map(|m| m.is_dd2()).unwrap_or(false);
+        let ans = !self.e.unwrap_or(false) && check_flags_sf_mi(self.sf, self.mi) && self.map.as_ref().map(|m| m.is_dd2()).unwrap_or(false);
         *io = Some(ans);
         ans
     }
@@ -315,7 +318,7 @@ impl PlayerCtx {
 
 impl Default for PlayerCtx {
     fn default() -> Self {
-        PlayerCtx::new(0, 0, None, false)
+        PlayerCtx::new(0, 0, None, false, None)
     }
 }
 

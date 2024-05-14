@@ -457,8 +457,8 @@ impl XPlayer {
                 Request::Authenticate { .. } => Ok(()),  // ignore
                 Request::ResumeSession { .. } => Ok(()), // ignore
                 // report requests
-                Request::ReportContext { sf, mi, map, i, bi } => {
-                    debug!("Report context: sf/mi/map/i/bi: {}/{}/{:?}/{:?}/{:?}", sf, mi, map, i, bi);
+                Request::ReportContext { sf, mi, map, i, bi, e } => {
+                    debug!("Report context: sf/mi/map/i/bi/e: {}/{}/{:?}/{:?}/{:?}/{:?}", sf, mi, map, i, bi, e);
                     match (parse_u64_str(&sf), parse_u64_str(&mi)) {
                         (Ok(sf), Ok(mi)) => {
                             XPlayer::update_context(
@@ -472,6 +472,7 @@ impl XPlayer {
                                 map.as_ref(),
                                 i.unwrap_or(false),
                                 bi,
+                                e,
                             )
                             .await
                         }
@@ -799,12 +800,13 @@ impl XPlayer {
         map: Option<&Map>,
         has_vl_item: bool,
         bi: [i32; 2],
+        editor_exists: Option<bool>,
     ) -> Result<(), api_error::Error> {
         if let Some(ctx_id) = ctx_id.as_ref() {
             let _ = previous_ctx.insert(ctx_id.clone());
         }
         debug!("New context with sf: {}, mi: {}", sf, mi);
-        let new_ctx = PlayerCtx::new(sf, mi, map.cloned(), has_vl_item);
+        let new_ctx = PlayerCtx::new(sf, mi, map.cloned(), has_vl_item, editor_exists);
         let map_id = match map {
             Some(map) => {
                 let map_id = crate::queries::get_or_insert_map(pool, &map.uid, &map.name, &map.hash).await?;
@@ -812,7 +814,7 @@ impl XPlayer {
             }
             None => None,
         };
-        let new_id = insert_context_packed(pool, session_token, &new_ctx, &previous_ctx, map_id, bi).await?;
+        let new_id = insert_context_packed(pool, session_token, &new_ctx, &previous_ctx, map_id, bi, editor_exists).await?;
         if let Some(previous_ctx) = previous_ctx {
             context_mark_succeeded(pool, &previous_ctx, &new_id).await?;
         }

@@ -551,14 +551,13 @@ pub async fn get_live_leaderboard(pool: &Pool<Postgres>) -> Result<Vec<PlayerAtH
             SELECT r.*, c.flags, ROW_NUMBER() OVER (PARTITION BY r.user_id ORDER BY c.created_ts DESC) AS rn3
             FROM rankings2 r
             INNER JOIN contexts c ON r.context_id = c.context_id
-            LEFT JOIN shadow_bans sb ON r.user_id = sb.user_id
-            WHERE sb.user_id IS NULL
             AND r.rn2 = 1
         )
-        SELECT u.display_name, r.user_id, r.height, r.ts, cl.color FROM r_contexts r
+        SELECT u.display_name, r.user_id, r.height, r.ts FROM r_contexts r
         LEFT JOIN users u on r.user_id = u.web_services_user_id
-        LEFT JOIN colors cl ON r.user_id = cl.user_id
+        LEFT JOIN shadow_bans sb ON r.user_id = sb.user_id
         WHERE rn = 1 AND rn2 = 1 AND rn3 = 1 AND NOT (r.flags[6] OR r.flags[8] OR r.flags[10] OR r.flags[12])
+            AND sb.user_id IS NULL
         ORDER BY height DESC;
     "#
     )
@@ -583,6 +582,39 @@ pub async fn update_user_color(pool: &Pool<Postgres>, user_id: &Uuid, color: [f6
         user_id
     )
     .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn adm__get_dd2_contexts_in_editor(pool: &Pool<Postgres>) -> Result<(), sqlx::Error> {
+    let r = query!(
+        r#"--sql
+        WITH top_players AS (
+            SELECT user_id from ranked_lb_view LIMIT 20
+        ),
+        user_sessions AS (
+            SELECT s.session_token
+            FROM sessions s
+            WHERE s.user_id IN (SELECT * FROM top_players)
+                AND s.created_ts > '2024-05-07 03:48:16.941229'::timestamp
+        ),
+        user_contexts AS (
+            SELECT c.context_id, c.created_ts, c.flags
+            FROM contexts c
+            WHERE c.session_token IN (SELECT * FROM user_sessions)
+                AND c.has_vl_item = true
+                AND c.flags_raw > 1
+                AND c.created_ts > '2024-05-07 03:48:16.941229'::timestamp
+        ),
+        editor_contexts AS (
+            SELECT c.context_id
+            FROM user_contexts c
+            WHERE (c.flags[6] OR c.flags[8] OR c.flags[10] OR c.flags[12])
+        )
+        SELECT COUNT(*) FROM editor_contexts;
+    "#
+    )
+    .fetch_all(pool)
     .await?;
     Ok(())
 }

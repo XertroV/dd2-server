@@ -46,10 +46,11 @@ pub async fn insert_context(
     managers: i64,
     bi: [i32; 2],
     predecessor: &Option<Uuid>,
+    editor: Option<bool>,
 ) -> Result<Uuid, sqlx::Error> {
     let context_id = context_id.unwrap_or_else(Uuid::now_v7);
     let r = query!(
-        "INSERT INTO contexts (context_id, session_token, flags, flags_raw, has_vl_item, map_id, managers, block_count, item_count, predecessor) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING context_id;",
+        "INSERT INTO contexts (context_id, session_token, flags, flags_raw, has_vl_item, map_id, managers, block_count, item_count, bi_count, predecessor, editor) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING context_id;",
         context_id,
         session_token,
         flags,
@@ -59,7 +60,9 @@ pub async fn insert_context(
         managers,
         bi[0],
         bi[1],
-        predecessor.as_ref()
+        bi[0] + bi[1],
+        predecessor.as_ref(),
+        editor
     )
     .fetch_one(pool)
     .await?;
@@ -84,6 +87,7 @@ pub async fn insert_context_packed(
     prior: &Option<Uuid>,
     map_id: Option<i32>,
     bi: [i32; 2],
+    editor: Option<bool>,
 ) -> Result<Uuid, sqlx::Error> {
     // let prior = prior.as_ref().cloned();
     insert_context(
@@ -97,6 +101,7 @@ pub async fn insert_context_packed(
         context.mi as i64,
         bi,
         &prior,
+        editor,
     )
     .await
 }
