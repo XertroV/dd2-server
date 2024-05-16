@@ -406,7 +406,12 @@ pub async fn get_global_overview(pool: &Pool<Postgres>) -> Result<serde_json::Va
 pub async fn update_global_overview(pool: &Pool<Postgres>) -> Result<serde_json::Value, sqlx::Error> {
     let players = query!("SELECT COUNT(*) FROM users;").fetch_one(pool).await?.count;
     let sessions = query!("SELECT COUNT(*) FROM sessions;").fetch_one(pool).await?.count;
-    let rjf = query!("SELECT SUM(nb_resets) as resets, SUM(nb_jumps) as jumps, SUM(nb_falls) as falls, SUM(nb_floors_fallen) as floors_fallen, SUM(total_dist_fallen) as height_fallen FROM stats;").fetch_one(pool).await?;
+    let rjf = query!(r#"
+        SELECT SUM(s.nb_resets) as resets, SUM(s.nb_jumps) as jumps, SUM(s.nb_falls) as falls, SUM(s.nb_floors_fallen) as floors_fallen, SUM(s.total_dist_fallen) as height_fallen
+        FROM stats s
+        LEFT JOIN shadow_bans sb ON s.user_id = sb.user_id
+        WHERE sb.user_id IS NULL
+    ;"#).fetch_one(pool).await?;
     let falls_raw = query!("SELECT MAX(id) FROM falls;").fetch_one(pool).await?.max;
     // let jumps_count = query!("SELECT COUNT(*) FROM falls_only_jumps;").fetch_one(pool).await?.count;
     // let falls_count = query!("SELECT COUNT(*) FROM falls_no_jumps;").fetch_one(pool).await?.count;
@@ -612,7 +617,7 @@ pub async fn adm__get_dd2_contexts_in_editor(pool: &Pool<Postgres>) -> Result<()
             WHERE (c.flags[6] OR c.flags[8] OR c.flags[10] OR c.flags[12])
         )
         SELECT COUNT(*) FROM editor_contexts;
-    "#
+        "#
     )
     .fetch_all(pool)
     .await?;

@@ -10,7 +10,7 @@ use player::{parse_u64_str, LoginSession, Player};
 use queries::{
     context_mark_succeeded, create_session, get_global_lb, get_global_overview, get_user_in_lb, get_user_stats, insert_context_packed,
     insert_finish, insert_gc_nod, insert_respawn, insert_start_fall, insert_vehicle_state, register_or_login, resume_session,
-    update_fall_with_end, update_global_overview, update_server_stats, update_user_color, update_users_stats, PBUpdateRes,
+    update_fall_with_end, update_server_stats, update_user_color, update_users_stats, PBUpdateRes,
 };
 use router::{Map, PlayerCtx, Request, Response, Stats, ToPlayerMgr};
 use serde_json;
