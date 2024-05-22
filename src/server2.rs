@@ -61,7 +61,7 @@ mod player;
 mod queries;
 mod router;
 
-const MAX_CONNECTIONS: u32 = 2048;
+const MAX_CONNECTIONS: u32 = 4096;
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 10)]
 async fn main() -> Result<(), Box<dyn Error>> {

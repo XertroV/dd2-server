@@ -9,6 +9,7 @@ pub enum Error {
     SendErr(SendError<Response>),
     SendErrToMgr(SendError<ToPlayerMgr>),
     B64(base64::DecodeError),
+    JsonErr(serde_json::Error),
 }
 
 impl From<String> for Error {
@@ -38,5 +39,11 @@ impl From<SendError<ToPlayerMgr>> for Error {
 impl From<base64::DecodeError> for Error {
     fn from(e: base64::DecodeError) -> Self {
         Error::B64(e)
+    }
+}
+
+impl From<serde_json::Error> for Error {
+    fn from(e: serde_json::Error) -> Self {
+        Error::JsonErr(e)
     }
 }

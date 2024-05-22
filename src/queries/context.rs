@@ -118,16 +118,21 @@ fn decode_map_hash(hash: &str) -> Vec<u8> {
 
 pub async fn get_or_insert_map(pool: &Pool<Postgres>, uid: &str, name: &str, hash: &str) -> Result<i32, sqlx::Error> {
     let h = decode_map_hash(hash);
-    let r = query!("SELECT map_id FROM maps WHERE uid = $1 AND hash = $2;", uid, h)
-        .fetch_one(pool)
-        .await
-        .map(|r| r.map_id);
+    let r = query!(
+        "INSERT INTO maps (uid, name, hash) VALUES ($1, $2, $3) ON CONFLICT (uid, hash) DO UPDATE SET load_count = maps.load_count + 1 RETURNING map_id;",
+        uid,
+        name,
+        h
+    )
+    .fetch_one(pool)
+    .await
+    .map(|r| r.map_id);
     match r {
         Ok(id) => {
-            increment_map_count(pool, id).await?;
+            // increment_map_count(pool, id).await?;
             Ok(id)
         }
-        Err(sqlx::Error::RowNotFound) => insert_map(pool, uid, name, hash).await,
+        // Err(sqlx::Error::RowNotFound) => insert_map(pool, uid, name, hash).await,
         Err(e) => Err(e),
     }
 }

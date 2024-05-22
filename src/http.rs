@@ -85,7 +85,7 @@ pub async fn run_http_server(pool: Arc<Pool<Postgres>>) -> Result<(), Box<dyn st
     let ping_pool2 = pool.clone();
 
     let api_routes = warp::path!("api" / "routes").and(warp::path::end()).map(|| {
-        "Routes: /leaderboard/global, /leaderboard/global/<page>, /leaderboard/<wsid>, /live_heights/global, /live_heights/<wsid> (prefer global), /overview, /server_info, /donations"
+        "Routes: /leaderboard/global, /leaderboard/global/<page>, /leaderboard/<wsid>, /live_heights/global, /live_heights/<wsid> (prefer global), /overview, /server_info, /donations, /twitch/list"
     });
 
     let ping_path = warp::path!("mlping.Script.txt")
@@ -155,6 +155,12 @@ pub async fn run_http_server(pool: Arc<Pool<Postgres>>) -> Result<(), Box<dyn st
         .and_then(|pool: Arc<Pool<Postgres>>| async move { api::handle_get_donations(pool.as_ref()).await });
     let req_pool = pool.clone();
 
+    let get_twitch_handles = warp::path!("twitch" / "list")
+        .and(warp::path::end())
+        .map(move || req_pool.clone())
+        .and_then(|pool: Arc<Pool<Postgres>>| async move { api::handle_get_twitch_list(pool.as_ref()).await });
+    let req_pool = pool.clone();
+
     // info!("Enabling route: get /mlping_intro");
     // let ping_path = warp::path!("mlping_intro")
     //     .and(warp::path::end())
@@ -186,6 +192,7 @@ pub async fn run_http_server(pool: Arc<Pool<Postgres>>) -> Result<(), Box<dyn st
         .or(get_live_height_lb)
         .or(get_last_heights_of_user)
         .or(get_donations_totals)
+        .or(get_twitch_handles)
         .with(warp::log("dips++"));
 
     #[cfg(debug_assertions)]

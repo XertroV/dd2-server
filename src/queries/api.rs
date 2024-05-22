@@ -1,14 +1,14 @@
 use std::sync::Arc;
 
 use serde_json::Value;
-use sqlx::{Pool, Postgres};
+use sqlx::{query, Pool, Postgres};
 use uuid::Uuid;
 use warp::{
     reject::Reject,
     reply::{Json, Reply, WithStatus},
 };
 
-use crate::{donations, router::LeaderboardEntry};
+use crate::{api_error, donations, router::LeaderboardEntry};
 
 use super::{get_global_lb, get_users_latest_height, stats};
 
@@ -118,6 +118,39 @@ pub async fn handle_get_donations(pool: &Pool<Postgres>) -> Result<Json, warp::R
             Err(warp::reject::custom(Into::<ApiErrRejection>::into(e)))
         }
     }
+}
+
+pub async fn handle_get_twitch_list(pool: &Pool<Postgres>) -> Result<Json, warp::Rejection> {
+    let r = get_twitch_profiles_all(pool).await;
+    match r {
+        Ok(r) => Ok(warp::reply::json(&r)),
+        Err(e) => {
+            eprintln!("Error: {:?}", e);
+            Err(warp::reject::custom(ApiErrRejection::new(&format!("{:?}", e))))
+        }
+    }
+}
+
+pub async fn get_twitch_profiles_all(pool: &Pool<Postgres>) -> Result<serde_json::Value, api_error::Error> {
+    let r = query!(
+        r#"--sql
+            SELECT tu.user_id, tu.twitch_name, u.display_name FROM twitch_usernames tu
+            LEFT JOIN users u ON u.web_services_user_id = tu.user_id;
+        "#
+    )
+    .fetch_all(pool)
+    .await?;
+    let rows = r
+        .into_iter()
+        .map(|r| {
+            serde_json::json!({
+                "user_id": r.user_id.to_string(),
+                "twitch_name": r.twitch_name,
+                "display_name": r.display_name
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(serde_json::value::to_value(rows)?)
 }
 
 #[derive(Debug)]
