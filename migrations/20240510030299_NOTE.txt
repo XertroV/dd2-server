@@ -1,1 +1,2 @@
 INDEX fall_positions ON falls(start_pos_y DESC, end_pos_y)
+deleted
