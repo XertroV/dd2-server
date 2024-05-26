@@ -4,11 +4,12 @@ use std::{
     sync::Arc,
 };
 
-use base64::prelude::*;
 #[cfg(not(debug_assertions))]
 use lets_encrypt_warp::lets_encrypt;
 use log::{info, warn};
 use sqlx::{Pool, Postgres};
+use tokio_graceful_shutdown::SubsystemHandle;
+use tokio_util::sync::CancellationToken;
 use warp::{
     http::Response,
     reject,
@@ -74,9 +75,22 @@ fn domain_filter(allowed_domain: &'static str) -> impl Filter<Extract = (impl Re
 struct DomainMismatch;
 impl warp::reject::Reject for DomainMismatch {}
 
-pub async fn run_http_server(pool: Arc<Pool<Postgres>>) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn run_http_server_subsystem(pool: Arc<Pool<Postgres>>, subsys: SubsystemHandle) -> miette::Result<()> {
+    let cancel_t = subsys.create_cancellation_token();
+    tokio::select! {
+        _ = run_http_server(pool, "dips-plus-plus-server.xk.io".to_string(), Some(cancel_t.clone())) => {
+            warn!("HTTP server ended early");
+        }
+        _ = cancel_t.cancelled() => {
+            warn!("HTTP Server shutting down due to subsystem cancellation.");
+        },
+    };
+    Ok(())
+}
+
+pub async fn run_http_server(pool: Arc<Pool<Postgres>>, lets_enc_domain: String, cancel_t: Option<CancellationToken>) {
     // only for dev mode
-    let ip_addr = IpAddr::from_str("0.0.0.0")?;
+    let ip_addr = IpAddr::from_str("0.0.0.0").expect("ip to be sane");
     let soc_addr: SocketAddr = SocketAddr::new(ip_addr, 8077);
 
     let version_route = warp::path!("version").and(warp::path::end()).map(|| VERSION);
@@ -195,14 +209,24 @@ pub async fn run_http_server(pool: Arc<Pool<Postgres>>) -> Result<(), Box<dyn st
         .or(get_twitch_handles)
         .with(warp::log("dips++"));
 
+    info!("Starting HTTP server: {}", soc_addr.to_string());
+
     #[cfg(debug_assertions)]
-    warp::serve(site).run(soc_addr).await;
+    warp::serve(site)
+        .bind_with_graceful_shutdown(soc_addr, async move {
+            match cancel_t {
+                Some(ct) => ct.cancelled().await,
+                None => tokio::signal::ctrl_c().await.unwrap(),
+            }
+        })
+        .1
+        .await;
     #[cfg(not(debug_assertions))]
-    lets_encrypt(site, "dipspp.letsencrypt@xk.io", "dips-plus-plus.xk.io").await;
+    lets_encrypt(site, "dipspp.letsencrypt@xk.io", &lets_enc_domain).await;
 
     info!("Server shutting down.");
 
-    Ok(())
+    // Ok(())
 }
 
 pub async fn handle_mlping(

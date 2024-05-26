@@ -119,6 +119,31 @@ pub async fn get_user_stats(pool: &Pool<Postgres>, user_id: &Uuid) -> Result<(St
     Ok((s, r.rank_at_time.unwrap_or(u32::MAX as i64) as u32))
 }
 
+/// Allow the user to decrease their stats to correct for Ez DD2
+pub async fn downgrade_stats(pool: &Pool<Postgres>, user_id: &Uuid, stats: &Stats) -> Result<(), sqlx::Error> {
+    let r = query!("UPDATE stats SET nb_jumps = $1, nb_falls = $2, nb_floors_fallen = $3, last_pb_set_ts = $4, total_dist_fallen = $5, pb_height = $6, pb_floor = $7, nb_resets = $8, ggs_triggered = $9, title_gags_triggered = $10, title_gags_special_triggered = $11, bye_byes_triggered = $12, monument_triggers = $13, reached_floor_count = $14, floor_voice_lines_played = $15, seconds_spent_in_map = $16, extra = $17, update_count = update_count + 1, ts = NOW() WHERE user_id = $18 AND pb_height <= $6 RETURNING *;",
+        stats.nb_jumps as i32,
+        stats.nb_falls as i32,
+        stats.nb_floors_fallen as i32,
+        DateTime::from_timestamp(stats.last_pb_set_ts as i64, 0).unwrap().naive_utc(),
+        stats.total_dist_fallen as f64,
+        stats.pb_height as f64,
+        stats.pb_floor as i32,
+        stats.nb_resets as i32,
+        stats.ggs_triggered as i32,
+        stats.title_gags_triggered as i32,
+        stats.title_gags_special_triggered as i32,
+        stats.bye_byes_triggered as i32,
+        stats.monument_triggers,
+        stats.reached_floor_count,
+        stats.floor_voice_lines_played,
+        stats.seconds_spent_in_map,
+        stats.extra.clone().unwrap_or(serde_json::Value::Object(serde_json::Map::new())),
+        user_id
+    ).fetch_one(pool).await?;
+    Ok(())
+}
+
 /*
 -- Falls table
 CREATE TABLE falls (

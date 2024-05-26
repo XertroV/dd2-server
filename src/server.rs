@@ -75,7 +75,7 @@ async fn main() {
     PlayerMgr::start(player_mgr.into());
 
     tokio::select! {
-        _ = run_http_server(db.clone()) => {},
+        _ = run_http_server(db.clone(), "dips-plus-plus.xk.io".to_string(), None) => {},
         // _ = listen(bind_addr, db.clone()) => {},
     };
 }

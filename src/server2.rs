@@ -13,12 +13,14 @@ use queries::{
     update_fall_with_end, update_server_stats, update_user_color, update_users_stats, PBUpdateRes,
 };
 use router::{Map, PlayerCtx, Request, Response, Stats, ToPlayerMgr};
+use serde::ser::StdError;
 use serde_json;
 use sqlx::{
     postgres::{PgPool, PgPoolOptions},
     query, Pool, Postgres,
 };
 use std::{
+    convert::Infallible,
     error::Error,
     net::SocketAddr,
     str::FromStr,
@@ -44,7 +46,7 @@ use uuid::Uuid;
 
 use crate::{
     consts::DD2_MAP_UID,
-    http::run_http_server,
+    http::{run_http_server, run_http_server_subsystem},
     op_auth::init_op_config,
     player::{check_flags_sf_mi, ToPlayer},
     queries::{get_server_info, update_user_pb_height},
@@ -69,21 +71,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
     env_logger::Builder::from_env(Env::default().default_filter_or("info")).init();
     info!("Starting DD2 Server for UID: {}", DD2_MAP_UID);
 
-    Toplevel::new(|s| async move {
-        s.start(SubsystemBuilder::new("AcceptConns", accept_conns));
-    })
-    .catch_signals()
-    .handle_shutdown_requests(Duration::from_millis(500))
-    .await
-    .map_err(Into::into)
-}
-
-async fn accept_conns(subsys: SubsystemHandle) -> miette::Result<()> {
     // init db from env var
     let db_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
     let pool = PgPoolOptions::new().max_connections(10).connect(&db_url).await.unwrap();
     let db = Arc::new(pool);
     info!("Connected to db");
+    let http_db = db.clone();
 
     match sqlx::migrate!().run(db.as_ref()).await {
         Ok(_) => info!("Migrations ran successfully"),
@@ -91,6 +84,20 @@ async fn accept_conns(subsys: SubsystemHandle) -> miette::Result<()> {
     }
     init_op_config().await;
 
+    let subsys = Toplevel::new(|s| async move {
+        s.start(SubsystemBuilder::new("AcceptConns", |a| accept_conns(a, db)));
+    })
+    .catch_signals();
+
+    let http_serv = run_http_server(http_db, "dips-plus-plus-server.xk.io".to_string(), None);
+
+    tokio::select! {
+        r = subsys.handle_shutdown_requests(Duration::from_millis(500)) => r.map_err(Into::into),
+        _ = http_serv => Ok(()),
+    }
+}
+
+async fn accept_conns(subsys: SubsystemHandle, db: Arc<Pool<Postgres>>) -> miette::Result<()> {
     let bind_addr = "0.0.0.0:17677";
     warn!("Starting server on: {}", bind_addr);
     let listener = TcpListener::bind(bind_addr).await.unwrap();
@@ -104,6 +111,17 @@ async fn accept_conns(subsys: SubsystemHandle) -> miette::Result<()> {
     //         info!("[accept_cons]: shutdown");
     //     },
     // }
+
+    // subsys.start(SubsystemBuilder::new("HTTPServer", move |a| async {
+    //     run_http_server(
+    //         http_db,
+    //         "dips-plus-plus-server.xk.io".to_string(),
+    //         Some(a.create_cancellation_token()),
+    //     )
+    //     .await;
+    //     Ok::<(), Infallible>(())
+    // }));
+    // run_http_server_subsystem(http_db, subsys).await?;
 
     // listener
     Ok(())
@@ -509,6 +527,7 @@ impl XPlayer {
                 },
                 Request::ReportPlayerColor { wsid, color } => XPlayer::on_report_color(&pool, wsid, color).await,
                 Request::ReportTwitch { twitch_name } => XPlayer::on_report_twitch(&pool, user_id, twitch_name).await,
+                Request::DowngradeStats { stats } => XPlayer::downgrade_stats(&pool, user_id, stats, &queue_tx).await,
                 // get requests
                 Request::GetMyStats {} => XPlayer::get_stats(&pool, user_id, &queue_tx).await,
                 Request::GetGlobalLB { start, end } => XPlayer::get_global_lb(&pool, &queue_tx, start as i32, end as i32).await,
@@ -998,6 +1017,27 @@ impl XPlayer {
             user_id: r.user_id.to_string(),
         })?;
         Ok(())
+    }
+
+    pub async fn downgrade_stats(
+        pool: &Pool<Postgres>,
+        user_id: &Uuid,
+        stats: Stats,
+        queue_tx: &UnboundedSender<Response>,
+    ) -> Result<(), ApiError> {
+        match queries::downgrade_stats(pool, user_id, &stats).await {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                queue_tx.send(Response::NonFatalErrorMsg {
+                    level: 1,
+                    msg: format!(
+                        "Failed to downgrade stats (note: pb height must be less than or equal to existing)\nError: {:?}",
+                        e
+                    ),
+                })?;
+                Err(e.into())
+            }
+        }
     }
 
     pub async fn on_report_pb_height(

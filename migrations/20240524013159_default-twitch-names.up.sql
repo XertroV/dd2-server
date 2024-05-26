@@ -1,0 +1,23 @@
+-- Add up migration script here
+-- INSERT INTO twitch_usernames (user_id, twitch_name) VALUES ('5d6b14db-4d41-47a4-93e2-36a3bf229f9b', 'Bren_TM2') ON CONFLICT (user_id) DO NOTHING;
+-- INSERT INTO twitch_usernames (user_id, twitch_name) VALUES ('d46fb45d-d422-47c9-9785-67270a311e25', 'eLconn21') ON CONFLICT (user_id) DO NOTHING;
+-- INSERT INTO twitch_usernames (user_id, twitch_name) VALUES ('e3ff2309-bc24-414a-b9f1-81954236c34b', 'Lars_tm') ON CONFLICT (user_id) DO NOTHING;
+-- INSERT INTO twitch_usernames (user_id, twitch_name) VALUES ('e5a9863b-1844-4436-a8a8-cea583888f8b', 'Hazardu') ON CONFLICT (user_id) DO NOTHING;
+-- INSERT INTO twitch_usernames (user_id, twitch_name) VALUES ('bd45204c-80f1-4809-b983-38b3f0ffc1ef', 'Wirtual') ON CONFLICT (user_id) DO NOTHING;
+-- INSERT INTO twitch_usernames (user_id, twitch_name) VALUES ('803695f6-8319-4b8e-8c28-44856834fe3b', 'simo_900') ON CONFLICT (user_id) DO NOTHING;
+-- INSERT INTO twitch_usernames (user_id, twitch_name) VALUES ('c1e8bbec-8bb3-40b3-9b0e-52e3cb36015e', 'SkandeaR') ON CONFLICT (user_id) DO NOTHING;
+-- INSERT INTO twitch_usernames (user_id, twitch_name) VALUES ('05477e79-25fd-48c2-84c7-e1621aa46517', 'GranaDyy') ON CONFLICT (user_id) DO NOTHING;
+-- INSERT INTO twitch_usernames (user_id, twitch_name) VALUES ('da4642f9-6acf-43fe-88b6-b120ff1308ba', 'Scrapie') ON CONFLICT (user_id) DO NOTHING;
+-- INSERT INTO twitch_usernames (user_id, twitch_name) VALUES ('a4699c4c-e6c1-4005-86f6-55888f854e6f', 'Talliebird') ON CONFLICT (user_id) DO NOTHING;
+-- INSERT INTO twitch_usernames (user_id, twitch_name) VALUES ('b05db0f8-d845-47d2-b0e5-795717038ac6', 'MASSA') ON CONFLICT (user_id) DO NOTHING;
+-- INSERT INTO twitch_usernames (user_id, twitch_name) VALUES ('e387f7d8-afb0-4bf6-bb29-868d1a62de3b', 'Tarpor') ON CONFLICT (user_id) DO NOTHING;
+-- INSERT INTO twitch_usernames (user_id, twitch_name) VALUES ('d320a237-1b0a-4069-af83-f2c09fbf042e', 'Mudda_tm') ON CONFLICT (user_id) DO NOTHING;
+-- INSERT INTO twitch_usernames (user_id, twitch_name) VALUES ('3bb0d130-637d-46a6-9c19-87fe4bda3c52', 'Spammiej') ON CONFLICT (user_id) DO NOTHING;
+-- INSERT INTO twitch_usernames (user_id, twitch_name) VALUES ('af30b7a1-fc37-485f-94bf-f00e39805d8c', 'Ixxonn') ON CONFLICT (user_id) DO NOTHING;
+-- INSERT INTO twitch_usernames (user_id, twitch_name) VALUES ('fc54a67c-7bd3-4b33-aa7d-a77f13a7b621', 'mtat_TM') ON CONFLICT (user_id) DO NOTHING;
+-- INSERT INTO twitch_usernames (user_id, twitch_name) VALUES ('0c857beb-fd95-4449-a669-21fb310cacae', 'CarlJrtm') ON CONFLICT (user_id) DO NOTHING;
+-- INSERT INTO twitch_usernames (user_id, twitch_name) VALUES ('e07e9ea9-daa5-4496-9908-9680e35da02b', 'BirdieTM') ON CONFLICT (user_id) DO NOTHING;
+-- INSERT INTO twitch_usernames (user_id, twitch_name) VALUES ('24b09acf-f745-408e-80fc-b1141054504c', 'SimplyNick') ON CONFLICT (user_id) DO NOTHING;
+-- INSERT INTO twitch_usernames (user_id, twitch_name) VALUES ('ed14ac85-1252-4cc7-8efd-49cd72938f9d', 'Jxliano') ON CONFLICT (user_id) DO NOTHING;
+-- INSERT INTO twitch_usernames (user_id, twitch_name) VALUES ('06496fad-70f7-49bc-80c6-d62caa7a9de4', 'Hefest') ON CONFLICT (user_id) DO NOTHING;
+-- INSERT INTO twitch_usernames (user_id, twitch_name) VALUES ('21161743-d01c-429f-a50d-8214149df07d', 'Ryx_1') ON CONFLICT (user_id) DO NOTHING;

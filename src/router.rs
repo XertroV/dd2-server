@@ -115,6 +115,10 @@ pub enum Request {
     ReportTwitch {
         twitch_name: String,
     } = 41,
+    DowngradeStats {
+        stats: Stats,
+    } = 42,
+
     GetMyStats {} = 128,
     GetGlobalLB {
         start: u32,
@@ -155,6 +159,7 @@ impl Request {
             Request::ReportPBHeight { .. } => 39,
             Request::ReportPlayerColor { .. } => 40,
             Request::ReportTwitch { .. } => 41,
+            Request::DowngradeStats { .. } => 42,
             // get
             Request::GetMyStats { .. } => 128,
             Request::GetGlobalLB { .. } => 129,
@@ -188,6 +193,7 @@ impl Request {
             Request::ReportPBHeight { .. } => "ReportPBHeight",
             Request::ReportPlayerColor { .. } => "ReportPlayerColor",
             Request::ReportTwitch { .. } => "ReportTwitch",
+            Request::DowngradeStats { .. } => "DowngradeStats",
             // get
             Request::GetMyStats { .. } => "GetMyStats",
             Request::GetGlobalLB { .. } => "GetGlobalLB",
@@ -335,6 +341,11 @@ pub enum Response {
     ServerInfo {
         nb_players_live: u32,
     },
+    NonFatalErrorMsg {
+        // 0 = error, 1 = warning, 2 = info, 3 = success, 4 = debug
+        level: u8,
+        msg: String,
+    },
 
     NewRecord {
         name: String,
@@ -397,6 +408,7 @@ impl Response {
             Response::ContextAck { .. } => 3,
             Response::Ping { .. } => 8,
             Response::ServerInfo { .. } => 9,
+            Response::NonFatalErrorMsg { .. } => 10,
             Response::NewRecord { .. } => 32,
             Response::Stats { .. } => 128,
             Response::GlobalLB { .. } => 129,
@@ -418,6 +430,7 @@ impl Response {
             Response::ContextAck { .. } => "ContextAck",
             Response::Ping { .. } => "Ping",
             Response::ServerInfo { .. } => "ServerInfo",
+            Response::NonFatalErrorMsg { .. } => "NonFatalErrorMsg",
             Response::NewRecord { .. } => "NewRecord",
             Response::Stats { .. } => "Stats",
             Response::GlobalLB { .. } => "GlobalLB",
