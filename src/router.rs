@@ -119,6 +119,12 @@ pub enum Request {
         stats: Stats,
     } = 42,
 
+    // arbitrary maps
+    ReportMapCurrPos {
+        uid: String,
+        pos: [f64; 3],
+    } = 64,
+
     GetMyStats {} = 128,
     GetGlobalLB {
         start: u32,
@@ -138,6 +144,26 @@ pub enum Request {
     GetTwitch {
         wsid: Option<String>,
     } = 137,
+
+    GetMapOverview {
+        uid: String,
+    } = 192,
+    GetMapLB {
+        uid: String,
+        start: u32,
+        end: u32,
+    } = 193,
+    GetMapLive {
+        uid: String,
+    } = 194,
+    GetMapMyRank {
+        uid: String,
+    } = 195,
+    GetMapRank {
+        uid: String,
+        wsid: String,
+    } = 196,
+
     StressMe {} = 255,
 }
 
@@ -160,6 +186,8 @@ impl Request {
             Request::ReportPlayerColor { .. } => 40,
             Request::ReportTwitch { .. } => 41,
             Request::DowngradeStats { .. } => 42,
+            // arbitrary maps
+            Request::ReportMapCurrPos { .. } => 64,
             // get
             Request::GetMyStats { .. } => 128,
             Request::GetGlobalLB { .. } => 129,
@@ -171,7 +199,13 @@ impl Request {
             Request::GetDonations { .. } => 135,
             Request::GetGfmDonations { .. } => 136,
             Request::GetTwitch { .. } => 137,
-
+            // get arb maps
+            Request::GetMapOverview { .. } => 192,
+            Request::GetMapLB { .. } => 193,
+            Request::GetMapLive { .. } => 194,
+            Request::GetMapMyRank { .. } => 195,
+            Request::GetMapRank { .. } => 196,
+            // debug
             Request::StressMe { .. } => 255,
         }
     }
@@ -194,6 +228,8 @@ impl Request {
             Request::ReportPlayerColor { .. } => "ReportPlayerColor",
             Request::ReportTwitch { .. } => "ReportTwitch",
             Request::DowngradeStats { .. } => "DowngradeStats",
+            // arbitrary maps
+            Request::ReportMapCurrPos { .. } => "ReportMapCurrPos",
             // get
             Request::GetMyStats { .. } => "GetMyStats",
             Request::GetGlobalLB { .. } => "GetGlobalLB",
@@ -205,6 +241,13 @@ impl Request {
             Request::GetDonations { .. } => "GetDonations",
             Request::GetGfmDonations {} => "GetGfmDonations",
             Request::GetTwitch { .. } => "GetTwitch",
+            // get arb maps
+            Request::GetMapOverview { .. } => "GetMapOverview",
+            Request::GetMapLB { .. } => "GetMapLB",
+            Request::GetMapLive { .. } => "GetMapLive",
+            Request::GetMapMyRank { .. } => "GetMapMyRank",
+            Request::GetMapRank { .. } => "GetMapRank",
+            // debug
             Request::StressMe { .. } => "StressMe",
         }
     }
@@ -398,6 +441,24 @@ pub enum Response {
         user_id: String,
         twitch_name: String,
     },
+
+    MapOverview {
+        uid: String,
+        nb_players_on_lb: u32,
+        nb_playing_now: u32,
+    },
+    MapLB {
+        uid: String,
+        entries: Vec<LeaderboardEntry2>,
+    },
+    MapLivePlayers {
+        uid: String,
+        players: Vec<LeaderboardEntry2>,
+    },
+    MapRank {
+        uid: String,
+        r: Option<LeaderboardEntry2>,
+    },
 }
 
 impl Response {
@@ -420,6 +481,11 @@ impl Response {
             Response::Donations { .. } => 135,
             Response::GfmDonations { .. } => 136,
             Response::TwitchName { .. } => 137,
+            // arb maps
+            Response::MapOverview { .. } => 192,
+            Response::MapLB { .. } => 193,
+            Response::MapLivePlayers { .. } => 194,
+            Response::MapRank { .. } => 195,
         }
     }
 
@@ -442,6 +508,11 @@ impl Response {
             Response::Donations { .. } => "Donations",
             Response::GfmDonations { .. } => "GfmDonations",
             Response::TwitchName { .. } => "TwitchName",
+            // arb maps
+            Response::MapOverview { .. } => "MapOverview",
+            Response::MapLB { .. } => "MapLB",
+            Response::MapLivePlayers { .. } => "MapLivePlayers",
+            Response::MapRank { .. } => "MapRank",
         }
     }
 
@@ -500,6 +571,18 @@ pub struct LeaderboardEntry {
     pub name: String,
     pub update_count: i32,
     pub color: [f64; 3],
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LeaderboardEntry2 {
+    pub rank: u32,
+    pub wsid: String,
+    pub pos: [f64; 3],
+    pub ts: u32,
+    pub name: String,
+    pub update_count: i32,
+    pub color: [f64; 3],
+    pub race_time: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

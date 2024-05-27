@@ -12,7 +12,7 @@ use queries::{
     insert_finish, insert_gc_nod, insert_respawn, insert_start_fall, insert_vehicle_state, register_or_login, resume_session,
     update_fall_with_end, update_server_stats, update_user_color, update_users_stats, PBUpdateRes,
 };
-use router::{Map, PlayerCtx, Request, Response, Stats, ToPlayerMgr};
+use router::{LeaderboardEntry2, Map, PlayerCtx, Request, Response, Stats, ToPlayerMgr};
 use serde::ser::StdError;
 use serde_json;
 use sqlx::{
@@ -64,6 +64,7 @@ mod queries;
 mod router;
 
 const MAX_CONNECTIONS: u32 = 4096;
+const MIN_PLUGIN_VERSION: [u32; 3] = [0, 4, 15];
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 10)]
 async fn main() -> Result<(), Box<dyn Error>> {
@@ -190,10 +191,14 @@ impl PlayerMgr {
             let _ = update_server_stats(&pool, nb_players as i32).await;
             let nb_players_live = get_server_info(&pool).await.unwrap_or_default();
             let server_info = router::Response::ServerInfo { nb_players_live };
+            let overview = get_global_overview(&pool).await;
             ps.iter()
                 .map(|p| {
                     let _ = p.send(ToPlayer::Top3(top3.clone()));
                     let _ = p.send(ToPlayer::Send(server_info.clone()));
+                    if let Ok(j) = &overview {
+                        let _ = p.send(ToPlayer::Send(router::Response::GlobalOverview { j: j.clone() }));
+                    }
                 })
                 .for_each(drop);
             drop(ps);
@@ -528,6 +533,8 @@ impl XPlayer {
                 Request::ReportPlayerColor { wsid, color } => XPlayer::on_report_color(&pool, wsid, color).await,
                 Request::ReportTwitch { twitch_name } => XPlayer::on_report_twitch(&pool, user_id, twitch_name).await,
                 Request::DowngradeStats { stats } => XPlayer::downgrade_stats(&pool, user_id, stats, &queue_tx).await,
+                // arbitrary maps
+                Request::ReportMapCurrPos { uid, pos } => XPlayer::report_map_curr_pos(&pool, user_id, uid, pos).await,
                 // get requests
                 Request::GetMyStats {} => XPlayer::get_stats(&pool, user_id, &queue_tx).await,
                 Request::GetGlobalLB { start, end } => XPlayer::get_global_lb(&pool, &queue_tx, start as i32, end as i32).await,
@@ -546,6 +553,19 @@ impl XPlayer {
                     )
                     .await
                 }
+                // get arb maps
+                Request::GetMapOverview { uid } => XPlayer::get_map_overview(&pool, &queue_tx, uid).await,
+                Request::GetMapLB { uid, start, end } => XPlayer::get_map_lb(&pool, &queue_tx, uid, start as i64, end as i64).await,
+                Request::GetMapLive { uid } => XPlayer::get_map_live(&pool, &queue_tx, uid).await,
+                Request::GetMapMyRank { uid } => XPlayer::get_map_rank(&pool, uid, user_id, &queue_tx).await,
+                Request::GetMapRank { uid, wsid } => {
+                    if let Ok(user_id) = Uuid::from_str(&wsid) {
+                        XPlayer::get_map_rank(&pool, uid, &user_id, &queue_tx).await
+                    } else {
+                        Ok(())
+                    }
+                }
+                // debug
                 Request::StressMe {} => (0..100)
                     .map(|_| queue_tx.send(Response::Ping {}))
                     .collect::<Result<_, _>>()
@@ -696,7 +716,7 @@ impl XPlayer {
             Ok(p) => p,
             Err(_) => vec![0, 0, 0],
         };
-        let minv = vec![0, 4, 8];
+        let minv = MIN_PLUGIN_VERSION;
         if version_less(&parts, &minv) {
             tokio::time::sleep(Duration::from_secs(10)).await;
             return Err(format!("Update Plugin! Version too low: {}", version_to_string(&parts)).into());
@@ -808,6 +828,240 @@ pub fn plugin_info_extract_version(plugin_info: &str) -> String {
 */
 
 impl XPlayer {
+    // get_map_overview
+    // get_map_lb
+    // get_map_live
+
+    pub async fn get_map_rank_query(
+        pool: &Pool<Postgres>,
+        map_uid: &str,
+        user_id: &Uuid,
+    ) -> Result<Option<LeaderboardEntry2>, api_error::Error> {
+        let resp = query!(
+            r#"--sql
+            SELECT m.user_id, u.display_name, c.color, m.pos, m.race_time, rank() OVER (ORDER BY m.height DESC) AS rank, m.updated_at
+            FROM map_leaderboard m
+            LEFT JOIN users u ON u.web_services_user_id = m.user_id
+            LEFT JOIN colors c ON c.user_id = m.user_id
+            WHERE m.map_uid = $1 AND m.user_id = $2
+        "#,
+            map_uid,
+            &user_id
+        )
+        .fetch_optional(pool)
+        .await?
+        .map(|r| LeaderboardEntry2 {
+            rank: r.rank.unwrap_or_default() as u32,
+            wsid: r.user_id.to_string(),
+            pos: [r.pos[0], r.pos[1], r.pos[2]],
+            ts: r.updated_at.and_utc().timestamp() as u32,
+            name: r.display_name,
+            update_count: 0,
+            color: [r.color[0], r.color[1], r.color[2]],
+            race_time: r.race_time as i64,
+        });
+        Ok(resp)
+    }
+
+    pub async fn get_map_rank(
+        pool: &Pool<Postgres>,
+        map_uid: String,
+        user_id: &Uuid,
+        queue_tx: &UnboundedSender<Response>,
+    ) -> Result<(), api_error::Error> {
+        let r = XPlayer::get_map_rank_query(pool, &map_uid, user_id).await?;
+        queue_tx.send(Response::MapRank { uid: map_uid, r })?;
+        Ok(())
+    }
+
+    pub async fn get_map_overview(
+        pool: &Pool<Postgres>,
+        queue_tx: &UnboundedSender<Response>,
+        map_uid: String,
+    ) -> Result<(), api_error::Error> {
+        let nb_players_on_lb: u32 = query!(
+            r#"--sql
+            SELECT COUNT(*) FROM map_leaderboard WHERE map_uid = $1
+        "#,
+            &map_uid
+        )
+        .fetch_one(pool)
+        .await?
+        .count
+        .unwrap_or(0) as u32;
+
+        let nb_playing_now: u32 = query!(
+            r#"--sql
+            SELECT COUNT(*) FROM map_curr_heights WHERE map_uid = $1
+                AND updated_at > now() - interval '30 seconds'
+        "#,
+            &map_uid
+        )
+        .fetch_one(pool)
+        .await?
+        .count
+        .unwrap_or(0) as u32;
+
+        queue_tx.send(Response::MapOverview {
+            uid: map_uid,
+            nb_players_on_lb,
+            nb_playing_now,
+        })?;
+        Ok(())
+    }
+
+    pub async fn get_map_lb(
+        pool: &Pool<Postgres>,
+        queue_tx: &UnboundedSender<Response>,
+        map_uid: String,
+        start: i64,
+        end: i64,
+    ) -> Result<(), api_error::Error> {
+        let resp = query!(r#"--sql
+            SELECT m.user_id, u.display_name, c.color, m.pos, m.race_time, m.updated_at, m.update_count, rank() OVER (ORDER BY m.height DESC) AS rank FROM map_leaderboard m
+            LEFT JOIN users u ON u.web_services_user_id = m.user_id
+            LEFT JOIN colors c ON c.user_id = m.user_id
+            WHERE m.map_uid = $1
+            ORDER BY m.height DESC
+            LIMIT $2
+            OFFSET $3
+        "#,
+            &map_uid,
+            end - start,
+            start
+        )
+        .fetch_all(pool)
+        .await?;
+        let entries = resp
+            .into_iter()
+            .map(|r| LeaderboardEntry2 {
+                rank: r.rank.unwrap_or_default() as u32,
+                wsid: r.user_id.to_string(),
+                pos: [r.pos[0], r.pos[1], r.pos[2]],
+                ts: r.updated_at.and_utc().timestamp() as u32,
+                name: r.display_name,
+                update_count: r.update_count,
+                color: [r.color[0], r.color[1], r.color[2]],
+                race_time: r.race_time as i64,
+            })
+            .collect();
+        queue_tx.send(Response::MapLB {
+            uid: map_uid.to_string(),
+            entries,
+        })?;
+        Ok(())
+    }
+
+    pub async fn get_map_live(
+        pool: &Pool<Postgres>,
+        queue_tx: &UnboundedSender<Response>,
+        map_uid: String,
+    ) -> Result<(), api_error::Error> {
+        let resp = query!(r#"--sql
+            SELECT m.user_id, u.display_name, c.color, m.pos, m.race_time, m.updated_at, m.update_count, rank() OVER (ORDER BY m.height DESC) AS rank FROM map_curr_heights m
+            LEFT JOIN users u ON u.web_services_user_id = m.user_id
+            LEFT JOIN colors c ON c.user_id = m.user_id
+            WHERE m.map_uid = $1
+                AND m.updated_at > now() - interval '30 seconds'
+            ORDER BY m.height DESC
+        "#,
+            &map_uid
+        )
+        .fetch_all(pool)
+        .await?;
+        let players = resp
+            .into_iter()
+            .map(|r| LeaderboardEntry2 {
+                rank: r.rank.unwrap_or_default() as u32,
+                wsid: r.user_id.to_string(),
+                pos: [r.pos[0], r.pos[1], r.pos[2]],
+                ts: r.updated_at.and_utc().timestamp() as u32,
+                name: r.display_name,
+                update_count: r.update_count,
+                color: [r.color[0], r.color[1], r.color[2]],
+                race_time: r.race_time as i64,
+            })
+            .collect();
+        queue_tx.send(Response::MapLivePlayers { uid: map_uid, players })?;
+        Ok(())
+    }
+
+    pub async fn report_map_curr_pos(
+        pool: &Pool<Postgres>,
+        user_id: &Uuid,
+        map_uid: String,
+        pos: [f64; 3],
+    ) -> Result<(), api_error::Error> {
+        if map_uid.len() != 27 {
+            warn!("Invalid map_uid: {:?} from {:?}", map_uid, user_id);
+            Err("Invalid map_uid".to_string())?;
+        }
+        let r = query!(
+            r#"--sql
+            INSERT INTO map_curr_heights (map_uid, user_id, height, pos) VALUES ($1, $2, $3, $4)
+            ON CONFLICT (map_uid, user_id)
+            DO UPDATE SET height = $3, pos = $4, updated_at = now(), update_count = map_curr_heights.update_count + 1
+            RETURNING height, update_count
+        "#,
+            &map_uid,
+            user_id,
+            pos[1],
+            &pos
+        )
+        .fetch_one(pool)
+        .await?;
+
+        #[cfg(debug_assertions)]
+        info!("User {:?} reported map curr pos: {:?}", user_id, r);
+
+        // do insert and on conflict update if height is higher
+
+        let update_r = query!(
+            r#"--sql
+            UPDATE map_leaderboard SET pos = $1, height = $2, updated_at = now(), update_count = map_leaderboard.update_count + 1
+            WHERE map_uid = $3 AND user_id = $4 AND height < $2
+            RETURNING id
+        "#,
+            &pos,
+            pos[1],
+            &map_uid,
+            user_id
+        )
+        .fetch_one(pool)
+        .await;
+        match update_r {
+            Ok(_) => {}
+            Err(sqlx::Error::RowNotFound) => {
+                #[cfg(debug_assertions)]
+                info!("inserting new map lb: {}, {}, {:?}", &map_uid, user_id, &pos);
+                query!(
+                    r#"--sql
+                    INSERT INTO map_leaderboard (map_uid, user_id, pos, height)
+                    VALUES ($1, $2, $3, $4)
+                    ON CONFLICT (map_uid, user_id) DO NOTHING
+                "#,
+                    &map_uid,
+                    user_id,
+                    &pos,
+                    pos[1]
+                )
+                .execute(pool)
+                .await?;
+            }
+            Err(e) => {
+                return Err(e.into());
+            }
+        }
+
+        #[cfg(debug_assertions)]
+        {
+            let lb = XPlayer::get_map_rank_query(pool, &map_uid, user_id).await?;
+            info!("User {:?} new lb map rank: {:?}", user_id, lb);
+        }
+
+        Ok(())
+    }
+
     pub async fn update_context(
         pool: &Pool<Postgres>,
         session_token: &Uuid,
