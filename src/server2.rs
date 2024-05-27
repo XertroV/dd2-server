@@ -545,7 +545,7 @@ impl XPlayer {
                 Request::DowngradeStats { stats } => XPlayer::downgrade_stats(&pool, user_id, stats, &queue_tx).await,
                 // arbitrary maps
                 Request::ReportMapCurrPos { uid, pos, race_time } => {
-                    XPlayer::report_map_curr_pos(&pool, user_id, uid, pos, race_time as i32).await
+                    XPlayer::report_map_curr_pos(&pool, user_id, uid, pos, race_time.unwrap_or(-1) as i32).await
                 }
                 // get requests
                 Request::GetMyStats {} => XPlayer::get_stats(&pool, user_id, &queue_tx).await,
