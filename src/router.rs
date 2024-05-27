@@ -123,6 +123,7 @@ pub enum Request {
     ReportMapCurrPos {
         uid: String,
         pos: [f64; 3],
+        race_time: i64,
     } = 64,
 
     GetMyStats {} = 128,

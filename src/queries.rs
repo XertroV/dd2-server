@@ -8,5 +8,6 @@ pub mod api;
 mod auth;
 mod clips;
 mod context;
+pub mod custom_maps;
 mod players;
 mod stats;

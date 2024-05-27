@@ -8,9 +8,9 @@ use miette::{Diagnostic, SourceSpan};
 use op_auth::check_token;
 use player::{parse_u64_str, LoginSession, Player};
 use queries::{
-    context_mark_succeeded, create_session, get_global_lb, get_global_overview, get_user_in_lb, get_user_stats, insert_context_packed,
-    insert_finish, insert_gc_nod, insert_respawn, insert_start_fall, insert_vehicle_state, register_or_login, resume_session,
-    update_fall_with_end, update_server_stats, update_user_color, update_users_stats, PBUpdateRes,
+    context_mark_succeeded, create_session, custom_maps::get_map_nb_playing_live, get_global_lb, get_global_overview, get_user_in_lb,
+    get_user_stats, insert_context_packed, insert_finish, insert_gc_nod, insert_respawn, insert_start_fall, insert_vehicle_state,
+    register_or_login, resume_session, update_fall_with_end, update_server_stats, update_user_color, update_users_stats, PBUpdateRes,
 };
 use router::{LeaderboardEntry2, Map, PlayerCtx, Request, Response, Stats, ToPlayerMgr};
 use serde::ser::StdError;
@@ -90,11 +90,21 @@ async fn main() -> Result<(), Box<dyn Error>> {
     })
     .catch_signals();
 
-    let http_serv = run_http_server(http_db, "dips-plus-plus-server.xk.io".to_string(), None);
+    #[cfg(debug_assertions)]
+    {
+        subsys
+            .handle_shutdown_requests(Duration::from_millis(500))
+            .await
+            .map_err(Into::into)
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        let http_serv = run_http_server(http_db, "dips-plus-plus-server.xk.io".to_string(), None);
 
-    tokio::select! {
-        r = subsys.handle_shutdown_requests(Duration::from_millis(500)) => r.map_err(Into::into),
-        _ = http_serv => Ok(()),
+        tokio::select! {
+            r = subsys.handle_shutdown_requests(Duration::from_millis(500)) => r.map_err(Into::into),
+            _ = http_serv => Ok(()),
+        }
     }
 }
 
@@ -534,7 +544,9 @@ impl XPlayer {
                 Request::ReportTwitch { twitch_name } => XPlayer::on_report_twitch(&pool, user_id, twitch_name).await,
                 Request::DowngradeStats { stats } => XPlayer::downgrade_stats(&pool, user_id, stats, &queue_tx).await,
                 // arbitrary maps
-                Request::ReportMapCurrPos { uid, pos } => XPlayer::report_map_curr_pos(&pool, user_id, uid, pos).await,
+                Request::ReportMapCurrPos { uid, pos, race_time } => {
+                    XPlayer::report_map_curr_pos(&pool, user_id, uid, pos, race_time as i32).await
+                }
                 // get requests
                 Request::GetMyStats {} => XPlayer::get_stats(&pool, user_id, &queue_tx).await,
                 Request::GetGlobalLB { start, end } => XPlayer::get_global_lb(&pool, &queue_tx, start as i32, end as i32).await,
@@ -889,18 +901,7 @@ impl XPlayer {
         .await?
         .count
         .unwrap_or(0) as u32;
-
-        let nb_playing_now: u32 = query!(
-            r#"--sql
-            SELECT COUNT(*) FROM map_curr_heights WHERE map_uid = $1
-                AND updated_at > now() - interval '30 seconds'
-        "#,
-            &map_uid
-        )
-        .fetch_one(pool)
-        .await?
-        .count
-        .unwrap_or(0) as u32;
+        let nb_playing_now = get_map_nb_playing_live(pool, &map_uid).await? as u32;
 
         queue_tx.send(Response::MapOverview {
             uid: map_uid,
@@ -991,6 +992,7 @@ impl XPlayer {
         user_id: &Uuid,
         map_uid: String,
         pos: [f64; 3],
+        race_time: i32,
     ) -> Result<(), api_error::Error> {
         if map_uid.len() != 27 {
             warn!("Invalid map_uid: {:?} from {:?}", map_uid, user_id);
@@ -998,15 +1000,16 @@ impl XPlayer {
         }
         let r = query!(
             r#"--sql
-            INSERT INTO map_curr_heights (map_uid, user_id, height, pos) VALUES ($1, $2, $3, $4)
+            INSERT INTO map_curr_heights (map_uid, user_id, height, pos, race_time) VALUES ($1, $2, $3, $4, $5)
             ON CONFLICT (map_uid, user_id)
-            DO UPDATE SET height = $3, pos = $4, updated_at = now(), update_count = map_curr_heights.update_count + 1
+            DO UPDATE SET height = $3, pos = $4, race_time = $5, updated_at = now(), update_count = map_curr_heights.update_count + 1
             RETURNING height, update_count
         "#,
             &map_uid,
             user_id,
             pos[1],
-            &pos
+            &pos,
+            race_time as i32
         )
         .fetch_one(pool)
         .await?;
@@ -1018,14 +1021,15 @@ impl XPlayer {
 
         let update_r = query!(
             r#"--sql
-            UPDATE map_leaderboard SET pos = $1, height = $2, updated_at = now(), update_count = map_leaderboard.update_count + 1
+            UPDATE map_leaderboard SET pos = $1, height = $2, race_time = $5, updated_at = now(), update_count = map_leaderboard.update_count + 1
             WHERE map_uid = $3 AND user_id = $4 AND height < $2
             RETURNING id
         "#,
             &pos,
             pos[1],
             &map_uid,
-            user_id
+            user_id,
+            race_time
         )
         .fetch_one(pool)
         .await;
@@ -1036,14 +1040,15 @@ impl XPlayer {
                 info!("inserting new map lb: {}, {}, {:?}", &map_uid, user_id, &pos);
                 query!(
                     r#"--sql
-                    INSERT INTO map_leaderboard (map_uid, user_id, pos, height)
-                    VALUES ($1, $2, $3, $4)
+                    INSERT INTO map_leaderboard (map_uid, user_id, pos, height, race_time)
+                    VALUES ($1, $2, $3, $4, $5)
                     ON CONFLICT (map_uid, user_id) DO NOTHING
                 "#,
                     &map_uid,
                     user_id,
                     &pos,
-                    pos[1]
+                    pos[1],
+                    race_time
                 )
                 .execute(pool)
                 .await?;

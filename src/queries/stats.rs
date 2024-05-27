@@ -7,6 +7,7 @@ use sqlx::{prelude::FromRow, query, query_as, types::Uuid, Pool, Postgres};
 
 use crate::{
     consts::DD2_MAP_UID,
+    queries::custom_maps::get_map_nb_playing_live,
     router::{LeaderboardEntry, Stats},
 };
 
@@ -465,6 +466,7 @@ pub async fn update_global_overview(pool: &Pool<Postgres>) -> Result<serde_json:
         // "falls_minor": falls_minor,
         "nb_players_live": nb_players_live,
         "nb_players_climbing": live_lb.len() as i32,
+        "nb_climbing_shallow_dip": get_map_nb_playing_live(pool, "DeepDip2__The_Gentle_Breeze").await?,
     });
     query!(
         "INSERT INTO cached_json (key, value) VALUES ($1, $2) ON CONFLICT (key) DO UPDATE SET value = $2;",
