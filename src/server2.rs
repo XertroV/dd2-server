@@ -994,6 +994,10 @@ impl XPlayer {
         pos: [f64; 3],
         race_time: i32,
     ) -> Result<(), api_error::Error> {
+        // bad height, discard report
+        if pos[1] > 3000.0 {
+            return Ok(());
+        }
         if map_uid.len() != 27 {
             warn!("Invalid map_uid: {:?} from {:?}", map_uid, user_id);
             Err("Invalid map_uid".to_string())?;
