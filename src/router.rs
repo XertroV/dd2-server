@@ -146,6 +146,19 @@ pub enum Request {
         wsid: Option<String>,
     } = 137,
 
+    // profile and preferences
+    GetMyProfile {} = 138,
+    SetMyProfile {
+        body: serde_json::Value,
+    } = 139,
+    GetMyPreferences {} = 140,
+    SetMyPreferences {
+        body: serde_json::Value,
+    } = 141,
+    GetUsersProfile {
+        wsid: String,
+    } = 142,
+
     GetMapOverview {
         uid: String,
     } = 192,
@@ -164,6 +177,8 @@ pub enum Request {
         uid: String,
         wsid: String,
     } = 196,
+
+    GetSecretAssets {} = 254,
 
     StressMe {} = 255,
 }
@@ -200,12 +215,19 @@ impl Request {
             Request::GetDonations { .. } => 135,
             Request::GetGfmDonations { .. } => 136,
             Request::GetTwitch { .. } => 137,
+            Request::GetMyProfile { .. } => 138,
+            Request::SetMyProfile { .. } => 139,
+            Request::GetMyPreferences { .. } => 140,
+            Request::SetMyPreferences { .. } => 141,
+            Request::GetUsersProfile { .. } => 142,
             // get arb maps
             Request::GetMapOverview { .. } => 192,
             Request::GetMapLB { .. } => 193,
             Request::GetMapLive { .. } => 194,
             Request::GetMapMyRank { .. } => 195,
             Request::GetMapRank { .. } => 196,
+            //
+            Request::GetSecretAssets { .. } => 254,
             // debug
             Request::StressMe { .. } => 255,
         }
@@ -242,12 +264,19 @@ impl Request {
             Request::GetDonations { .. } => "GetDonations",
             Request::GetGfmDonations {} => "GetGfmDonations",
             Request::GetTwitch { .. } => "GetTwitch",
+            Request::GetMyProfile {} => "GetMyProfile",
+            Request::SetMyProfile { .. } => "SetMyProfile",
+            Request::GetMyPreferences {} => "GetMyPreferences",
+            Request::SetMyPreferences { .. } => "SetMyPreferences",
+            Request::GetUsersProfile { .. } => "GetUsersProfile",
             // get arb maps
             Request::GetMapOverview { .. } => "GetMapOverview",
             Request::GetMapLB { .. } => "GetMapLB",
             Request::GetMapLive { .. } => "GetMapLive",
             Request::GetMapMyRank { .. } => "GetMapMyRank",
             Request::GetMapRank { .. } => "GetMapRank",
+
+            Request::GetSecretAssets { .. } => "GetSecretAssets",
             // debug
             Request::StressMe { .. } => "StressMe",
         }
@@ -443,6 +472,14 @@ pub enum Response {
         twitch_name: String,
     },
 
+    UsersProfile {
+        profile: JsonValue,
+    },
+    YourPreferences {
+        preferences: JsonValue,
+    },
+
+    // arbitrary maps
     MapOverview {
         uid: String,
         nb_players_on_lb: u32,
@@ -460,6 +497,18 @@ pub enum Response {
         uid: String,
         r: Option<LeaderboardEntry2>,
     },
+
+    // end
+    SecretAssets {
+        filenames_and_urls: Vec<AssetRef>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AssetRef {
+    pub name: String,
+    pub filename: String,
+    pub url: String,
 }
 
 impl Response {
@@ -482,11 +531,15 @@ impl Response {
             Response::Donations { .. } => 135,
             Response::GfmDonations { .. } => 136,
             Response::TwitchName { .. } => 137,
+            Response::UsersProfile { .. } => 138,
+            Response::YourPreferences { .. } => 139,
             // arb maps
             Response::MapOverview { .. } => 192,
             Response::MapLB { .. } => 193,
             Response::MapLivePlayers { .. } => 194,
             Response::MapRank { .. } => 195,
+
+            Response::SecretAssets { .. } => 254,
         }
     }
 
@@ -509,11 +562,15 @@ impl Response {
             Response::Donations { .. } => "Donations",
             Response::GfmDonations { .. } => "GfmDonations",
             Response::TwitchName { .. } => "TwitchName",
+            Response::UsersProfile { .. } => "UsersProfile",
+            Response::YourPreferences { .. } => "YourPreferences",
             // arb maps
             Response::MapOverview { .. } => "MapOverview",
             Response::MapLB { .. } => "MapLB",
             Response::MapLivePlayers { .. } => "MapLivePlayers",
             Response::MapRank { .. } => "MapRank",
+            //
+            Response::SecretAssets { .. } => "SecretAssets",
         }
     }
 

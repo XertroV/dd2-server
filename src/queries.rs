@@ -11,3 +11,4 @@ mod context;
 pub mod custom_maps;
 mod players;
 mod stats;
+pub mod user_settings;

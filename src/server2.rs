@@ -3,6 +3,7 @@ use base64::Engine;
 use donations::{get_donations_and_donors, get_gfm_donations_latest};
 use dotenv::dotenv;
 use env_logger::Env;
+use lazy_static::lazy_static;
 use log::{debug, error, info, warn};
 use miette::{Diagnostic, SourceSpan};
 use op_auth::check_token;
@@ -10,9 +11,10 @@ use player::{parse_u64_str, LoginSession, Player};
 use queries::{
     context_mark_succeeded, create_session, custom_maps::get_map_nb_playing_live, get_global_lb, get_global_overview, get_user_in_lb,
     get_user_stats, insert_context_packed, insert_finish, insert_gc_nod, insert_respawn, insert_start_fall, insert_vehicle_state,
-    register_or_login, resume_session, update_fall_with_end, update_server_stats, update_user_color, update_users_stats, PBUpdateRes,
+    register_or_login, resume_session, update_fall_with_end, update_server_stats, update_user_color, update_users_stats, user_settings,
+    PBUpdateRes,
 };
-use router::{LeaderboardEntry2, Map, PlayerCtx, Request, Response, Stats, ToPlayerMgr};
+use router::{AssetRef, LeaderboardEntry2, Map, PlayerCtx, Request, Response, Stats, ToPlayerMgr};
 use serde::ser::StdError;
 use serde_json;
 use sqlx::{
@@ -565,6 +567,17 @@ impl XPlayer {
                     )
                     .await
                 }
+
+                Request::GetMyProfile {} => XPlayer::get_users_profile(&pool, &user_id.to_string(), &queue_tx).await,
+                Request::SetMyProfile { mut body } => {
+                    body["wsid"] = serde_json::Value::String(user_id.to_string());
+                    body["name"] = serde_json::Value::String(session.display_name().to_string());
+                    XPlayer::set_users_profile(&pool, user_id, body).await
+                }
+                Request::GetMyPreferences {} => XPlayer::get_users_preferences(&pool, user_id, &queue_tx).await,
+                Request::SetMyPreferences { body } => XPlayer::set_users_preferences(&pool, user_id, body).await,
+                Request::GetUsersProfile { wsid } => XPlayer::get_users_profile(&pool, &wsid, &queue_tx).await,
+
                 // get arb maps
                 Request::GetMapOverview { uid } => XPlayer::get_map_overview(&pool, &queue_tx, uid).await,
                 Request::GetMapLB { uid, start, end } => XPlayer::get_map_lb(&pool, &queue_tx, uid, start as i64, end as i64).await,
@@ -577,6 +590,8 @@ impl XPlayer {
                         Ok(())
                     }
                 }
+
+                Request::GetSecretAssets {} => XPlayer::get_secret_assets(&pool, user_id, &queue_tx).await,
                 // debug
                 Request::StressMe {} => (0..100)
                     .map(|_| queue_tx.send(Response::Ping {}))
@@ -818,31 +833,140 @@ pub fn plugin_info_extract_version(plugin_info: &str) -> String {
         .unwrap_or_else(|| "0.0.0".into())
 }
 
-/**
-*
-*
-*
+//
+//
+//
+//
+//
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-*/
+lazy_static! {
+    pub static ref DD2_TOP_10: Vec<String> = {
+        vec![
+            "5d6b14db-4d41-47a4-93e2-36a3bf229f9b".to_string(),
+            "e5a9863b-1844-4436-a8a8-cea583888f8b".to_string(),
+            "d46fb45d-d422-47c9-9785-67270a311e25".to_string(),
+            "e3ff2309-bc24-414a-b9f1-81954236c34b".to_string(),
+            "0fd26a9f-8f70-4f51-85e1-fe99a4ed6ffb".to_string(),
+            "bd45204c-80f1-4809-b983-38b3f0ffc1ef".to_string(),
+            "da4642f9-6acf-43fe-88b6-b120ff1308ba".to_string(),
+            "d320a237-1b0a-4069-af83-f2c09fbf042e".to_string(),
+            "803695f6-8319-4b8e-8c28-44856834fe3b".to_string(),
+            "076d23a5-51a6-48aa-8d99-9d618cd13c93".to_string(),
+            // xertrov
+            "0a2d1bc0-4aaa-4374-b2db-3d561bdab1c9".to_string(),
+        ]
+    };
+}
 
 impl XPlayer {
-    // get_map_overview
-    // get_map_lb
-    // get_map_live
+    pub async fn get_secret_assets(
+        pool: &Pool<Postgres>,
+        user_id: &Uuid,
+        queue_tx: &UnboundedSender<Response>,
+    ) -> Result<(), api_error::Error> {
+        let happened =
+            query!("SELECT has_happened FROM map_events WHERE map_uid = 'DeepDip2__The_Storm_Is_Here' AND event_type = '3finish'")
+                .fetch_one(pool)
+                .await;
+        let top3_done = match happened {
+            Ok(r) => r.has_happened,
+            Err(_) => false,
+        };
+        let has_special_ff = DD2_TOP_10.contains(&user_id.to_string());
+        let fanfare_name = match has_special_ff || !top3_done {
+            true => user_id.to_string(),
+            false => "generic".to_string(),
+        };
+        if top3_done || has_special_ff {
+            queue_tx.send(Response::SecretAssets {
+                filenames_and_urls: vec![
+                    AssetRef {
+                        name: "head".to_string(),
+                        filename: "img/s1head.jpg".to_string(),
+                        url: "https://assets.xk.io/d++/secret/s1head-3948765.jpg".to_string(),
+                    },
+                    AssetRef {
+                        name: "s-flight-vae".to_string(),
+                        filename: "subs/flight-vae.txt".to_string(),
+                        url: "https://assets.xk.io/d++/secret/subs-vae-3948765.txt".to_string(),
+                    },
+                    AssetRef {
+                        name: "s-flight".to_string(),
+                        filename: "subs/flight.txt".to_string(),
+                        url: "https://assets.xk.io/d++/secret/subs-3948765.txt".to_string(),
+                    },
+                    AssetRef {
+                        name: "flight-vae".to_string(),
+                        filename: "vl/flight-vae.mp3".to_string(),
+                        url: "https://assets.xk.io/d++/secret/flight-vae-3948765.mp3".to_string(),
+                    },
+                    AssetRef {
+                        name: "flight".to_string(),
+                        filename: "vl/flight.mp3".to_string(),
+                        url: "https://assets.xk.io/d++/secret/flight-3948765.mp3".to_string(),
+                    },
+                    AssetRef {
+                        name: "fanfare".to_string(),
+                        filename: "img/fanfare-self.png".to_string(),
+                        url: format!("https://assets.xk.io/d++/secret/{}.png", fanfare_name),
+                    },
+                ],
+            })?;
+        }
+        Ok(())
+    }
+
+    // get_users_profile
+    // set_users_profile
+    // get_users_preferences
+    // set_users_preferences
+
+    pub async fn get_users_profile(
+        pool: &Pool<Postgres>,
+        user_id: &str,
+        queue_tx: &UnboundedSender<Response>,
+    ) -> Result<(), api_error::Error> {
+        let user_id: Uuid = Uuid::from_str(user_id)?;
+        let mut profile_r = user_settings::get_profile(pool, &user_id).await;
+        if let Err(sqlx::Error::RowNotFound) = profile_r {
+            let r = query!("SELECT display_name FROM users WHERE web_services_user_id = $1", user_id)
+                .fetch_one(pool)
+                .await?;
+            let name = r.display_name;
+            let s_value = serde_json::json!({
+                "wsid": user_id.to_string(),
+                "name": name,
+            });
+            query!(
+                "INSERT INTO profile_settings (user_id, s_value) VALUES ($1, $2) ON CONFLICT (user_id) DO NOTHING",
+                user_id,
+                s_value
+            )
+            .execute(pool)
+            .await?;
+            profile_r = user_settings::get_profile(pool, &user_id).await;
+        }
+        queue_tx.send(Response::UsersProfile { profile: profile_r? })?;
+        Ok(())
+    }
+
+    pub async fn set_users_profile(pool: &Pool<Postgres>, user_id: &Uuid, body: serde_json::Value) -> Result<(), api_error::Error> {
+        Ok(user_settings::set_profile(pool, user_id, body).await?)
+    }
+
+    pub async fn get_users_preferences(
+        pool: &Pool<Postgres>,
+        user_id: &Uuid,
+        queue_tx: &UnboundedSender<Response>,
+    ) -> Result<(), api_error::Error> {
+        let preferences = user_settings::get_preferences(pool, user_id).await?;
+        queue_tx.send(Response::YourPreferences { preferences })?;
+        Ok(())
+    }
+
+    pub async fn set_users_preferences(pool: &Pool<Postgres>, user_id: &Uuid, body: serde_json::Value) -> Result<(), api_error::Error> {
+        Ok(user_settings::set_preferences(pool, user_id, body).await?)
+    }
 
     pub async fn get_map_rank_query(
         pool: &Pool<Postgres>,
@@ -851,11 +975,15 @@ impl XPlayer {
     ) -> Result<Option<LeaderboardEntry2>, api_error::Error> {
         let resp = query!(
             r#"--sql
-            SELECT m.user_id, u.display_name, c.color, m.pos, m.race_time, rank() OVER (ORDER BY m.height DESC) AS rank, m.updated_at
-            FROM map_leaderboard m
-            LEFT JOIN users u ON u.web_services_user_id = m.user_id
-            LEFT JOIN colors c ON c.user_id = m.user_id
-            WHERE m.map_uid = $1 AND m.user_id = $2
+            WITH lb AS (
+                SELECT m.user_id, u.display_name, c.color, m.pos, m.race_time, rank() OVER (ORDER BY m.height DESC) AS rank, m.updated_at
+                FROM map_leaderboard m
+                LEFT JOIN users u ON u.web_services_user_id = m.user_id
+                LEFT JOIN colors c ON c.user_id = m.user_id
+                LEFT JOIN shadow_bans AS sb ON m.user_id = sb.user_id
+                WHERE m.map_uid = $1 AND sb.user_id IS NULL
+            )
+            SELECT * FROM lb WHERE user_id = $2
         "#,
             map_uid,
             &user_id
