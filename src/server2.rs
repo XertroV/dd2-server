@@ -812,6 +812,9 @@ pub fn version_less(v1: &[u32], v2: &[u32]) -> bool {
         if a < b {
             return true;
         }
+        if a > b {
+            return false;
+        }
     }
     false
 }
