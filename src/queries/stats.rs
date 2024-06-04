@@ -557,6 +557,7 @@ pub struct PlayerAtHeight {
     pub height: f64,
     pub ts: i64,
     pub rank: i64,
+    pub color: Option<[f64; 3]>,
 }
 
 pub async fn get_live_leaderboard(pool: &Pool<Postgres>) -> Result<Vec<PlayerAtHeight>, sqlx::Error> {
@@ -585,9 +586,10 @@ pub async fn get_live_leaderboard(pool: &Pool<Postgres>) -> Result<Vec<PlayerAtH
             INNER JOIN contexts c ON r.context_id = c.context_id
             AND r.rn2 = 1
         )
-        SELECT u.display_name, r.user_id, r.height, r.ts FROM r_contexts r
+        SELECT u.display_name, r.user_id, r.height, r.ts, c.color as "color?" FROM r_contexts r
         LEFT JOIN users u on r.user_id = u.web_services_user_id
         LEFT JOIN shadow_bans sb ON r.user_id = sb.user_id
+        LEFT JOIN colors c on r.user_id = c.user_id
         WHERE rn = 1 AND rn2 = 1 AND rn3 = 1 AND NOT (r.flags[6] OR r.flags[8] OR r.flags[10] OR r.flags[12])
             AND sb.user_id IS NULL
         ORDER BY height DESC;
@@ -603,6 +605,7 @@ pub async fn get_live_leaderboard(pool: &Pool<Postgres>) -> Result<Vec<PlayerAtH
             height: r.height.unwrap_or_default(),
             ts: r.ts.and_utc().timestamp(),
             rank: (i + 1) as i64,
+            color: r.color.and_then(vec_to_color),
         })
         .collect())
 }
