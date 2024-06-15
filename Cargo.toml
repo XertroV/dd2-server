@@ -11,6 +11,10 @@ path = "src/server.rs"
 name = "dd2-server2"
 path = "src/server2.rs"
 
+[[bin]]
+name = "dd2-clean-db"
+path = "src/clean_db.rs"
+
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]

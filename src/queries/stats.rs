@@ -558,6 +558,8 @@ pub struct PlayerAtHeight {
     pub ts: i64,
     pub rank: i64,
     pub color: Option<[f64; 3]>,
+    pub pos: Option<[f64; 3]>,
+    pub vel: Option<[f64; 3]>,
 }
 
 pub async fn get_live_leaderboard(pool: &Pool<Postgres>) -> Result<Vec<PlayerAtHeight>, sqlx::Error> {
@@ -574,7 +576,7 @@ pub async fn get_live_leaderboard(pool: &Pool<Postgres>) -> Result<Vec<PlayerAtH
             FROM recent_points
         ),
         rankings2 AS (
-            SELECT s.user_id, s.session_token, r.pos[2] as height, r.ts, r.rn, r.context_id,
+            SELECT s.user_id, s.session_token, r.pos[2] as height, r.pos, r.vel, r.ts, r.rn, r.context_id,
                     ROW_NUMBER() OVER (PARTITION BY s.user_id ORDER BY r.ts DESC) AS rn2
             FROM rankings r
             INNER JOIN sessions s ON s.session_token = r.session_token
@@ -586,7 +588,7 @@ pub async fn get_live_leaderboard(pool: &Pool<Postgres>) -> Result<Vec<PlayerAtH
             INNER JOIN contexts c ON r.context_id = c.context_id
             AND r.rn2 = 1
         )
-        SELECT u.display_name, r.user_id, r.height, r.ts, c.color as "color?" FROM r_contexts r
+        SELECT u.display_name, r.user_id, r.height, r.pos, r.vel, r.ts, c.color as "color?" FROM r_contexts r
         LEFT JOIN users u on r.user_id = u.web_services_user_id
         LEFT JOIN shadow_bans sb ON r.user_id = sb.user_id
         LEFT JOIN colors c on r.user_id = c.user_id
@@ -606,6 +608,8 @@ pub async fn get_live_leaderboard(pool: &Pool<Postgres>) -> Result<Vec<PlayerAtH
             ts: r.ts.and_utc().timestamp(),
             rank: (i + 1) as i64,
             color: r.color.and_then(vec_to_color),
+            pos: Some([r.pos[0], r.pos[1], r.pos[2]]),
+            vel: Some([r.vel[0], r.vel[1], r.vel[2]]),
         })
         .collect())
 }

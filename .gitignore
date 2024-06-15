@@ -3,3 +3,5 @@ config.json
 .env
 ssl/
 *.key
+.env-clean
+.env-dev
