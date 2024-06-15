@@ -64,12 +64,14 @@ async fn main() {
     let players_to_del = find_players_to_del(&db).await.unwrap();
     info!("Got {} players to delete", players_to_del.len());
 
+    let nb_deletions = 99999;
+
     if let Ok(tx) = db.begin().await {
         for (i, (user_id, user_name)) in players_to_del.iter().enumerate() {
             // break;
-            if i < 5 {
+            if i < nb_deletions {
                 warn!("Deleting user {} ({})", user_name, user_id);
-                delete_user_contexts(&db, user_id).await;
+                // delete_user_contexts(&db, user_id).await;
                 query!(
                     r#"
                 DELETE FROM users WHERE web_services_user_id = $1
@@ -79,7 +81,14 @@ async fn main() {
                 .execute(db.as_ref())
                 .await
                 .unwrap();
-                warn!("Deleted user {} ({})", user_name, user_id);
+                warn!(
+                    "Deleted user {} ({}) -- {:.2}%",
+                    user_name,
+                    user_id,
+                    ((i + 1) as f32 / nb_deletions as f32) * 100.0
+                );
+            } else {
+                break;
             }
         }
     }
@@ -95,80 +104,80 @@ async fn delete_user_contexts(pool: &Pool<Postgres>, user_id: &Uuid) {
         .unwrap();
 
     let nb_sessions = sessions.len();
-    info!("Deleting {:?} sessions (user: {:?})", nb_sessions, user_id);
+    // info!("Deleting {:?} sessions (user: {:?})", nb_sessions, user_id);
 
-    // panic!("Sessions: {:?}, {}", sessions[0], sessions.len());
-    for sess in sessions {
-        let contexts = query!("SELECT * FROM contexts WHERE session_token = $1", sess.session_token)
-            .fetch_all(pool)
-            .await
-            .unwrap();
-        let count = contexts.len();
-        if count > 0 {
-            info!("Deleting {:?} contexts (session: {:?})", contexts.len(), sess.session_token);
-        }
+    // // panic!("Sessions: {:?}, {}", sessions[0], sessions.len());
+    // for sess in sessions {
+    //     let contexts = query!("SELECT * FROM contexts WHERE session_token = $1", sess.session_token)
+    //         .fetch_all(pool)
+    //         .await
+    //         .unwrap();
+    //     let count = contexts.len();
+    //     if count > 0 {
+    //         info!("Deleting {:?} contexts (session: {:?})", contexts.len(), sess.session_token);
+    //     }
 
-        // if count > 0 {
-        //     panic!("Deleting {:?} contexts (session: {:?})", count, sess.session_token);
-        // }
+    //     // if count > 0 {
+    //     //     panic!("Deleting {:?} contexts (session: {:?})", count, sess.session_token);
+    //     // }
 
-        let nb_falls = query!(r#"SELECT COUNT(*) FROM falls WHERE session_token = $1"#, sess.session_token)
-            .fetch_one(pool)
-            .await
-            .unwrap()
-            .count
-            .unwrap();
-        if nb_falls > 0 {
-            info!("Deleting {:?} falls (session: {:?})", nb_falls, sess.session_token);
-            query!(r#"DELETE FROM falls WHERE session_token = $1"#, sess.session_token)
-                .execute(pool)
-                .await
-                .unwrap();
-        }
+    //     let nb_falls = query!(r#"SELECT COUNT(*) FROM falls WHERE session_token = $1"#, sess.session_token)
+    //         .fetch_one(pool)
+    //         .await
+    //         .unwrap()
+    //         .count
+    //         .unwrap();
+    //     if nb_falls > 0 && false {
+    //         info!("Deleting {:?} falls (session: {:?})", nb_falls, sess.session_token);
+    //         query!(r#"DELETE FROM falls WHERE session_token = $1"#, sess.session_token)
+    //             .execute(pool)
+    //             .await
+    //             .unwrap();
+    //     }
 
-        let nb_respawns = query!(r#"SELECT COUNT(*) FROM respawns WHERE session_token = $1"#, sess.session_token)
-            .fetch_one(pool)
-            .await
-            .unwrap()
-            .count
-            .unwrap();
+    //     let nb_respawns = query!(r#"SELECT COUNT(*) FROM respawns WHERE session_token = $1"#, sess.session_token)
+    //         .fetch_one(pool)
+    //         .await
+    //         .unwrap()
+    //         .count
+    //         .unwrap();
 
-        if nb_respawns > 0 {
-            info!("Deleting {:?} respawns (session: {:?})", nb_respawns, sess.session_token);
-            query!(r#"DELETE FROM respawns WHERE session_token = $1"#, sess.session_token)
-                .execute(pool)
-                .await
-                .unwrap();
-        }
+    //     if nb_respawns > 0 && false {
+    //         info!("Deleting {:?} respawns (session: {:?})", nb_respawns, sess.session_token);
+    //         query!(r#"DELETE FROM respawns WHERE session_token = $1"#, sess.session_token)
+    //             .execute(pool)
+    //             .await
+    //             .unwrap();
+    //     }
 
-        for ctx in contexts {
-            query!(r#"DELETE FROM vehicle_states WHERE context_id = $1;"#, ctx.context_id)
-                .execute(pool)
-                .await
-                .unwrap();
-            debug!("Deleted vehicle states for context {:?}", ctx.context_id);
-            query!(r#"DELETE FROM game_cam_nods WHERE context_id = $1;"#, ctx.context_id)
-                .execute(pool)
-                .await
-                .unwrap();
-            debug!("Deleted game cam nods for context {:?}", ctx.context_id);
-        }
+    //     for ctx in contexts {
+    //         query!(r#"DELETE FROM vehicle_states WHERE context_id = $1;"#, ctx.context_id)
+    //             .execute(pool)
+    //             .await
+    //             .unwrap();
+    //         debug!("Deleted vehicle states for context {:?}", ctx.context_id);
+    //         query!(r#"DELETE FROM game_cam_nods WHERE context_id = $1;"#, ctx.context_id)
+    //             .execute(pool)
+    //             .await
+    //             .unwrap();
+    //         debug!("Deleted game cam nods for context {:?}", ctx.context_id);
+    //     }
 
-        if count > 0 {
-            let _res = query!(
-                r#"
-                DELETE FROM contexts c
-                WHERE c.session_token = $1
-                "#,
-                sess.session_token
-            )
-            .execute(pool)
-            .await
-            .unwrap();
-            info!("Deleted {:?} contexts (session: {:?})", count, sess.session_token);
-            // panic!("Deleted {:?} contexts (session: {:?})", count, sess.session_token);
-        }
-    }
+    //     if count > 0 {
+    //         let _res = query!(
+    //             r#"
+    //             DELETE FROM contexts c
+    //             WHERE c.session_token = $1
+    //             "#,
+    //             sess.session_token
+    //         )
+    //         .execute(pool)
+    //         .await
+    //         .unwrap();
+    //         info!("Deleted {:?} contexts (session: {:?})", count, sess.session_token);
+    //         // panic!("Deleted {:?} contexts (session: {:?})", count, sess.session_token);
+    //     }
+    // }
 
     info!("Deleting {:?} sessions (user: {:?})", nb_sessions, user_id);
 
