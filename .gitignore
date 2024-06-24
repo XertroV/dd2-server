@@ -5,3 +5,5 @@ ssl/
 *.key
 .env-clean
 .env-dev
+output
+log*

@@ -144,7 +144,7 @@ pub async fn get_twitch_profiles_all(pool: &Pool<Postgres>) -> Result<serde_json
         .into_iter()
         .map(|r| {
             serde_json::json!({
-                "user_id": r.user_id.unwrap().to_string(),
+                "user_id": r.user_id.to_string(),
                 "twitch_name": r.twitch_name,
                 "display_name": r.display_name
             })

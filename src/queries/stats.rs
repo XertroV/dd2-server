@@ -1,5 +1,6 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use base64::Engine;
 use chrono::{DateTime, NaiveDateTime, Utc};
 use log::{info, warn};
 use serde::{Deserialize, Serialize};
@@ -367,7 +368,7 @@ pub async fn get_global_lb(pool: &Pool<Postgres>, start: i32, end: i32) -> Resul
             ts: e.ts.unwrap(),
             display_name: e.display_name,
             update_count: e.update_count.unwrap_or_default(),
-            color: e.color.and_then(vec_to_color),
+            color: vec_to_color(e.color),
         })
         .collect())
 }
@@ -377,6 +378,27 @@ pub fn vec_to_color(v: Vec<f64>) -> Option<[f64; 3]> {
         return None;
     }
     Some([v[0], v[1], v[2]])
+}
+
+pub fn vec_to_vec4(v: Vec<f64>) -> Option<[f64; 4]> {
+    if v.len() < 4 {
+        return None;
+    }
+    Some([v[0], v[1], v[2], v[3]])
+}
+
+pub type Vec3 = [f64; 3];
+
+pub fn vec3_sub(v1: Vec3, v2: Vec3) -> Vec3 {
+    [v1[0] - v2[0], v1[1] - v2[1], v1[2] - v2[2]]
+}
+
+pub fn vec3_avg(v1: Vec3, v2: Vec3) -> Vec3 {
+    [(v1[0] + v2[0]) * 0.5, (v1[1] + v2[1]) * 0.5, (v1[2] + v2[2]) * 0.5]
+}
+
+pub fn vec3_len(v: Vec3) -> f64 {
+    (v[0].powi(2) + v[1].powi(2) + v[2].powi(2)).sqrt()
 }
 
 pub async fn get_user_in_lb(pool: &Pool<Postgres>, user_id: &Uuid) -> Result<Option<LBEntry>, sqlx::Error> {
@@ -656,4 +678,395 @@ pub async fn adm__get_dd2_contexts_in_editor(pool: &Pool<Postgres>) -> Result<()
     .fetch_all(pool)
     .await?;
     Ok(())
+}
+
+pub type SqlResult<T> = Result<T, sqlx::Error>;
+
+pub async fn adm__get_user_sessions(
+    pool: &Pool<Postgres>,
+    user_id: &Uuid,
+    created_after: Option<NaiveDateTime>,
+) -> SqlResult<Vec<UserSession>> {
+    let sessions: Vec<UserSession> = query!(
+        r#"--sql
+        SELECT s.*, g.info as game_info, r.info as gamer_info, p.info as plugin_info
+        FROM sessions s
+        LEFT JOIN game_infos g ON s.game_info_id = g.id
+        LEFT JOIN gamer_infos r ON s.gamer_info_id = r.id
+        LEFT JOIN plugin_infos p ON s.plugin_info_id = p.id
+        WHERE s.user_id = $1
+            AND s.created_ts > $2
+        "#,
+        user_id,
+        created_after.unwrap_or(NaiveDateTime::UNIX_EPOCH)
+    )
+    .fetch_all(pool)
+    .await?
+    .into_iter()
+    .map(|r| {
+        UserSession::new(
+            r.user_id.unwrap(),
+            r.session_token,
+            r.created_ts,
+            r.ip_address,
+            r.replaced,
+            r.plugin_info,
+            r.game_info,
+            r.gamer_info,
+        )
+    })
+    .collect::<Vec<_>>();
+
+    Ok(sessions)
+}
+
+pub struct GameCamNod {
+    id: i32,
+    session_token: Uuid,
+    context_id: Uuid,
+    raw: Vec<u8>,
+}
+
+/*
+let (init_byte, is_race_nod_null, is_editor_cam_null, is_race_88_null, is_cam_1a8_16) = match nod.len() < 0x2C0 {
+    true => (0, true, true, true, false),
+    false => (
+        nod[0] as u8,
+        nod[0x70..0x78] == [0; 8],
+        nod[0x80..0x88] == [0; 8],
+        nod[0x88..0x90] == [0; 8],
+        nod[0x1a8] == 0x16,
+    ),
+};
+ */
+
+impl GameCamNod {
+    pub fn is_race_nod_null(&self) -> bool {
+        self.raw[0x70..0x78] == [0; 8]
+    }
+
+    pub fn is_editor_cam_null(&self) -> bool {
+        self.raw[0x80..0x88] == [0; 8]
+    }
+
+    pub fn is_race_88_null(&self) -> bool {
+        self.raw[0x88..0x90] == [0; 8]
+    }
+
+    pub fn is_cam_1a8_16(&self) -> bool {
+        self.raw[0x1a8] == 0x16
+    }
+}
+
+pub async fn adm__get_game_cam_nods(pool: &Pool<Postgres>, context_id: &Uuid) -> SqlResult<Vec<GameCamNod>> {
+    let r = query!(
+        r#"--sql
+        SELECT * FROM game_cam_nods WHERE context_id = $1
+    "#,
+        context_id
+    )
+    .fetch_all(pool)
+    .await?
+    .into_iter()
+    .map(|rec| GameCamNod {
+        id: rec.id,
+        session_token: rec.session_token,
+        context_id: rec.context_id,
+        raw: base64::prelude::BASE64_URL_SAFE.decode(&rec.raw).unwrap_or(rec.raw),
+    });
+
+    // base64::prelude::BASE64_URL_SAFE.decode(data).unwrap_or(data.into())
+
+    todo!()
+}
+
+pub async fn adm__get_user_contexts(pool: &Pool<Postgres>, user_id: &Uuid) -> SqlResult<(Vec<UserSession>, Vec<UserContext>)> {
+    let sessions = adm__get_user_sessions(pool, user_id, None).await?;
+    let r = query!(
+        r#"--sql
+    WITH user_sessions AS (
+        SELECT s.session_token
+        FROM sessions s
+        WHERE s.user_id = $1
+    ),
+    user_contexts AS (
+        SELECT c.*
+        FROM contexts c
+        WHERE c.session_token IN (SELECT * FROM user_sessions)
+    ),
+    uc_with_map AS (
+        SELECT c.*, m.uid as "map_uid?", m.name as "map_name?", m.hash as "map_hash?", m.load_count as "map_load_count?"
+        FROM user_contexts c
+        LEFT JOIN maps m ON
+        c.map_id = m.map_id
+    )
+    SELECT * FROM uc_with_map ORDER BY created_ts ASC;
+    "#,
+        user_id
+    )
+    .fetch_all(pool)
+    .await?;
+
+    let contexts = r
+        .into_iter()
+        .map(|r| {
+            UserContext::new(
+                r.context_id,
+                r.session_token,
+                r.created_ts,
+                r.flags,
+                r.has_vl_item,
+                r.flags_raw,
+                r.bi_count,
+                r.block_count,
+                r.item_count,
+                r.managers,
+                r.predecessor,
+                r.successor,
+                r.terminated,
+                r.editor,
+                r.map_id,
+                r.map_uid,
+                r.map_name,
+                r.map_hash,
+                r.map_load_count,
+            )
+        })
+        .collect::<Vec<_>>();
+
+    Ok((sessions, contexts))
+}
+
+pub async fn adm__get_editor_contexts_for(pool: &Pool<Postgres>, user_id: &Uuid) -> SqlResult<(Vec<UserSession>, Vec<UserContext>)> {
+    let sessions = adm__get_user_sessions(
+        pool,
+        user_id,
+        Some(NaiveDateTime::parse_from_str("2024-05-07 03:48:16.941229", "%Y-%m-%d %H:%M:%S%.f").unwrap()),
+    )
+    .await?;
+    let r = query!(
+        r#"--sql
+    WITH user_sessions AS (
+        SELECT s.session_token
+        FROM sessions s
+        WHERE s.user_id = $1
+            AND s.created_ts > '2024-05-07 03:48:16.941229'::timestamp
+    ),
+    user_contexts AS (
+        SELECT c.*
+        FROM contexts c
+        WHERE c.session_token IN (SELECT * FROM user_sessions)
+            AND c.flags_raw > 1
+            AND c.created_ts > '2024-05-07 03:48:16.941229'::timestamp
+    ),
+    uc_with_map AS (
+        SELECT c.*, m.uid as "map_uid?", m.name as "map_name?", m.hash as "map_hash?", m.load_count as "map_load_count?"
+        FROM user_contexts c
+        LEFT JOIN maps m ON
+        c.map_id = m.map_id
+    )
+    SELECT * FROM uc_with_map;
+    "#,
+        user_id
+    )
+    .fetch_all(pool)
+    .await?;
+
+    let contexts = r
+        .into_iter()
+        .map(|r| {
+            UserContext::new(
+                r.context_id,
+                r.session_token,
+                r.created_ts,
+                r.flags,
+                r.has_vl_item,
+                r.flags_raw,
+                r.bi_count,
+                r.block_count,
+                r.item_count,
+                r.managers,
+                r.predecessor,
+                r.successor,
+                r.terminated,
+                r.editor,
+                r.map_id,
+                r.map_uid,
+                r.map_name,
+                r.map_hash,
+                r.map_load_count,
+            )
+        })
+        .collect::<Vec<_>>();
+
+    Ok((sessions, contexts))
+}
+
+#[derive(Debug, Clone)]
+pub struct UserContext {
+    pub context_id: Uuid,
+    pub session_token: Uuid,
+    pub created_ts: NaiveDateTime,
+    pub flags: Vec<bool>,
+    pub has_vl_item: bool,
+    pub flags_raw: Option<i64>,
+    pub bi_count: i32,
+    pub block_count: i32,
+    pub item_count: i32,
+    pub managers: i64,
+    pub predecessor: Option<Uuid>,
+    pub successor: Option<Uuid>,
+    pub terminated: bool,
+    pub editor: Option<bool>,
+    pub map_id: Option<i32>,
+    pub map_uid: Option<String>,
+    pub map_name: Option<String>,
+    pub map_hash: Option<Vec<u8>>,
+    pub map_load_count: Option<i32>,
+}
+
+impl UserContext {
+    fn new(
+        context_id: Uuid,
+        session_token: Uuid,
+        created_ts: NaiveDateTime,
+        flags: Vec<bool>,
+        has_vl_item: bool,
+        flags_raw: Option<i64>,
+        bi_count: i32,
+        block_count: i32,
+        item_count: i32,
+        managers: i64,
+        predecessor: Option<Uuid>,
+        successor: Option<Uuid>,
+        terminated: bool,
+        editor: Option<bool>,
+        map_id: Option<i32>,
+        map_uid: Option<String>,
+        map_name: Option<String>,
+        map_hash: Option<Vec<u8>>,
+        map_load_count: Option<i32>,
+    ) -> Self {
+        UserContext {
+            context_id,
+            session_token,
+            created_ts,
+            flags,
+            has_vl_item,
+            flags_raw,
+            bi_count,
+            block_count,
+            item_count,
+            managers,
+            predecessor,
+            successor,
+            terminated,
+            editor,
+            map_id,
+            map_uid,
+            map_name,
+            map_hash,
+            map_load_count,
+        }
+    }
+
+    pub fn is_dd2_uid(&self) -> bool {
+        self.map_uid.as_ref().map(|s| s == DD2_MAP_UID).unwrap_or_default()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct UserSession {
+    pub user_id: Uuid,
+    pub session_token: Uuid,
+    pub created_ts: NaiveDateTime,
+    pub ip_address: String,
+    pub replaced: bool,
+    pub plugin_info: String,
+    pub game_info: String,
+    pub gamer_info: String,
+}
+
+impl UserSession {
+    fn new(
+        user_id: Uuid,
+        session_token: Uuid,
+        created_ts: NaiveDateTime,
+        ip_address: String,
+        replaced: bool,
+        plugin_info: String,
+        game_info: String,
+        gamer_info: String,
+    ) -> Self {
+        Self {
+            user_id,
+            session_token,
+            created_ts,
+            ip_address,
+            replaced,
+            plugin_info,
+            game_info,
+            gamer_info,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct VehicleState {
+    pub st: Uuid,
+    pub ctx: Uuid,
+    pub is_official: bool,
+    pub pos: [f64; 3],
+    pub vel: [f64; 3],
+    pub rotq: [f64; 4],
+    pub ts: NaiveDateTime,
+}
+
+pub async fn adm__get_user_vehicle_states(pool: &Pool<Postgres>, user_id: &Uuid) -> SqlResult<Vec<VehicleState>> {
+    let r = query!(
+        r#"--sql
+        WITH user_sessions AS (
+            SELECT s.session_token
+            FROM sessions s
+            WHERE s.user_id = $1
+                AND s.created_ts > '2024-05-07 03:48:16.941229'::timestamp
+        ),
+        user_contexts AS (
+            SELECT c.*
+            FROM contexts c
+            WHERE c.session_token IN (SELECT * FROM user_sessions)
+                AND c.created_ts > '2024-05-07 03:48:16.941229'::timestamp
+        ),
+        uc_with_map AS (
+            SELECT c.*, m.uid as "map_uid?", m.name as "map_name?", m.hash as "map_hash?", m.load_count as "map_load_count?"
+            FROM user_contexts c
+            LEFT JOIN maps m ON
+            c.map_id = m.map_id
+        ),
+        vs_with_ctx AS (
+            SELECT vs.session_token as st, vs.context_id as cid, vs.is_official, vs.pos, vs.rotq, vs.vel, vs.ts, uc.* FROM vehicle_states vs
+            INNER JOIN user_sessions us ON vs.session_token = us.session_token
+            LEFT JOIN uc_with_map uc ON vs.context_id = uc.context_id
+        )
+        SELECT * FROM vs_with_ctx;
+    "#,
+        user_id
+    )
+    .fetch_all(pool)
+    .await?;
+
+    let mut ret = vec![];
+    for r in r.into_iter() {
+        ret.push(VehicleState {
+            st: r.st,
+            ctx: r.cid.unwrap_or_default(),
+            is_official: r.is_official,
+            pos: vec_to_color(r.pos).unwrap(),
+            vel: vec_to_color(r.vel).unwrap(),
+            rotq: vec_to_vec4(r.rotq).unwrap(),
+            ts: r.ts,
+        });
+    }
+
+    Ok(ret)
 }

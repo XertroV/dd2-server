@@ -330,4 +330,28 @@ mod tests {
             assert_eq!(i, context_map_cypher_to_plain(context_map_plain_to_cypher(i)));
         }
     }
+
+    #[test]
+    fn test_context_min_official() {
+        for x in [2, 9, 13] {
+            let mut flags = [false; 15];
+            flags[x] = true;
+            let encoded = encode_context_flags(&flags);
+            let decoded = decode_context_flags(encoded);
+            for i in 0..15 {
+                assert!(decoded[i] == (i == x));
+            }
+            eprintln!("encoded SF {} only {:?}", x, encoded);
+        }
+
+        // let mut flags = [false; 15];
+        // flags[9] = true;
+        // let encoded = encode_context_flags(&flags);
+        // let decoded = decode_context_flags(encoded);
+        // for i in 0..15 {
+        //     assert!(decoded[i] == (i == 9));
+        // }
+        // eprintln!("encoded SF 9 only {:?}", encoded);
+        // assert!(false);
+    }
 }
