@@ -368,7 +368,7 @@ pub async fn get_global_lb(pool: &Pool<Postgres>, start: i32, end: i32) -> Resul
             ts: e.ts.unwrap(),
             display_name: e.display_name,
             update_count: e.update_count.unwrap_or_default(),
-            color: vec_to_color(e.color),
+            color: todo!("migrations"), // vec_to_color(e.color),
         })
         .collect())
 }
@@ -696,6 +696,7 @@ pub async fn adm__get_user_sessions(
         LEFT JOIN plugin_infos p ON s.plugin_info_id = p.id
         WHERE s.user_id = $1
             AND s.created_ts > $2
+        ORDER BY s.created_ts ASC;
         "#,
         user_id,
         created_after.unwrap_or(NaiveDateTime::UNIX_EPOCH)

@@ -457,6 +457,7 @@ checksum = "e8566979429cf69b49a5c740c60791108e86440e8be149bbea4fe54d2c32d6e2"
 name = "dd2-server"
 version = "0.4.20"
 dependencies = [
+ "ahash",
  "base64 0.22.1",
  "bitflags 2.5.0",
  "chrono",

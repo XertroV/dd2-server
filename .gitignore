@@ -7,3 +7,5 @@ ssl/
 .env-dev
 output
 log*
+.twitch
+output-*

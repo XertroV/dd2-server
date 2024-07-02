@@ -1,20 +1,21 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     path::PathBuf,
     sync::Arc,
     thread,
     time::{Duration, SystemTime},
 };
 
+use ahash::random_state::RandomState;
 use chrono::{NaiveDate, NaiveDateTime};
 use consts::DD2_MAP_UID;
 use env_logger::Env;
 use itertools::{EitherOrBoth, Itertools};
-use log::{info, warn};
+use log::{error, info, warn};
 use player::check_flags_sf_mi;
 use queries::{
     adm__get_game_cam_nods, adm__get_user_contexts, adm__get_user_sessions, adm__get_user_vehicle_states, vec3_avg, vec3_len, vec3_sub,
-    SqlResult, UserContext, UserSession, Vec3, VehicleState,
+    vec_to_color, SqlResult, UserContext, UserSession, Vec3, VehicleState,
 };
 use router::ToPlayerMgr;
 use sqlx::{postgres::PgPoolOptions, query, Pool, Postgres};
@@ -36,6 +37,7 @@ async fn main() {
     env_logger::Builder::from_env(Env::default().default_filter_or("info")).init();
 
     let db_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
+    info!("Connecting to db: {}", db_url);
     let pool = PgPoolOptions::new()
         .max_connections(10)
         .acquire_timeout(Duration::from_secs(2))
@@ -45,33 +47,171 @@ async fn main() {
     let db = Arc::new(pool);
     info!("Connected to db");
 
+    let start = SystemTime::now();
     match sqlx::migrate!().run(db.as_ref()).await {
         Ok(_) => info!("Migrations ran successfully"),
         Err(e) => panic!("Error running migrations: {:?}", e),
     }
+    let end = SystemTime::now();
+    info!("Migration time: {:?}", end.duration_since(start).unwrap());
 
     let pool = db.as_ref();
 
-    let players_to_del = find_players_to_del(pool).await.unwrap();
-    info!("Got {} players to delete", players_to_del.len());
-    if players_to_del.len() > 0 {
-        clean_away_irrelevant_users(db.as_ref()).await;
+    if false {
+        // let players_to_del = find_players_to_del(pool).await.unwrap();
+        // info!("Got {} players to delete", players_to_del.len());
+        // if players_to_del.len() > 0 {
+        //     clean_away_irrelevant_users(db.as_ref()).await;
+        // }
     }
 
-    run_get_unique_scene_flags(db.as_ref()).await;
-    run_get_unique_mgrs(db.as_ref()).await;
-    run_generate_data_for_users(db.as_ref()).await;
+    // run_get_unique_scene_flags(db.as_ref()).await;
+    // run_get_unique_mgrs(db.as_ref()).await;
+    // run_generate_data_for_users(db.as_ref()).await;
+    // run_generate_wr_over_time(db.as_ref()).await;
+    run_generate_wr_over_time_from_vehicle_states(db.as_ref()).await;
+}
+
+pub async fn run_generate_wr_over_time_from_vehicle_states(pool: &Pool<Postgres>) {
+    let wrs = query!(
+        r#"
+        WITH shadow_banned AS (
+            SELECT user_id FROM shadow_bans
+        ),
+        joined_vs AS (
+            SELECT vs.id as vs_id, vs.pos[2] as h, vs.ts, s.user_id, u.display_name as name, c.color FROM vehicle_states vs
+            INNER JOIN sessions s ON vs.session_token = s.session_token
+            INNER JOIN users u ON s.user_id = u.web_services_user_id
+            INNER JOIN colors c ON s.user_id = c.user_id
+            WHERE vs.is_official
+                AND s.user_id NOT IN (SELECT * FROM shadow_banned)
+        ),
+        ranked_vs AS (
+            SELECT
+                vs_id, user_id, ts, h, name, color,
+                MAX(h) OVER (ORDER BY ts) AS max_height_so_far
+            FROM joined_vs
+        ),
+        new_wr AS (
+            SELECT
+                vs_id, user_id, ts, h, name, color,
+                max_height_so_far,
+                LAG(max_height_so_far, 1, 0) OVER (ORDER BY ts) AS previous_max_height
+            FROM ranked_vs
+        )
+        SELECT
+            vs_id, user_id, ts, h, name, color,
+            max_height_so_far,
+            previous_max_height
+        FROM
+            new_wr
+        WHERE
+            h > previous_max_height
+        ORDER BY
+            ts;
+        "#
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap();
+    info!("Got {} WRs", wrs.len());
+    let mut rows = vec![];
+    for wr in wrs {
+        rows.push(format!(
+            "{},{},{},{},{}",
+            wr.ts.and_utc().timestamp(),
+            wr.h.unwrap_or_default(),
+            &wr.user_id.unwrap(),
+            wr.name,
+            color_to_str(vec_to_color(wr.color).unwrap_or([0.7, 0.5, 0.7]))
+        ));
+    }
+
+    let data = format!("ts,height,wsid,name,color\n{}", rows.join("\n"));
+    write_wr_over_time("wr_over_time_vs.csv", &data);
+    info!("Wrote WRs to file");
+}
+
+pub async fn run_generate_wr_over_time(pool: &Pool<Postgres>) {
+    let lb_entries = query!(
+        r#"
+        WITH shadow_banned AS (
+            SELECT user_id FROM shadow_bans
+        )
+        SELECT l.*, u.display_name as name, c.color FROM leaderboard_archive l
+        LEFT JOIN users u ON l.user_id = u.web_services_user_id
+        LEFT JOIN colors c ON l.user_id = c.user_id
+        WHERE l.user_id NOT IN (SELECT * FROM shadow_banned)
+        ORDER BY ts ASC
+        "#
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap();
+
+    let mut wr_prog = vec![];
+    let mut best_h = 0.0;
+    for (ix, entry) in lb_entries.into_iter().enumerate() {
+        if entry.height > best_h {
+            best_h = entry.height;
+            wr_prog.push((entry.ts, entry));
+        }
+    }
+
+    let data = format!(
+        "ts,height,wsid,name,color\n{}",
+        wr_prog
+            .into_iter()
+            .map(|(ts, h)| format!(
+                "{},{},{},{},{}",
+                ts.and_utc().timestamp(),
+                h.height,
+                &h.user_id,
+                h.name,
+                color_to_str(vec_to_color(h.color).unwrap_or([0.7, 0.5, 0.7]))
+            ))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    write_wr_over_time("wr_over_time.csv", &data);
+}
+
+fn write_wr_over_time(file_name: &str, data: &str) {
+    let base_path = PathBuf::from("output");
+    let file_path = base_path.join(file_name);
+    std::fs::create_dir_all(base_path).unwrap();
+    std::fs::write(file_path, data).unwrap();
+}
+
+fn color_to_str(c: Vec3) -> String {
+    format!(
+        "#{:02x}{:02x}{:02x}",
+        (c[0] * 255.0) as u8,
+        (c[1] * 255.0) as u8,
+        (c[2] * 255.0) as u8
+    )
 }
 
 pub async fn run_generate_data_for_users(pool: &Pool<Postgres>) {
     let users = query!(
         r#"
+        WITH shadow_banned AS (
+            SELECT user_id FROM shadow_bans
+        ),
+        top_44 AS (
+            SELECT user_id FROM ranked_lb_view
+            WHERE height > 800.0
+              AND user_id NOT IN (SELECT * FROM shadow_banned)
+        )
         SELECT web_services_user_id as user_id, display_name as name FROM users
+            WHERE web_services_user_id IN (SELECT * FROM top_44)
         "#,
     )
     .fetch_all(pool)
     .await
     .unwrap();
+
+    info!("Got {} users to process", users.len());
 
     for user in users {
         info!("Generating data for user: {:?}", user.name);
@@ -81,10 +221,92 @@ pub async fn run_generate_data_for_users(pool: &Pool<Postgres>) {
         // check_user_session_contexts(sessions, contexts, user.name).await;
         // break;
         // thread::sleep(Duration::from_secs(1));
-        // generate_user_timeline_data(pool, &user.user_id, &user.name).await.unwrap();
+
+        if false {}
+        generate_user_timeline_data(pool, &user.user_id, &user.name).await.unwrap();
+        info!("Processed user TL data: {}", &user.user_id);
         generate_position_deltas_data(pool, &user.user_id, &user.name).await.unwrap();
-        info!("Processed user: {}", &user.user_id);
+        info!("Processed user Pos Delta data: {}", &user.user_id);
+        generate_map_data_for_user(pool, &user.user_id, &user.name).await.unwrap();
+        info!("Processed user Map data: {}", &user.user_id);
+        info!("Finished processing user: {} / {}", &user.user_id, &user.name);
     }
+}
+
+pub async fn generate_map_data_for_user(pool: &Pool<Postgres>, user_id: &Uuid, user_name: &str) -> SqlResult<()> {
+    let (sessions, contexts) = adm__get_user_contexts(pool, user_id).await?;
+
+    let s_lookup: HashMap<Uuid, UserSession, std::hash::RandomState> =
+        HashMap::from_iter(sessions.into_iter().map(|s| (s.session_token.clone(), s)));
+
+    let mut rows = vec![];
+    rows.push("ctx_ix,start_ts,map_name,bi_count,since_init_s,end_ts,duration_s".to_string());
+
+    rows.reserve(contexts.len());
+
+    let mut last_row = None;
+
+    // let mut map_ctxs = vec![];
+    for (ix, ctx) in contexts.iter().enumerate() {
+        // let is_dd2 = ctx.is_dd2_uid();
+        let mut map_name = ctx
+            .map_name
+            .clone()
+            .unwrap_or_else(|| ctx.map_uid.clone().unwrap_or("no-map".to_string()));
+        if map_name.starts_with("<!:;") {
+            map_name = ctx.map_uid.clone().unwrap_or("not-rel&no-uid".to_string());
+        }
+        let bi_count = ctx.bi_count;
+        let ts: i64 = ctx.created_ts.and_utc().timestamp();
+        let session = s_lookup.get(&ctx.session_token).unwrap();
+        let since_init_str = session
+            .gamer_info
+            .split("SinceInit:")
+            .nth(1)
+            .unwrap_or_default()
+            .lines()
+            .nth(0)
+            .unwrap_or_default();
+        let since_init = Duration::from_millis(since_init_str.parse::<u64>().unwrap());
+
+        if let Some((l_ix, l_ts, l_map_name, l_bi_count, l_since_init, l_end_ts, l_secs)) = last_row {
+            if l_map_name != map_name || l_bi_count != bi_count {
+                let last_secs = ts - l_ts;
+                if last_secs < 0 {
+                    error!("Negative time diff: {} -> {}", l_ts, ts);
+                }
+                rows.push(format!(
+                    "{},{},{},{},{},{},{}",
+                    l_ix, l_ts, l_map_name, l_bi_count, l_since_init, ts, last_secs
+                ));
+                last_row = Some((ix, ts, map_name, bi_count, since_init.as_secs_f32(), ts + 60, 60));
+            } else {
+                //
+                last_row = Some((l_ix, l_ts, l_map_name, l_bi_count, l_since_init, ts, ts - l_ts));
+            }
+        } else {
+            last_row = Some((ix, ts, map_name, bi_count, since_init.as_secs_f32(), ts + 60, 60));
+        }
+    }
+
+    let (l_ix, l_ts, l_map_name, l_bi_count, l_since_init, end_ts, dur_s) = last_row.unwrap();
+    rows.push(format!(
+        "{},{},{},{},{},{},{}",
+        l_ix, l_ts, l_map_name, l_bi_count, l_since_init, end_ts, dur_s
+    ));
+
+    let data = rows.join("\n");
+
+    write_user_map_session(user_name, data.as_bytes()).await;
+
+    Ok(())
+}
+
+async fn write_user_map_session(user_name: &str, data: &[u8]) {
+    let base_path = PathBuf::from(format!("output/maps/{}", clean_username(user_name)));
+    let file_path = base_path.join(format!("all-maps.csv"));
+    std::fs::create_dir_all(base_path).unwrap();
+    std::fs::write(file_path, data).unwrap();
 }
 
 pub async fn generate_user_timeline_data(pool: &Pool<Postgres>, user_id: &Uuid, user_name: &str) -> SqlResult<()> {
@@ -306,7 +528,7 @@ pub fn vec3_psv(v: Vec3) -> String {
 }
 
 pub async fn generate_position_deltas_data(pool: &Pool<Postgres>, user_id: &Uuid, user_name: &str) -> SqlResult<()> {
-    // let (sessions, contexts) = adm__get_user_contexts(pool, user_id).await?;
+    let (sessions, contexts) = adm__get_user_contexts(pool, user_id).await?;
     let vehicle_states = adm__get_user_vehicle_states(pool, user_id).await?;
 
     let mut vs = vehicle_states

@@ -1,3 +1,5 @@
+from collections import defaultdict
+import json
 from pathlib import Path
 import csv
 from dataclasses import dataclass
@@ -20,6 +22,25 @@ for user_tl_folder in otl_users:
     csvs = list(user_tl_folder.glob("*.csv"))
     # print(f"nb csvs: {len(csvs)}")
     user_csvs.append((user_tl_folder, csvs))
+
+row_types = [0, 2, 3, 5, 7, 9, 10, 11, 12, 15, 16, 17, 18]
+type_names = [
+    "MainMenu",
+    "MapDriving",
+    "MapMenu",
+    "MapUnk",
+    "Unk",
+    "EditorUnk",
+    "EditorMap",
+    "EditorMT",
+    "EditorDriving",
+    "EdUnkDD2",
+    "EdMapDD2",
+    "EdMtDD2",
+    "EdDriveDD2",
+]
+
+type_to_name = dict(zip(row_types, type_names))
 
 
 @dataclass
@@ -50,6 +71,8 @@ class TimelineRow:
 import itertools
 
 ignore_before = datetime.fromtimestamp(1715126458)
+
+logged_user_ctx = defaultdict(lambda: defaultdict(lambda: 0))
 
 user_csvs = sorted(user_csvs, key=lambda p: p[0].stem)
 for tl_folder, csvs in user_csvs:
@@ -83,7 +106,11 @@ for tl_folder, csvs in user_csvs:
                 # offset type if DD2
                 ys.append(row.ty + (6 if row.is_dd2 and row.ty > 8 else 0))
                 if row.is_dd2 and row.ty > 8 and row.start > ignore_before:
-                    print(f"DD2 type: {row.ty}")
+                    logged_user_ctx[user_name][str(row.map_id)] += 1
+                    if logged_user_ctx[user_name][str(row.map_id)] < 2:
+                        print(
+                            f"DD2 type: {type_to_name.get(row.ty, 'unk')} -- {row.map_id} -- count: {logged_user_ctx[user_name][row.map_id]}"
+                        )
                 cs.append(row.get_col())
 
         uniq_ids = set(map_ids)
@@ -129,22 +156,8 @@ for tl_folder, csvs in user_csvs:
         ax.set_ylabel("Context type")
         # we offset editor DD2 types earlier
         ax.set_yticks(
-            [0, 2, 3, 5, 7, 9, 10, 11, 12, 15, 16, 17, 18],
-            [
-                "MainMenu",
-                "MapDriving",
-                "MapMenu",
-                "MapUnk",
-                "Unk",
-                "EditorUnk",
-                "EditorMap",
-                "EditorMT",
-                "EditorDriving",
-                "EdUnkDD2",
-                "EdMapDD2",
-                "EdMtDD2",
-                "EdDriveDD2",
-            ],
+            row_types,
+            type_names,
         )
         ax.add_collection(lc)
         ax.autoscale()
@@ -166,3 +179,7 @@ for tl_folder, csvs in user_csvs:
         # if i > 3: break
         # break
     # break
+
+
+print("Done. All warnings:")
+print(json.dumps(logged_user_ctx, indent=2))
