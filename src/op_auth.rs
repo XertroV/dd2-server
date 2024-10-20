@@ -74,13 +74,9 @@ pub async fn check_token(token: &str, plugin_id: i32) -> Option<TokenResp> {
         }
     };
 
-    // This is a placeholder for your get_token_cached_and_recent function.
-    // Implement cache check here...
     let mut token_cache = TOKEN_CACHE.write().await;
     if let Some(token_resp) = token_cache.get(token) {
         return Some(token_resp.clone());
-        // if token_resp.token_time > (chrono::Utc::now().timestamp() - 3600) {
-        // }
     }
     drop(token_cache);
 
