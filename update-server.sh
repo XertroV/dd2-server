@@ -28,6 +28,6 @@ function sync_server() {
 
 sync_server "DipsPP-server1" dd2-server
 sync_server "dpp-02" dd2-server2
-sync_server "dpp-03" dd2-server2
-sync_server "dpp-04" dd2-server2
+# sync_server "dpp-03" dd2-server2
+# sync_server "dpp-04" dd2-server2
 # ssh $SERVERNAME "cd ~/plugin-server && ./server-setup.sh"

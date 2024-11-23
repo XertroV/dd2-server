@@ -10,9 +10,8 @@ use op_auth::check_token;
 use player::{parse_u64_str, LoginSession, Player};
 use queries::{
     context_mark_succeeded, create_session, custom_maps::get_map_nb_playing_live, get_global_lb, get_global_overview, get_user_in_lb,
-    get_user_stats, insert_context_packed, insert_finish, insert_gc_nod, insert_respawn, insert_start_fall, insert_vehicle_state,
-    register_or_login, resume_session, update_fall_with_end, update_server_stats, update_user_color, update_users_stats, user_settings,
-    PBUpdateRes,
+    get_user_stats, insert_context_packed, insert_finish, insert_respawn, insert_start_fall, insert_vehicle_state, register_or_login,
+    resume_session, update_fall_with_end, update_server_stats, update_user_color, update_users_stats, user_settings, PBUpdateRes,
 };
 use router::{AssetRef, LeaderboardEntry2, Map, PlayerCtx, Request, Response, Stats, ToPlayerMgr};
 use serde::ser::StdError;
@@ -514,7 +513,7 @@ impl XPlayer {
                         _ => Err(format!("Invalid sf/mi: {}/{}", sf, mi).into()),
                     }
                 }
-                Request::ReportGCNodMsg { data } => XPlayer::on_report_gcnod_msg(&pool, session_token, ctx_id.as_ref(), &data).await,
+                Request::ReportGCNodMsg { data } => Ok(()), // XPlayer::on_report_gcnod_msg(&pool, session_token, ctx_id.as_ref(), &data).await,
                 Request::Ping {} => queue_tx.send(Response::Ping {}).map_err(Into::into),
                 Request::ReportVehicleState { vel, pos, rotq } => {
                     XPlayer::report_vehicle_state(&pool, session_token, ctx.as_ref(), ctx_id.as_ref(), pos, rotq, vel).await
@@ -773,7 +772,7 @@ impl XPlayer {
             }
         };
         let user = register_or_login(&self.pool, &wsid, &token_resp.display_name).await?;
-        let session = create_session(&self.pool, user.id(), &plugin_info, &game_info, &gamer_info, &self.ip_address).await?;
+        let session = create_session(&self.pool, user.id(), &self.ip_address).await?;
         let plugin_ver = plugin_info_extract_version(&plugin_info);
         Ok(LoginSession {
             user,
@@ -798,7 +797,7 @@ impl XPlayer {
         };
         let plugin_ver = plugin_info_extract_version(&plugin_info);
         // check for sesison and resume
-        let (s, u) = resume_session(&self.pool, &session_token, &plugin_info, &game_info, &gamer_info, &self.ip_address).await?;
+        let (s, u) = resume_session(&self.pool, &session_token, &self.ip_address).await?;
         Ok(LoginSession {
             user: u,
             session: s,
@@ -1237,25 +1236,25 @@ impl XPlayer {
         Ok(())
     }
 
-    pub async fn on_report_gcnod_msg(pool: &Pool<Postgres>, session_id: &Uuid, ctx_id: Option<&Uuid>, data: &str) -> Result<(), ApiError> {
-        // decode base64
+    // pub async fn on_report_gcnod_msg(pool: &Pool<Postgres>, session_id: &Uuid, ctx_id: Option<&Uuid>, data: &str) -> Result<(), ApiError> {
+    //     // decode base64
 
-        let x = if data.len() < 0x2E0 {
-            data.into()
-        } else {
-            base64::prelude::BASE64_URL_SAFE.decode(data).unwrap_or(data.into())
-        };
+    //     let x = if data.len() < 0x2E0 {
+    //         data.into()
+    //     } else {
+    //         base64::prelude::BASE64_URL_SAFE.decode(data).unwrap_or(data.into())
+    //     };
 
-        match ctx_id {
-            Some(ctx_id) => {
-                insert_gc_nod(pool, session_id, ctx_id, &x).await?;
-            }
-            None => {
-                warn!("Dropping GCNod b/c no context");
-            }
-        }
-        Ok(())
-    }
+    //     match ctx_id {
+    //         Some(ctx_id) => {
+    //             insert_gc_nod(pool, session_id, ctx_id, &x).await?;
+    //         }
+    //         None => {
+    //             warn!("Dropping GCNod b/c no context");
+    //         }
+    //     }
+    //     Ok(())
+    // }
 
     pub async fn get_gfm_donations(pool: &Pool<Postgres>, queue_tx: &UnboundedSender<Response>) -> Result<(), ApiError> {
         let total = get_gfm_donations_latest(pool).await?;

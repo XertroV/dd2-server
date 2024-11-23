@@ -687,38 +687,39 @@ pub async fn adm__get_user_sessions(
     user_id: &Uuid,
     created_after: Option<NaiveDateTime>,
 ) -> SqlResult<Vec<UserSession>> {
-    let sessions: Vec<UserSession> = query!(
-        r#"--sql
-        SELECT s.*, g.info as game_info, r.info as gamer_info, p.info as plugin_info
-        FROM sessions s
-        LEFT JOIN game_infos g ON s.game_info_id = g.id
-        LEFT JOIN gamer_infos r ON s.gamer_info_id = r.id
-        LEFT JOIN plugin_infos p ON s.plugin_info_id = p.id
-        WHERE s.user_id = $1
-            AND s.created_ts > $2
-        ORDER BY s.created_ts ASC;
-        "#,
-        user_id,
-        created_after.unwrap_or(NaiveDateTime::UNIX_EPOCH)
-    )
-    .fetch_all(pool)
-    .await?
-    .into_iter()
-    .map(|r| {
-        UserSession::new(
-            r.user_id.unwrap(),
-            r.session_token,
-            r.created_ts,
-            r.ip_address,
-            r.replaced,
-            r.plugin_info,
-            r.game_info,
-            r.gamer_info,
-        )
-    })
-    .collect::<Vec<_>>();
-
-    Ok(sessions)
+    // let sessions: Vec<UserSession> = query!(
+    //     r#"--sql
+    //     SELECT s.*
+    //         -- g.info as game_info, r.info as gamer_info, p.info as plugin_info
+    //     FROM sessions s
+    //     -- LEFT JOIN game_infos g ON s.game_info_id = g.id
+    //     -- LEFT JOIN gamer_infos r ON s.gamer_info_id = r.id
+    //     -- LEFT JOIN plugin_infos p ON s.plugin_info_id = p.id
+    //     WHERE s.user_id = $1
+    //         AND s.created_ts > $2
+    //     ORDER BY s.created_ts ASC;
+    //     "#,
+    //     user_id,
+    //     created_after.unwrap_or(NaiveDateTime::UNIX_EPOCH)
+    // )
+    // .fetch_all(pool)
+    // .await?
+    // .into_iter()
+    // .map(|r| {
+    //     UserSession::new(
+    //         r.user_id.unwrap(),
+    //         r.session_token,
+    //         r.created_ts,
+    //         r.ip_address,
+    //         r.replaced,
+    //         r.plugin_info,
+    //         r.game_info,
+    //         r.gamer_info,
+    //     )
+    // })
+    // .collect::<Vec<_>>();
+    // Ok(sessions)
+    Ok(vec![])
 }
 
 pub struct GameCamNod {
@@ -759,27 +760,27 @@ impl GameCamNod {
     }
 }
 
-pub async fn adm__get_game_cam_nods(pool: &Pool<Postgres>, context_id: &Uuid) -> SqlResult<Vec<GameCamNod>> {
-    let r = query!(
-        r#"--sql
-        SELECT * FROM game_cam_nods WHERE context_id = $1
-    "#,
-        context_id
-    )
-    .fetch_all(pool)
-    .await?
-    .into_iter()
-    .map(|rec| GameCamNod {
-        id: rec.id,
-        session_token: rec.session_token,
-        context_id: rec.context_id,
-        raw: base64::prelude::BASE64_URL_SAFE.decode(&rec.raw).unwrap_or(rec.raw),
-    });
+// pub async fn adm__get_game_cam_nods(pool: &Pool<Postgres>, context_id: &Uuid) -> SqlResult<Vec<GameCamNod>> {
+//     let r = query!(
+//         r#"--sql
+//         SELECT * FROM game_cam_nods WHERE context_id = $1
+//     "#,
+//         context_id
+//     )
+//     .fetch_all(pool)
+//     .await?
+//     .into_iter()
+//     .map(|rec| GameCamNod {
+//         id: rec.id,
+//         session_token: rec.session_token,
+//         context_id: rec.context_id,
+//         raw: base64::prelude::BASE64_URL_SAFE.decode(&rec.raw).unwrap_or(rec.raw),
+//     });
 
-    // base64::prelude::BASE64_URL_SAFE.decode(data).unwrap_or(data.into())
+//     // base64::prelude::BASE64_URL_SAFE.decode(data).unwrap_or(data.into())
 
-    todo!()
-}
+//     todo!()
+// }
 
 pub async fn adm__get_user_contexts(pool: &Pool<Postgres>, user_id: &Uuid) -> SqlResult<(Vec<UserSession>, Vec<UserContext>)> {
     let sessions = adm__get_user_sessions(pool, user_id, None).await?;

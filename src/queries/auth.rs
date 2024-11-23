@@ -19,9 +19,9 @@ pub struct Session {
 pub async fn create_session(
     pool: &Pool<Postgres>,
     user_id: &Uuid,
-    plugin_info: &str,
-    game_info: &str,
-    gamer_info: &str,
+    // plugin_info: &str,
+    // game_info: &str,
+    // gamer_info: &str,
     ip_address: &str,
 ) -> Result<Session, sqlx::Error> {
     let session_token = Uuid::now_v7();
@@ -32,7 +32,7 @@ pub async fn create_session(
     // plugin_info_id, game_info_id, gamer_info_id
 
     let r = query!(
-        "INSERT INTO sessions (session_token, user_id, ip_address) VALUES ($1, $2, $3, $4, $5, $6) RETURNING session_token;",
+        "INSERT INTO sessions (session_token, user_id, ip_address) VALUES ($1, $2, $3) RETURNING session_token;",
         session_token,
         user_id,
         &ip_address[..ip_address.len().min(39)],
@@ -44,72 +44,72 @@ pub async fn create_session(
     })
 }
 
-async fn select_or_insert_plugin_info(pool: &Pool<Postgres>, plugin_info: &str) -> Result<i32, sqlx::Error> {
-    let r = query!("SELECT id FROM plugin_infos WHERE info = $1;", plugin_info)
-        .fetch_one(pool)
-        .await
-        .map(|r| r.id);
-    match r {
-        Ok(id) => Ok(id),
-        Err(sqlx::Error::RowNotFound) => insert_plugin_info(pool, plugin_info).await,
-        Err(e) => Err(e),
-    }
-}
+// async fn select_or_insert_plugin_info(pool: &Pool<Postgres>, plugin_info: &str) -> Result<i32, sqlx::Error> {
+//     let r = query!("SELECT id FROM plugin_infos WHERE info = $1;", plugin_info)
+//         .fetch_one(pool)
+//         .await
+//         .map(|r| r.id);
+//     match r {
+//         Ok(id) => Ok(id),
+//         Err(sqlx::Error::RowNotFound) => insert_plugin_info(pool, plugin_info).await,
+//         Err(e) => Err(e),
+//     }
+// }
 
-async fn insert_plugin_info(pool: &Pool<Postgres>, plugin_info: &str) -> Result<i32, sqlx::Error> {
-    let pi_id = query!("INSERT INTO plugin_infos (info) VALUES ($1) RETURNING id;", plugin_info)
-        .fetch_one(pool)
-        .await?
-        .id;
-    Ok(pi_id)
-}
+// async fn insert_plugin_info(pool: &Pool<Postgres>, plugin_info: &str) -> Result<i32, sqlx::Error> {
+//     let pi_id = query!("INSERT INTO plugin_infos (info) VALUES ($1) RETURNING id;", plugin_info)
+//         .fetch_one(pool)
+//         .await?
+//         .id;
+//     Ok(pi_id)
+// }
 
-async fn select_or_insert_game_info(pool: &Pool<Postgres>, game_info: &str) -> Result<i32, sqlx::Error> {
-    let r = query!("SELECT id FROM game_infos WHERE info = $1;", game_info)
-        .fetch_one(pool)
-        .await
-        .map(|r| r.id);
-    match r {
-        Ok(id) => Ok(id),
-        Err(sqlx::Error::RowNotFound) => insert_game_info(pool, game_info).await,
-        Err(e) => Err(e),
-    }
-}
+// async fn select_or_insert_game_info(pool: &Pool<Postgres>, game_info: &str) -> Result<i32, sqlx::Error> {
+//     let r = query!("SELECT id FROM game_infos WHERE info = $1;", game_info)
+//         .fetch_one(pool)
+//         .await
+//         .map(|r| r.id);
+//     match r {
+//         Ok(id) => Ok(id),
+//         Err(sqlx::Error::RowNotFound) => insert_game_info(pool, game_info).await,
+//         Err(e) => Err(e),
+//     }
+// }
 
-async fn insert_game_info(pool: &Pool<Postgres>, game_info: &str) -> Result<i32, sqlx::Error> {
-    let gi_id = query!("INSERT INTO game_infos (info) VALUES ($1) RETURNING id;", game_info)
-        .fetch_one(pool)
-        .await?
-        .id;
-    Ok(gi_id)
-}
+// async fn insert_game_info(pool: &Pool<Postgres>, game_info: &str) -> Result<i32, sqlx::Error> {
+//     let gi_id = query!("INSERT INTO game_infos (info) VALUES ($1) RETURNING id;", game_info)
+//         .fetch_one(pool)
+//         .await?
+//         .id;
+//     Ok(gi_id)
+// }
 
-async fn select_or_insert_gamer_info(pool: &Pool<Postgres>, gamer_info: &str) -> Result<i32, sqlx::Error> {
-    let r = query!("SELECT id FROM gamer_infos WHERE info = $1;", gamer_info)
-        .fetch_one(pool)
-        .await
-        .map(|r| r.id);
-    match r {
-        Ok(id) => Ok(id),
-        Err(sqlx::Error::RowNotFound) => insert_gamer_info(pool, gamer_info).await,
-        Err(e) => Err(e),
-    }
-}
+// async fn select_or_insert_gamer_info(pool: &Pool<Postgres>, gamer_info: &str) -> Result<i32, sqlx::Error> {
+//     let r = query!("SELECT id FROM gamer_infos WHERE info = $1;", gamer_info)
+//         .fetch_one(pool)
+//         .await
+//         .map(|r| r.id);
+//     match r {
+//         Ok(id) => Ok(id),
+//         Err(sqlx::Error::RowNotFound) => insert_gamer_info(pool, gamer_info).await,
+//         Err(e) => Err(e),
+//     }
+// }
 
-async fn insert_gamer_info(pool: &Pool<Postgres>, gamer_info: &str) -> Result<i32, sqlx::Error> {
-    let gi_id = query!("INSERT INTO gamer_infos (info) VALUES ($1) RETURNING id;", gamer_info)
-        .fetch_one(pool)
-        .await?
-        .id;
-    Ok(gi_id)
-}
+// async fn insert_gamer_info(pool: &Pool<Postgres>, gamer_info: &str) -> Result<i32, sqlx::Error> {
+//     let gi_id = query!("INSERT INTO gamer_infos (info) VALUES ($1) RETURNING id;", gamer_info)
+//         .fetch_one(pool)
+//         .await?
+//         .id;
+//     Ok(gi_id)
+// }
 
 pub async fn resume_session(
     pool: &Pool<Postgres>,
     session_token: &Uuid,
-    plugin_info: &str,
-    game_info: &str,
-    gamer_info: &str,
+    // plugin_info: &str,
+    // game_info: &str,
+    // gamer_info: &str,
     ip_address: &str,
 ) -> Result<(Session, User), sqlx::Error> {
     let user = query_as!(
@@ -125,10 +125,7 @@ pub async fn resume_session(
         .execute(pool)
         .await?;
 
-    Ok((
-        create_session(pool, user.id(), plugin_info, game_info, gamer_info, ip_address).await?,
-        user,
-    ))
+    Ok((create_session(pool, user.id(), ip_address).await?, user))
 }
 
 pub async fn register_or_login(pool: &Pool<Postgres>, account_id: &Uuid, display_name: &str) -> Result<User, sqlx::Error> {

@@ -174,27 +174,27 @@ CREATE INDEX context_id_idx ON game_cam_nods(context_id);
 CREATE INDEX flags_idx ON game_cam_nods(init_byte, is_race_nod_null, is_editor_cam_null, is_race_88_null, is_cam_1a8_16);
 */
 
-pub async fn insert_gc_nod(pool: &Pool<Postgres>, session_id: &Uuid, context_id: &Uuid, nod: &[u8]) -> Result<(), sqlx::Error> {
-    let (init_byte, is_race_nod_null, is_editor_cam_null, is_race_88_null, is_cam_1a8_16) = match nod.len() < 0x2C0 {
-        true => (0, true, true, true, false),
-        false => (
-            nod[0] as u8,
-            nod[0x70..0x78] == [0; 8],
-            nod[0x80..0x88] == [0; 8],
-            nod[0x88..0x90] == [0; 8],
-            nod[0x1a8] == 0x16,
-        ),
-    };
-    query!(
-        "INSERT INTO game_cam_nods (session_token, context_id, raw, init_byte, is_race_nod_null, is_editor_cam_null, is_race_88_null, is_cam_1a8_16) VALUES ($1, $2, $3, $4, $5, $6, $7, $8);",
-        session_id,
-        context_id,
-        nod,
-        init_byte as i16,
-        is_race_nod_null,
-        is_editor_cam_null,
-        is_race_88_null,
-        is_cam_1a8_16,
-    ).execute(pool).await?;
-    Ok(())
-}
+// pub async fn insert_gc_nod(pool: &Pool<Postgres>, session_id: &Uuid, context_id: &Uuid, nod: &[u8]) -> Result<(), sqlx::Error> {
+//     let (init_byte, is_race_nod_null, is_editor_cam_null, is_race_88_null, is_cam_1a8_16) = match nod.len() < 0x2C0 {
+//         true => (0, true, true, true, false),
+//         false => (
+//             nod[0] as u8,
+//             nod[0x70..0x78] == [0; 8],
+//             nod[0x80..0x88] == [0; 8],
+//             nod[0x88..0x90] == [0; 8],
+//             nod[0x1a8] == 0x16,
+//         ),
+//     };
+//     query!(
+//         "INSERT INTO game_cam_nods (session_token, context_id, raw, init_byte, is_race_nod_null, is_editor_cam_null, is_race_88_null, is_cam_1a8_16) VALUES ($1, $2, $3, $4, $5, $6, $7, $8);",
+//         session_id,
+//         context_id,
+//         nod,
+//         init_byte as i16,
+//         is_race_nod_null,
+//         is_editor_cam_null,
+//         is_race_88_null,
+//         is_cam_1a8_16,
+//     ).execute(pool).await?;
+//     Ok(())
+// }
