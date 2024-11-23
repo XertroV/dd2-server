@@ -1,6 +1,8 @@
 # Deep Dip 2: Organizer Due Diligence Report
 
-This report is a summary of our due diligence efforts over the course of Deep Dip 2. By "due diligence" we mean: making sure that the integrity of the competition was maintained
+- XertroV, July 2024
+
+This report is a summary of our due diligence efforts following Deep Dip 2. By "due diligence" we mean: making sure that the integrity of the competition was maintained and that players didn't cheat.
 
 ## Main Findings
 
@@ -10,12 +12,25 @@ The rest of this report will briefly discuss our due diligence process, deficien
 
 ## Due Diligence Process
 
-Firstly, we would like to say that we did not perform this due diligence process
+Two main methods were used:
+- Investigating external reports received over the event
+- Using gathering data: detecting and identifying suspicious events, then cross-referencing with other information
+
+Reports from
+
+
+
+-
+- duplicate / shared IP addresses
+- editor sessions, vehicle positions
+- map loads without plugin
+
 
 Even before the event, we planned to
 Although we avoided publicly discussing
 
-### ~~Weaknesses
+Note: The focus of analysis was on the top 3, although other player's data was analyzed to some extent.
+## Shortcomings / Weaknesses
 
 * ? missing vods
 

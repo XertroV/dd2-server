@@ -59,7 +59,7 @@ headers = {"Client-ID": client_id, "Authorization": f"Bearer {access_token}"}
 
 response = requests.get(user_url, headers=headers)
 resp = response.json()
-print(f"User response: {resp}")
+# print(f"User response: {resp}")
 user_id = resp["data"][0]["id"]
 
 # List VODs
@@ -68,7 +68,7 @@ vods_url = (
 )
 response = requests.get(vods_url, headers=headers)
 vods = response.json()["data"]
-print(f"VODs: {vods}")
+# print(f"VODs: {vods}")
 
 
 def hms_to_timedelta(hms: str):

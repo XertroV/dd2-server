@@ -262,20 +262,20 @@ impl PlayerMgr {
 
         // update GFM donations
         let mgr = orig_mgr.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_secs(2)).await;
-            loop {
-                match get_and_update_donations_from_gfm(&mgr.pool).await {
-                    Ok(_o) => {
-                        // info!("Updated GFM donations: {:?}", _o);
-                    }
-                    Err(e) => {
-                        error!("Error updating GFM donations: {:?}", e);
-                    }
-                }
-                tokio::time::sleep(Duration::from_secs(60 * 5)).await;
-            }
-        });
+        // tokio::spawn(async move {
+        //     tokio::time::sleep(Duration::from_secs(2)).await;
+        //     loop {
+        //         match get_and_update_donations_from_gfm(&mgr.pool).await {
+        //             Ok(_o) => {
+        //                 // info!("Updated GFM donations: {:?}", _o);
+        //             }
+        //             Err(e) => {
+        //                 error!("Error updating GFM donations: {:?}", e);
+        //             }
+        //         }
+        //         tokio::time::sleep(Duration::from_secs(60 * 5)).await;
+        //     }
+        // });
 
         // update server stats
         let mgr = orig_mgr.clone();
@@ -294,20 +294,20 @@ impl PlayerMgr {
         });
 
         let mgr = orig_mgr.clone();
-        tokio::spawn(async move {
-            loop {
-                info!("Updating donations");
-                match update_donations(&mgr.pool).await {
-                    Ok(r) => {
-                        info!("Updated donations: {:?}", r);
-                    }
-                    Err(e) => {
-                        error!("Error updating donations: {:?}", e);
-                    }
-                }
-                tokio::time::sleep(Duration::from_secs(60)).await;
-            }
-        });
+        // tokio::spawn(async move {
+        //     loop {
+        //         info!("Updating donations");
+        //         match update_donations(&mgr.pool).await {
+        //             Ok(r) => {
+        //                 info!("Updated donations: {:?}", r);
+        //             }
+        //             Err(e) => {
+        //                 error!("Error updating donations: {:?}", e);
+        //             }
+        //         }
+        //         tokio::time::sleep(Duration::from_secs(60)).await;
+        //     }
+        // });
 
         // // send top3 to all players every 2 min
         // let mgr = orig_mgr.clone();

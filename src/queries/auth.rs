@@ -26,17 +26,15 @@ pub async fn create_session(
 ) -> Result<Session, sqlx::Error> {
     let session_token = Uuid::now_v7();
 
-    let pi_id = select_or_insert_plugin_info(pool, plugin_info).await?;
-    let gi_id = select_or_insert_game_info(pool, game_info).await?;
-    let gri_id = select_or_insert_gamer_info(pool, gamer_info).await?;
+    // let pi_id = select_or_insert_plugin_info(pool, plugin_info).await?;
+    // let gi_id = select_or_insert_game_info(pool, game_info).await?;
+    // let gri_id = select_or_insert_gamer_info(pool, gamer_info).await?;
+    // plugin_info_id, game_info_id, gamer_info_id
 
     let r = query!(
-        "INSERT INTO sessions (session_token, user_id, plugin_info_id, game_info_id, gamer_info_id, ip_address) VALUES ($1, $2, $3, $4, $5, $6) RETURNING session_token;",
+        "INSERT INTO sessions (session_token, user_id, ip_address) VALUES ($1, $2, $3, $4, $5, $6) RETURNING session_token;",
         session_token,
         user_id,
-        pi_id,
-        gi_id,
-        gri_id,
         &ip_address[..ip_address.len().min(39)],
     )
     .fetch_one(pool)

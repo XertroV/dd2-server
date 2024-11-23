@@ -526,9 +526,10 @@ impl XPlayer {
                     pos,
                     speed,
                     start_time,
-                } => XPlayer::on_report_fall_start(&pool, user_id, session_token, floor as i32, pos.into(), speed, start_time as i32).await,
+                } => Ok(()), // XPlayer::on_report_fall_start(&pool, user_id, session_token, floor as i32, pos.into(), speed, start_time as i32).await,
                 Request::ReportFallEnd { floor, pos, end_time } => {
-                    XPlayer::on_report_fall_end(&pool, user_id, floor as i32, pos.into(), end_time as i32).await
+                    // XPlayer::on_report_fall_end(&pool, user_id, floor as i32, pos.into(), end_time as i32).await
+                    Ok(())
                 }
                 Request::ReportStats { stats } => XPlayer::on_report_stats(&pool, user_id, stats, ctx.as_ref()).await,
                 // // Request::ReportMapLoad { uid } => Player::on_report_map_load(&pool, p.clone(), &uid).await,

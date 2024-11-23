@@ -3,7 +3,7 @@ use std::{
     path::PathBuf,
     sync::Arc,
     thread,
-    time::{Duration, SystemTime},
+    time::{Duration, Instant, SystemTime},
 };
 
 use ahash::random_state::RandomState;
@@ -18,6 +18,7 @@ use queries::{
     vec_to_color, SqlResult, UserContext, UserSession, Vec3, VehicleState,
 };
 use router::ToPlayerMgr;
+use serde_json::json;
 use sqlx::{postgres::PgPoolOptions, query, Pool, Postgres};
 use uuid::Uuid;
 
@@ -65,11 +66,11 @@ async fn main() {
         // }
     }
 
+    run_generate_data_for_users(db.as_ref()).await;
     // run_get_unique_scene_flags(db.as_ref()).await;
     // run_get_unique_mgrs(db.as_ref()).await;
-    // run_generate_data_for_users(db.as_ref()).await;
     // run_generate_wr_over_time(db.as_ref()).await;
-    run_generate_wr_over_time_from_vehicle_states(db.as_ref()).await;
+    // run_generate_wr_over_time_from_vehicle_states(db.as_ref()).await;
 }
 
 pub async fn run_generate_wr_over_time_from_vehicle_states(pool: &Pool<Postgres>) {
@@ -222,15 +223,142 @@ pub async fn run_generate_data_for_users(pool: &Pool<Postgres>) {
         // break;
         // thread::sleep(Duration::from_secs(1));
 
-        if false {}
-        generate_user_timeline_data(pool, &user.user_id, &user.name).await.unwrap();
-        info!("Processed user TL data: {}", &user.user_id);
-        generate_position_deltas_data(pool, &user.user_id, &user.name).await.unwrap();
-        info!("Processed user Pos Delta data: {}", &user.user_id);
-        generate_map_data_for_user(pool, &user.user_id, &user.name).await.unwrap();
-        info!("Processed user Map data: {}", &user.user_id);
+        if false {
+            generate_user_timeline_data(pool, &user.user_id, &user.name).await.unwrap();
+            info!("Processed user TL data: {}", &user.user_id);
+            generate_position_deltas_data(pool, &user.user_id, &user.name).await.unwrap();
+            info!("Processed user Pos Delta data: {}", &user.user_id);
+            generate_map_data_for_user(pool, &user.user_id, &user.name).await.unwrap();
+            info!("Processed user Map data: {}", &user.user_id);
+        }
+        run_find_user_pings(pool, &user.user_id, &user.name).await.unwrap();
+        info!("Processed user map ML pings: {}", &user.name);
         info!("Finished processing user: {} / {}", &user.user_id, &user.name);
     }
+}
+
+pub async fn run_find_user_pings(pool: &Pool<Postgres>, user_id: &Uuid, user_name: &str) -> SqlResult<()> {
+    let pings = query!(
+        r#"
+        SELECT DISTINCT p.ip_v4, p.user_agent, p.ts, p.is_intro, s.user_id
+        FROM ml_pings p
+        LEFT JOIN sessions s ON p.ip_v4 = s.ip_address
+        WHERE s.user_id = $1
+        ORDER BY p.ts ASC
+        "#,
+        user_id
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap();
+
+    let mut rows = vec![];
+    rows.push("ts,ip_v4,user_agent,is_intro".to_string());
+    rows.extend(
+        pings
+            .iter()
+            .map(|p| {
+                format!(
+                    "{},{},{},{}",
+                    p.ts.and_utc().timestamp(),
+                    p.ip_v4.as_ref().unwrap(),
+                    p.user_agent.as_ref().unwrap(),
+                    p.is_intro
+                )
+            })
+            .collect::<Vec<_>>(),
+    );
+    // let pings_data = rows.join("\n");
+    // write_user_pings(user_name, pings_data.as_bytes());
+
+    let (_sessions, contexts) = adm__get_user_contexts(pool, user_id).await?;
+
+    let mut ctx_iter = contexts.iter().enumerate();
+    let mut ping_to_ctxs = vec![-1; pings.len()];
+    let mut last_i: usize = 0;
+    let mut last_c: Option<&UserContext> = None;
+    for (ix, ping) in pings.iter().enumerate() {
+        if let Some(_last_c) = last_c {
+            ping_to_ctxs[ix] = last_i as i64;
+        }
+
+        while let Some((i, c)) = ctx_iter.next() {
+            last_i = i;
+            last_c = Some(c);
+            if c.created_ts > ping.ts - Duration::from_millis(900) {
+                break;
+            }
+            ping_to_ctxs[ix] = i as i64;
+        }
+    }
+
+    let mut data = vec![];
+    let chunks = ping_to_ctxs
+        .iter()
+        .enumerate()
+        .chunk_by(|(_, i)| **i)
+        .into_iter()
+        .map(|(ix, g)| (ix, g.collect_vec()))
+        .collect_vec();
+    for chunk in chunks {
+        if chunk.1.len() > 1 {
+            let tmp_pings = chunk.1.iter().map(|(i, _)| &pings[*i]).collect_vec();
+            warn!("Chunk: {:?} = {:?}", chunk.1.len(), tmp_pings);
+        }
+    }
+    for (p2c_ix, (ping, &c_ix)) in pings.iter().zip(ping_to_ctxs.iter()).enumerate() {
+        if c_ix < 0 {
+            warn!("[{}] no context found for ping: {:?}", p2c_ix, ping);
+            continue;
+        }
+        let ctxs = contexts[c_ix.max(1) as usize - 1..].iter().take(5).collect_vec();
+
+        let ping_j = json!({
+            "ip_v4": ping.ip_v4,
+            "user_agent": ping.user_agent,
+            "ts": ping.ts.and_utc().timestamp(),
+            "is_intro": ping.is_intro,
+            "user_id": ping.user_id.as_ref().unwrap().to_string(),
+        });
+        let ctxs = ctxs
+            .iter()
+            .map(|&c| {
+                json!({
+                    "ty": CtxType::from(c).as_int(),
+                    "ctx_id": c.context_id.to_string(),
+                    "map_name": c.map_name.clone().unwrap_or_else(|| c.map_uid.clone().unwrap_or("no-map".to_string())),
+                    "bi_count": c.bi_count,
+                    "created_ts": c.created_ts.and_utc().timestamp(),
+                    "is_dd2_uid": c.is_dd2_uid(),
+                    "flags": c.flags_raw.unwrap_or(0),
+                    "managers": c.managers,
+                    "editor": c.editor.unwrap_or(false),
+                    "has_vl_item": c.has_vl_item,
+                })
+            })
+            .collect::<Vec<_>>();
+        data.push(json!({
+            "ping": ping_j,
+            "ctxs": ctxs
+        }));
+    }
+
+    let start = Instant::now();
+    // let data = serde_json::to_string_pretty(&data).unwrap();
+    let data = serde_json::to_string(&data).unwrap();
+    let end = Instant::now();
+    info!("JSON serialization took: {:?}", end.duration_since(start));
+    write_user_pings_json(user_name, data.as_bytes());
+
+    Ok(())
+}
+
+fn write_user_pings_json(user_name: &str, data: &[u8]) {
+    let base_path = PathBuf::from("output/pings");
+    let file_path = base_path.join(format!("{}.csv", clean_username(user_name)));
+    std::fs::create_dir_all(base_path).unwrap();
+    std::fs::write(file_path, data).unwrap();
+    info!("Wrote user pings: {}", user_name);
 }
 
 pub async fn generate_map_data_for_user(pool: &Pool<Postgres>, user_id: &Uuid, user_name: &str) -> SqlResult<()> {
