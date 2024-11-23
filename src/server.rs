@@ -185,7 +185,7 @@ impl PlayerMgr {
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(1)).await;
-                let mut players = mgr.players.lock().await;
+                // let mut players = mgr.players.lock().await;
                 // for i in (0..players.len()).rev() {
                 //     if !players[i].is_connected() {
                 //         players[i].init_shutdown();
@@ -281,7 +281,7 @@ impl PlayerMgr {
         let mgr = orig_mgr.clone();
         tokio::spawn(async move {
             loop {
-                tokio::time::sleep(Duration::from_secs(5)).await;
+                tokio::time::sleep(Duration::from_secs(120)).await;
                 let nb_players_live = mgr.players.lock().await.len();
                 info!("Updating server(v1) stats: {:?}", nb_players_live);
                 match update_server_stats(&mgr.pool, nb_players_live as i32).await {

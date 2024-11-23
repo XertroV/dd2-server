@@ -171,6 +171,7 @@ impl PlayerMgr {
         players: Arc<Mutex<Vec<UnboundedSender<ToPlayer>>>>,
         subsys: SubsystemHandle,
     ) -> miette::Result<()> {
+        let mut count: u64 = 0;
         loop {
             tokio::select! {
                 _ = tokio::time::sleep(Duration::from_secs(15)) => {},
@@ -178,6 +179,7 @@ impl PlayerMgr {
                     break;
                 }
             };
+            count += 1;
 
             let r = get_global_lb(&pool, 1, 11).await;
             let r = match r {
@@ -198,20 +200,24 @@ impl PlayerMgr {
             to_rem.iter().rev().for_each(|i| {
                 ps.remove(*i);
             });
-            let nb_players = ps.len();
-            let _ = update_server_stats(&pool, nb_players as i32).await;
-            let nb_players_live = get_server_info(&pool).await.unwrap_or_default();
-            let server_info = router::Response::ServerInfo { nb_players_live };
-            let overview = get_global_overview(&pool).await;
-            ps.iter()
-                .map(|p| {
-                    let _ = p.send(ToPlayer::Top3(top3.clone()));
-                    let _ = p.send(ToPlayer::Send(server_info.clone()));
-                    if let Ok(j) = &overview {
-                        let _ = p.send(ToPlayer::Send(router::Response::GlobalOverview { j: j.clone() }));
-                    }
-                })
-                .for_each(drop);
+
+            // only update server stats every 10th iteration (every 2.5 minutes)
+            if count % 10 == 0 {
+                let nb_players = ps.len();
+                let _ = update_server_stats(&pool, nb_players as i32).await;
+                let nb_players_live = get_server_info(&pool).await.unwrap_or_default();
+                let server_info = router::Response::ServerInfo { nb_players_live };
+                let overview = get_global_overview(&pool).await;
+                ps.iter()
+                    .map(|p| {
+                        let _ = p.send(ToPlayer::Top3(top3.clone()));
+                        let _ = p.send(ToPlayer::Send(server_info.clone()));
+                        if let Ok(j) = &overview {
+                            let _ = p.send(ToPlayer::Send(router::Response::GlobalOverview { j: j.clone() }));
+                        }
+                    })
+                    .for_each(drop);
+            }
             drop(ps);
         }
         Ok(())
@@ -682,7 +688,7 @@ impl XPlayer {
                 let top3 = Response::Top3 { top3 };
                 let _ = queue_tx.send(top3.clone());
             };
-            info!("done send global lb");
+            // info!("done send global lb");
         });
         let pool = self.pool.clone();
         let queue_tx = self.queue_tx.clone();
@@ -690,7 +696,7 @@ impl XPlayer {
             if let Ok(j) = get_global_overview(&pool).await {
                 let _ = queue_tx.send(Response::GlobalOverview { j });
             };
-            info!("done send global overview");
+            // info!("done send global overview");
         });
         let pool = self.pool.clone();
         let queue_tx = self.queue_tx.clone();
@@ -698,7 +704,7 @@ impl XPlayer {
             if let Ok(j) = get_server_info(&pool).await {
                 let _ = queue_tx.send(Response::ServerInfo { nb_players_live: j });
             };
-            info!("done send server info");
+            // info!("done send server info");
         });
     }
 

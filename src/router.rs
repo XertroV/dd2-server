@@ -596,7 +596,7 @@ pub struct ServerInfo {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Stats {
-    pub seconds_spent_in_map: i32,
+    pub seconds_spent_in_map: i64,
     pub nb_jumps: u32,
     pub nb_falls: u32,
     pub nb_floors_fallen: u32,

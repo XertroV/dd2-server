@@ -3,6 +3,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use base64::Engine;
 use chrono::{DateTime, NaiveDateTime, Utc};
 use log::{info, warn};
+use num_traits::ToPrimitive;
 use serde::{Deserialize, Serialize};
 use sqlx::{prelude::FromRow, query, query_as, types::Uuid, Pool, Postgres};
 
@@ -27,6 +28,7 @@ pub async fn log_ml_ping(pool: &Pool<Postgres>, ip_v4: &str, ip_v6: &str, is_int
 
 pub async fn update_users_stats(pool: &Pool<Postgres>, user_id: &Uuid, stats: &Stats) -> Result<(), sqlx::Error> {
     info!("Updating stats for user {:?}", user_id);
+    let sec_in_map: i32 = stats.seconds_spent_in_map.to_i32().unwrap_or(0);
     let r = query!("UPDATE stats SET nb_jumps = $1, nb_falls = $2, nb_floors_fallen = $3, last_pb_set_ts = $4, total_dist_fallen = $5, pb_height = $6, pb_floor = $7, nb_resets = $8, ggs_triggered = $9, title_gags_triggered = $10, title_gags_special_triggered = $11, bye_byes_triggered = $12, monument_triggers = $13, reached_floor_count = $14, floor_voice_lines_played = $15, seconds_spent_in_map = $16, extra = $17, update_count = update_count + 1, ts = NOW() WHERE user_id = $18 RETURNING update_count;",
         stats.nb_jumps as i32,
         stats.nb_falls as i32,
@@ -43,7 +45,7 @@ pub async fn update_users_stats(pool: &Pool<Postgres>, user_id: &Uuid, stats: &S
         stats.monument_triggers,
         stats.reached_floor_count,
         stats.floor_voice_lines_played,
-        stats.seconds_spent_in_map,
+        sec_in_map,
         stats.extra.clone().unwrap_or(serde_json::Value::Object(serde_json::Map::new())),
         user_id
     ).fetch_one(pool).await;
@@ -64,7 +66,7 @@ pub async fn update_users_stats(pool: &Pool<Postgres>, user_id: &Uuid, stats: &S
         Err(sqlx::Error::RowNotFound) => {
             query!("INSERT INTO stats (user_id, seconds_spent_in_map, nb_jumps, nb_falls, nb_floors_fallen, last_pb_set_ts, total_dist_fallen, pb_height, pb_floor, nb_resets, ggs_triggered, title_gags_triggered, title_gags_special_triggered, bye_byes_triggered, monument_triggers, reached_floor_count, floor_voice_lines_played, extra) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18);",
                 user_id,
-                stats.seconds_spent_in_map,
+                stats.seconds_spent_in_map.to_i32().unwrap_or(0),
                 stats.nb_jumps as i32,
                 stats.nb_falls as i32,
                 stats.nb_floors_fallen as i32,
@@ -93,7 +95,7 @@ pub async fn get_user_stats(pool: &Pool<Postgres>, user_id: &Uuid) -> Result<(St
         .fetch_one(pool)
         .await?;
     let mut s = Stats {
-        seconds_spent_in_map: r.seconds_spent_in_map.unwrap_or_default(),
+        seconds_spent_in_map: r.seconds_spent_in_map.unwrap_or_default() as i64,
         nb_jumps: r.nb_jumps.unwrap_or_default() as u32,
         nb_falls: r.nb_falls.unwrap_or_default() as u32,
         nb_floors_fallen: r.nb_floors_fallen.unwrap_or_default() as u32,
@@ -139,7 +141,7 @@ pub async fn downgrade_stats(pool: &Pool<Postgres>, user_id: &Uuid, stats: &Stat
         stats.monument_triggers,
         stats.reached_floor_count,
         stats.floor_voice_lines_played,
-        stats.seconds_spent_in_map,
+        stats.seconds_spent_in_map.to_i32().unwrap_or(0),
         stats.extra.clone().unwrap_or(serde_json::Value::Object(serde_json::Map::new())),
         user_id
     ).fetch_one(pool).await?;
@@ -258,9 +260,8 @@ pub async fn insert_vehicle_state(
     vel: [f32; 3],
 ) -> Result<(), sqlx::Error> {
     query!(
-        "INSERT INTO vehicle_states (session_token, context_id, is_official, pos, rotq, vel) VALUES ($1, $2, $3, $4, $5, $6);",
+        "INSERT INTO vehicle_states (session_token, is_official, pos, rotq, vel) VALUES ($1, $2, $3, $4, $5);",
         session_id,
-        context_id,
         is_official,
         &pos.map(|f| f as f64),
         &rotq.map(|f| f as f64),
@@ -368,7 +369,8 @@ pub async fn get_global_lb(pool: &Pool<Postgres>, start: i32, end: i32) -> Resul
             ts: e.ts.unwrap(),
             display_name: e.display_name,
             update_count: e.update_count.unwrap_or_default(),
-            color: todo!("migrations"), // vec_to_color(e.color),
+            color: e.color.and_then(vec_to_color),
+            // color: todo!("migrations"), // vec_to_color(e.color),
         })
         .collect())
 }
