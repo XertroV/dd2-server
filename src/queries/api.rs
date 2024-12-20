@@ -140,7 +140,6 @@ pub async fn get_twitch_profiles_all(pool: &Pool<Postgres>) -> Result<serde_json
     )
     .fetch_all(pool)
     .await?;
-    todo!("migrations");
     let rows = r
         .into_iter()
         .map(|r| {

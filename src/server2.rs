@@ -204,19 +204,21 @@ impl PlayerMgr {
             // only update server stats every 10th iteration (every 2.5 minutes)
             if count % 10 == 0 {
                 let nb_players = ps.len();
-                let _ = update_server_stats(&pool, nb_players as i32).await;
-                let nb_players_live = get_server_info(&pool).await.unwrap_or_default();
-                let server_info = router::Response::ServerInfo { nb_players_live };
-                let overview = get_global_overview(&pool).await;
-                ps.iter()
-                    .map(|p| {
-                        let _ = p.send(ToPlayer::Top3(top3.clone()));
-                        let _ = p.send(ToPlayer::Send(server_info.clone()));
-                        if let Ok(j) = &overview {
-                            let _ = p.send(ToPlayer::Send(router::Response::GlobalOverview { j: j.clone() }));
-                        }
-                    })
-                    .for_each(drop);
+                if nb_players > 0 {
+                    let _ = update_server_stats(&pool, nb_players as i32).await;
+                    let nb_players_live = get_server_info(&pool).await.unwrap_or_default();
+                    let server_info = router::Response::ServerInfo { nb_players_live };
+                    let overview = get_global_overview(&pool).await;
+                    ps.iter()
+                        .map(|p| {
+                            let _ = p.send(ToPlayer::Top3(top3.clone()));
+                            let _ = p.send(ToPlayer::Send(server_info.clone()));
+                            if let Ok(j) = &overview {
+                                let _ = p.send(ToPlayer::Send(router::Response::GlobalOverview { j: j.clone() }));
+                            }
+                        })
+                        .for_each(drop);
+                }
             }
             drop(ps);
         }
