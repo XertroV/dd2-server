@@ -1,5 +1,5 @@
 use std::{
-    net::{IpAddr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     str::FromStr,
     sync::Arc,
 };
@@ -7,8 +7,10 @@ use std::{
 #[cfg(not(debug_assertions))]
 use lets_encrypt_warp::lets_encrypt;
 use log::{info, warn};
+use rustls_acme::{caches::DirCache, AcmeConfig};
 use sqlx::{Pool, Postgres};
 use tokio_graceful_shutdown::SubsystemHandle;
+use tokio_stream::wrappers::TcpListenerStream;
 use tokio_util::sync::CancellationToken;
 use warp::{
     http::Response,
@@ -211,18 +213,42 @@ pub async fn run_http_server(pool: Arc<Pool<Postgres>>, lets_enc_domain: String,
 
     info!("Starting HTTP server: {}", soc_addr.to_string());
 
-    #[cfg(debug_assertions)]
-    warp::serve(site)
-        .bind_with_graceful_shutdown(soc_addr, async move {
-            match cancel_t {
-                Some(ct) => ct.cancelled().await,
-                None => tokio::signal::ctrl_c().await.unwrap(),
-            }
-        })
-        .1
-        .await;
+    let tcp_listener = tokio::net::TcpListener::bind(soc_addr).await.unwrap();
+    let tcp_incoming = TcpListenerStream::new(tcp_listener);
+
+    let domains = vec![lets_enc_domain.clone(), "proximity.xk.io".to_string()];
+    let contact = "mailto:dipspp.letsencrypt@xk.io".to_string();
+    let contacts = vec![contact.clone(), contact];
+    #[allow(unused_mut)]
+    let mut cache_dir: Option<String> = None;
+
     #[cfg(not(debug_assertions))]
-    lets_encrypt(site, "dipspp.letsencrypt@xk.io", &lets_enc_domain).await;
+    {
+        cache_dir = Some("acme_cache".to_string());
+    }
+
+    let prod = false;
+    #[cfg(not(debug_assertions))]
+    let prod = true;
+
+    let tls_incoming = AcmeConfig::new(domains)
+        .contact(&contacts)
+        .cache_option(cache_dir.clone().map(DirCache::new))
+        .directory_lets_encrypt(prod)
+        .tokio_incoming(tcp_incoming, Vec::new());
+
+    // #[cfg(debug_assertions)]
+    warp::serve(site).run_incoming(tls_incoming).await;
+    // .bind_with_graceful_shutdown(soc_addr, async move {
+    //     match cancel_t {
+    //         Some(ct) => ct.cancelled().await,
+    //         None => tokio::signal::ctrl_c().await.unwrap(),
+    //     }
+    // })
+    // .1
+    // .await;
+    // #[cfg(not(debug_assertions))]
+    // lets_encrypt(site, "dipspp.letsencrypt@xk.io", &lets_enc_domain).await;
 
     info!("Server shutting down.");
 

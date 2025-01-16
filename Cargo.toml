@@ -43,13 +43,15 @@ uuid = { version = "1.8.0", features = ["v7"] }
 base64 = "0.22.1"
 warp = "0.3.7"
 lets-encrypt-warp = "0.3.0"
+rustls-acme = { version = "0.12.1", features = ["tokio"] }
 hex = "0.4.3"
 tokio-graceful-shutdown = "0.15.0"
 miette = { version = "7.2.0", features = ["fancy"] }
-tokio-util = { version = "0.7.11", features = ["rt"] }
+tokio-util = { version = "0.7", features = ["rt"] }
 thiserror = "1.0.59"
 supports-color = "3.0.0"
 hostname = "0.4.0"
 num-traits = "0.2.19"
 itertools = "0.13.0"
 ahash = "0.8.11"
+tokio-stream = { version = "0.1.17", features = ["net"] }
