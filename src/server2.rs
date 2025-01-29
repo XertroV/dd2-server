@@ -47,7 +47,7 @@ use uuid::Uuid;
 
 use crate::{
     consts::DD2_MAP_UID,
-    http::{run_http_server, run_http_server_subsystem},
+    http::run_http_server,
     op_auth::init_op_config,
     player::{check_flags_sf_mi, ToPlayer},
     queries::{get_server_info, update_user_pb_height},
@@ -103,7 +103,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let http_serv = run_http_server(http_db, "dips-plus-plus-server.xk.io".to_string(), None);
 
         tokio::select! {
-            r = subsys.handle_shutdown_requests(Duration::from_millis(500)) => r.map_err(Into::into),
+            r = subsys.handle_shutdown_requests(Duration::from_millis(100)) => r.map_err(Into::into),
             _ = http_serv => Ok(()),
         }
     }

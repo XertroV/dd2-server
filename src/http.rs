@@ -77,23 +77,24 @@ fn domain_filter(allowed_domain: &'static str) -> impl Filter<Extract = (impl Re
 struct DomainMismatch;
 impl warp::reject::Reject for DomainMismatch {}
 
-pub async fn run_http_server_subsystem(pool: Arc<Pool<Postgres>>, subsys: SubsystemHandle) -> miette::Result<()> {
-    let cancel_t = subsys.create_cancellation_token();
-    tokio::select! {
-        _ = run_http_server(pool, "dips-plus-plus-server.xk.io".to_string(), Some(cancel_t.clone())) => {
-            warn!("HTTP server ended early");
-        }
-        _ = cancel_t.cancelled() => {
-            warn!("HTTP Server shutting down due to subsystem cancellation.");
-        },
-    };
-    Ok(())
-}
+// pub async fn run_http_server_subsystem(pool: Arc<Pool<Postgres>>, subsys: SubsystemHandle) -> miette::Result<()> {
+//     let cancel_t = subsys.create_cancellation_token();
+//     tokio::select! {
+//         _ = run_http_server(pool, "dips-plus-plus-server.xk.io".to_string(), Some(cancel_t.clone())) => {
+//             warn!("HTTP server ended early");
+//         }
+//         _ = cancel_t.cancelled() => {
+//             warn!("HTTP Server shutting down due to subsystem cancellation.");
+//         },
+//     };
+//     Ok(())
+// }
 
 pub async fn run_http_server(pool: Arc<Pool<Postgres>>, lets_enc_domain: String, cancel_t: Option<CancellationToken>) {
     // only for dev mode
     let ip_addr = IpAddr::from_str("0.0.0.0").expect("ip to be sane");
     let soc_addr: SocketAddr = SocketAddr::new(ip_addr, 8077);
+    let soc_addr: SocketAddr = SocketAddr::new(ip_addr, 443);
 
     let version_route = warp::path!("version").and(warp::path::end()).map(|| VERSION);
 
@@ -220,16 +221,14 @@ pub async fn run_http_server(pool: Arc<Pool<Postgres>>, lets_enc_domain: String,
     let contact = "mailto:dipspp.letsencrypt@xk.io".to_string();
     let contacts = vec![contact.clone(), contact];
     #[allow(unused_mut)]
-    let mut cache_dir: Option<String> = None;
+    let mut cache_dir: Option<String> = Some("acme_cache_staging".to_string());
+    let mut prod = false;
 
     #[cfg(not(debug_assertions))]
     {
-        cache_dir = Some("acme_cache".to_string());
+        cache_dir = Some("acme_cache_prod".to_string());
+        prod = true;
     }
-
-    let prod = false;
-    #[cfg(not(debug_assertions))]
-    let prod = true;
 
     let tls_incoming = AcmeConfig::new(domains)
         .contact(&contacts)
