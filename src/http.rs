@@ -234,7 +234,12 @@ pub async fn run_http_server(pool: Arc<Pool<Postgres>>, lets_enc_domain: String,
 
     info!("Starting HTTP server: {}", soc_addr.to_string());
 
+    // init variables for Prod and Certificate stuff
+    #[allow(unused_mut)]
+    let mut cache_dir: Option<String> = Some("acme_cache_staging".to_string());
+    #[allow(unused_mut)]
     let mut prod = !dev_mode;
+    // update for production
     #[cfg(not(debug_assertions))]
     {
         cache_dir = Some("acme_cache_prod".to_string());
@@ -248,8 +253,6 @@ pub async fn run_http_server(pool: Arc<Pool<Postgres>>, lets_enc_domain: String,
         let domains = vec![lets_enc_domain.clone(), "proximity.xk.io".to_string()];
         let contact = "mailto:dipspp.letsencrypt@xk.io".to_string();
         let contacts = vec![contact.clone(), contact];
-        #[allow(unused_mut)]
-        let mut cache_dir: Option<String> = Some("acme_cache_staging".to_string());
 
         let tls_incoming = AcmeConfig::new(domains)
             .contact(&contacts)

@@ -94,7 +94,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
     #[cfg(not(debug_assertions))]
     {
-        let http_serv = run_http_server(http_db, "dips-plus-plus-server.xk.io".to_string(), None);
+        let http_serv = http::run_http_server(http_db, "dips-plus-plus-server.xk.io".to_string(), None);
 
         tokio::select! {
             r = subsys.handle_shutdown_requests(Duration::from_millis(100)) => r.map_err(Into::into),
