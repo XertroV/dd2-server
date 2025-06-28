@@ -90,7 +90,12 @@ impl warp::reject::Reject for DomainMismatch {}
 //     Ok(())
 // }
 
-pub async fn run_http_server(pool: Arc<Pool<Postgres>>, lets_enc_domain: String, cancel_t: Option<CancellationToken>) {
+pub async fn run_http_server(
+    pool: Arc<Pool<Postgres>>,
+    lets_enc_domain: String,
+    cancel_t: Option<CancellationToken>,
+    add_extra_domains: bool,
+) {
     #[cfg(debug_assertions)]
     let dev_mode = true;
     #[cfg(not(debug_assertions))]
@@ -250,7 +255,11 @@ pub async fn run_http_server(pool: Arc<Pool<Postgres>>, lets_enc_domain: String,
         let tcp_listener = tokio::net::TcpListener::bind(soc_addr).await.unwrap();
         let tcp_incoming = TcpListenerStream::new(tcp_listener);
 
-        let domains = vec![lets_enc_domain.clone(), "proximity.xk.io".to_string()];
+        let mut domains = vec![lets_enc_domain.clone()];
+        if add_extra_domains {
+            domains.push("proximity.xk.io".to_string());
+        };
+
         let contact = "mailto:dipspp.letsencrypt@xk.io".to_string();
         let contacts = vec![contact.clone(), contact];
 
