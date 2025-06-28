@@ -1,6 +1,7 @@
 {
     "editor.formatOnSave": true,
     "cSpell.words": [
+        "chrono",
         "respawns"
     ],
     "plpgsqlLanguageServer.database": "deepdip2",

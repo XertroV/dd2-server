@@ -1,43 +1,38 @@
 use api_error::Error as ApiError;
-use base64::Engine;
 use donations::{get_donations_and_donors, get_gfm_donations_latest};
 use dotenv::dotenv;
 use env_logger::Env;
 use lazy_static::lazy_static;
 use log::{debug, error, info, warn};
-use miette::{Diagnostic, SourceSpan};
+use miette::Diagnostic;
+use num_traits::ToPrimitive;
 use op_auth::check_token;
-use player::{parse_u64_str, LoginSession, Player};
+use player::{parse_u64_str, LoginSession};
 use queries::{
     context_mark_succeeded, create_session, custom_maps::get_map_nb_playing_live, get_global_lb, get_global_overview, get_user_in_lb,
     get_user_stats, insert_context_packed, insert_finish, insert_respawn, insert_start_fall, insert_vehicle_state, register_or_login,
     resume_session, update_fall_with_end, update_server_stats, update_user_color, update_users_stats, user_settings, PBUpdateRes,
 };
 use router::{AssetRef, LeaderboardEntry2, Map, PlayerCtx, Request, Response, Stats, ToPlayerMgr};
-use serde::ser::StdError;
-use serde_json;
-use sqlx::{
-    postgres::{PgPool, PgPoolOptions},
-    query, Pool, Postgres,
-};
+
+use sqlx::{postgres::PgPoolOptions, query, Pool, Postgres};
 use std::{
-    convert::Infallible,
     error::Error,
     net::SocketAddr,
     str::FromStr,
     sync::Arc,
-    time::{Duration, SystemTime},
+    time::{self, Duration},
 };
 use thiserror::Error;
 use tokio::{
-    io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, Interest},
+    io::{self, AsyncReadExt, AsyncWriteExt},
     net::{
         tcp::{OwnedReadHalf, OwnedWriteHalf},
         TcpListener, TcpStream,
     },
     select,
     sync::{
-        mpsc::{unbounded_channel, Receiver, Sender, UnboundedReceiver, UnboundedSender},
+        mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender},
         Mutex, OnceCell, OwnedSemaphorePermit, Semaphore,
     },
 };
@@ -47,10 +42,9 @@ use uuid::Uuid;
 
 use crate::{
     consts::DD2_MAP_UID,
-    http::run_http_server,
     op_auth::init_op_config,
     player::{check_flags_sf_mi, ToPlayer},
-    queries::{get_server_info, update_user_pb_height},
+    queries::{custom_map_aux_specs, get_server_info, update_user_pb_height},
     router::{write_response, LeaderboardEntry},
 };
 
@@ -171,7 +165,8 @@ impl PlayerMgr {
         players: Arc<Mutex<Vec<UnboundedSender<ToPlayer>>>>,
         subsys: SubsystemHandle,
     ) -> miette::Result<()> {
-        let mut count: u64 = 0;
+        // offset the count by some random amount [0, 9] to stagger server stats updates between servers
+        let mut count: u64 = (time::Instant::now().elapsed().as_millis() % 10) as u64;
         loop {
             tokio::select! {
                 _ = tokio::time::sleep(Duration::from_secs(15)) => {},
@@ -557,6 +552,13 @@ impl XPlayer {
                 Request::ReportMapCurrPos { uid, pos, race_time } => {
                     XPlayer::report_map_curr_pos(&pool, user_id, uid, pos, race_time.unwrap_or(-1) as i32).await
                 }
+                // custom map aux spec upload
+                Request::ReportCustomMapAuxSpec { id, name_id, spec } => {
+                    XPlayer::report_custom_map_aux_spec(&pool, id, user_id, &name_id, &spec, &queue_tx).await
+                }
+                Request::DeleteCustomMapAuxSpec { id, name_id } => {
+                    XPlayer::delete_custom_map_aux_spec(&pool, id, user_id, &name_id, &queue_tx).await
+                }
                 // get requests
                 Request::GetMyStats {} => XPlayer::get_stats(&pool, user_id, &queue_tx).await,
                 Request::GetGlobalLB { start, end } => XPlayer::get_global_lb(&pool, &queue_tx, start as i32, end as i32).await,
@@ -844,7 +846,6 @@ pub fn plugin_info_extract_version(plugin_info: &str) -> String {
         .unwrap_or_else(|| "0.0.0".into())
 }
 
-//
 //
 //
 //
@@ -1514,6 +1515,54 @@ impl XPlayer {
         end_time: i32,
     ) -> Result<(), ApiError> {
         update_fall_with_end(pool, user_id, floor, pos, end_time).await?;
+        Ok(())
+    }
+
+    pub async fn report_custom_map_aux_spec(
+        pool: &Pool<Postgres>,
+        request_id: u32,
+        user_id: &Uuid,
+        name_id: &str,
+        spec: &serde_json::Value,
+        queue_tx: &UnboundedSender<Response>,
+    ) -> Result<(), ApiError> {
+        if !spec.is_object() || spec.as_object().unwrap().is_empty() {
+            return Err(ApiError::StrErr("Invalid spec: must be a non-empty object".to_string()));
+        }
+        let existing = queries::custom_map_aux_specs::get_spec(pool, user_id, name_id).await?;
+        if let Some(existing) = existing {
+            if existing.created_at < chrono::Utc::now() - chrono::Duration::hours(24) {
+                return Err(ApiError::StrErr("Spec can no longer be modified".to_string()));
+            }
+        }
+        queries::custom_map_aux_specs::upsert_spec(pool, user_id, name_id, spec).await?;
+        queue_tx.send(Response::TaskResponse {
+            id: request_id,
+            success: true,
+            error: None,
+        })?;
+        Ok(())
+    }
+
+    pub async fn delete_custom_map_aux_spec(
+        pool: &Pool<Postgres>,
+        request_id: u32,
+        user_id: &Uuid,
+        name_id: &str,
+        queue_tx: &UnboundedSender<Response>,
+    ) -> Result<(), ApiError> {
+        let existing = queries::custom_map_aux_specs::get_spec(pool, user_id, name_id).await?;
+        if let Some(existing) = existing {
+            if existing.created_at < chrono::Utc::now() - chrono::Duration::hours(24) {
+                return Err(ApiError::StrErr("Spec can no longer be deleted".to_string()));
+            }
+        }
+        queries::custom_map_aux_specs::delete_spec(pool, user_id, name_id).await?;
+        queue_tx.send(Response::TaskResponse {
+            id: request_id,
+            success: true,
+            error: None,
+        })?;
         Ok(())
     }
 }

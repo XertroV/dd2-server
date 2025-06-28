@@ -171,3 +171,28 @@ impl From<sqlx::Error> for ApiErrRejection {
         ApiErrRejection { err: format!("{:?}", e) }
     }
 }
+
+impl From<api_error::Error> for ApiErrRejection {
+    fn from(e: api_error::Error) -> Self {
+        ApiErrRejection { err: format!("{:?}", e) }
+    }
+}
+
+pub async fn handle_get_custom_map_aux_spec(pool: &Pool<Postgres>, wsid: String, name_id: String) -> Result<impl Reply, warp::Rejection> {
+    let user_id = match Uuid::parse_str(&wsid) {
+        Ok(id) => id,
+        Err(e) => {
+            return Err(warp::reject::custom(ApiErrRejection::new("Invalid user id")));
+        }
+    };
+    let r = super::custom_map_aux_specs::get_spec(pool, &user_id, &name_id).await;
+    match r {
+        Ok(Some(r)) => Ok(warp::reply::json(&r.spec)),
+        // send 403
+        Ok(None) => Err(warp::reject::not_found()),
+        Err(e) => {
+            eprintln!("Error: {:?}", e);
+            Err(warp::reject::custom(Into::<ApiErrRejection>::into(e)))
+        }
+    }
+}

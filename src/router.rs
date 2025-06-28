@@ -125,6 +125,15 @@ pub enum Request {
         pos: [f64; 3],
         race_time: Option<i64>,
     } = 64,
+    ReportCustomMapAuxSpec {
+        id: u32,
+        name_id: String,
+        spec: serde_json::Value,
+    } = 65,
+    DeleteCustomMapAuxSpec {
+        id: u32,
+        name_id: String,
+    } = 66,
 
     GetMyStats {} = 128,
     GetGlobalLB {
@@ -204,6 +213,8 @@ impl Request {
             Request::DowngradeStats { .. } => 42,
             // arbitrary maps
             Request::ReportMapCurrPos { .. } => 64,
+            Request::ReportCustomMapAuxSpec { .. } => 65,
+            Request::DeleteCustomMapAuxSpec { .. } => 66,
             // get
             Request::GetMyStats { .. } => 128,
             Request::GetGlobalLB { .. } => 129,
@@ -253,6 +264,8 @@ impl Request {
             Request::DowngradeStats { .. } => "DowngradeStats",
             // arbitrary maps
             Request::ReportMapCurrPos { .. } => "ReportMapCurrPos",
+            Request::ReportCustomMapAuxSpec { .. } => "ReportCustomMapAuxSpec",
+            Request::DeleteCustomMapAuxSpec { .. } => "DeleteCustomMapAuxSpec",
             // get
             Request::GetMyStats { .. } => "GetMyStats",
             Request::GetGlobalLB { .. } => "GetGlobalLB",
@@ -497,7 +510,12 @@ pub enum Response {
         uid: String,
         r: Option<LeaderboardEntry2>,
     },
-
+    // near end
+    TaskResponse {
+        id: u32,
+        success: bool,
+        error: Option<String>,
+    },
     // end
     SecretAssets {
         filenames_and_urls: Vec<AssetRef>,
@@ -539,6 +557,7 @@ impl Response {
             Response::MapLivePlayers { .. } => 194,
             Response::MapRank { .. } => 195,
 
+            Response::TaskResponse { .. } => 253,
             Response::SecretAssets { .. } => 254,
         }
     }
@@ -570,6 +589,7 @@ impl Response {
             Response::MapLivePlayers { .. } => "MapLivePlayers",
             Response::MapRank { .. } => "MapRank",
             //
+            Response::TaskResponse { .. } => "TaskResponse",
             Response::SecretAssets { .. } => "SecretAssets",
         }
     }
@@ -661,6 +681,13 @@ pub struct Donation {
     pub amount: f64,
     pub comment: String,
     pub ts: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskResponse {
+    pub id: u32,
+    pub success: bool,
+    pub error: Option<String>,
 }
 
 pub async fn write_response(stream: &mut OwnedWriteHalf, resp: Response) -> io::Result<()> {

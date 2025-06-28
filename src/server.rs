@@ -3,31 +3,24 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use donations::{get_and_update_donations_from_gfm, get_donations_from_matcherino, update_donations_in_db};
+use donations::update_donations_in_db;
 use dotenv::dotenv;
 use env_logger::Env;
 use log::{error, info, warn};
 use player::Player;
-use queries::{get_global_lb, update_global_overview, update_server_stats};
+use queries::{update_global_overview, update_server_stats};
 use router::ToPlayerMgr;
-use serde_json;
-use sqlx::{
-    postgres::{PgPool, PgPoolOptions},
-    Pool, Postgres,
-};
+
+use sqlx::{postgres::PgPoolOptions, Pool, Postgres};
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt, Interest},
-    net::{TcpListener, TcpStream},
+    net::TcpStream,
     sync::{
-        mpsc::{unbounded_channel, Receiver, Sender, UnboundedReceiver, UnboundedSender},
+        mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender},
         Mutex, Semaphore,
     },
 };
 
-use crate::{
-    consts::DD2_MAP_UID, http::run_http_server, op_auth::init_op_config, player::ToPlayer, queries::get_server_info,
-    router::LeaderboardEntry,
-};
+use crate::{consts::DD2_MAP_UID, donations::get_donations_from_matcherino, http::run_http_server, op_auth::init_op_config};
 
 mod api_error;
 mod consts;
@@ -281,7 +274,7 @@ impl PlayerMgr {
         let mgr = orig_mgr.clone();
         tokio::spawn(async move {
             loop {
-                tokio::time::sleep(Duration::from_secs(55)).await;
+                tokio::time::sleep(Duration::from_secs(150)).await;
                 let nb_players_live = mgr.players.lock().await.len();
                 info!("Updating server(v1) stats: {:?}", nb_players_live);
                 match update_server_stats(&mgr.pool, nb_players_live as i32).await {

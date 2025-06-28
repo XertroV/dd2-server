@@ -91,10 +91,17 @@ impl warp::reject::Reject for DomainMismatch {}
 // }
 
 pub async fn run_http_server(pool: Arc<Pool<Postgres>>, lets_enc_domain: String, cancel_t: Option<CancellationToken>) {
+    #[cfg(debug_assertions)]
+    let dev_mode = true;
+    #[cfg(not(debug_assertions))]
+    let dev_mode = false;
+
     // only for dev mode
     let ip_addr = IpAddr::from_str("0.0.0.0").expect("ip to be sane");
-    let soc_addr: SocketAddr = SocketAddr::new(ip_addr, 8077);
-    let soc_addr: SocketAddr = SocketAddr::new(ip_addr, 443);
+    let soc_addr = match dev_mode {
+        true => SocketAddr::new(ip_addr, 8077),
+        false => SocketAddr::new(ip_addr, 443),
+    };
 
     let version_route = warp::path!("version").and(warp::path::end()).map(|| VERSION);
 
@@ -102,7 +109,7 @@ pub async fn run_http_server(pool: Arc<Pool<Postgres>>, lets_enc_domain: String,
     let ping_pool2 = pool.clone();
 
     let api_routes = warp::path!("api" / "routes").and(warp::path::end()).map(|| {
-        "Routes: /leaderboard/global, /leaderboard/global/<page>, /leaderboard/<wsid>, /live_heights/global, /live_heights/<wsid> (prefer global), /overview, /server_info, /donations, /twitch/list"
+        "Routes: /leaderboard/global, /leaderboard/global/<page>, /leaderboard/<wsid>, /live_heights/global, /live_heights/<wsid> (prefer global), /overview, /server_info, /donations, /twitch/list, /aux_spec/<wsid>/<name_id>.json"
     });
 
     let ping_path = warp::path!("mlping.Script.txt")
@@ -178,6 +185,18 @@ pub async fn run_http_server(pool: Arc<Pool<Postgres>>, lets_enc_domain: String,
         .and_then(|pool: Arc<Pool<Postgres>>| async move { api::handle_get_twitch_list(pool.as_ref()).await });
     let req_pool = pool.clone();
 
+    let get_custom_map_aux_spec = warp::path!("aux_spec" / String / String)
+        .and(warp::path::end())
+        .map(move |wsid: String, name_id: String| (wsid, name_id, req_pool.clone()))
+        .and_then(|(wsid, name_id, pool): (String, String, Arc<Pool<Postgres>>)| async move {
+            if !name_id.ends_with(".json") {
+                return Err(warp::reject::not_found());
+            }
+            let name_id = name_id.trim_end_matches(".json").to_string();
+            api::handle_get_custom_map_aux_spec(pool.as_ref(), wsid, name_id).await
+        });
+    let req_pool = pool.clone();
+
     // info!("Enabling route: get /mlping_intro");
     // let ping_path = warp::path!("mlping_intro")
     //     .and(warp::path::end())
@@ -210,34 +229,49 @@ pub async fn run_http_server(pool: Arc<Pool<Postgres>>, lets_enc_domain: String,
         .or(get_last_heights_of_user)
         .or(get_donations_totals)
         .or(get_twitch_handles)
+        .or(get_custom_map_aux_spec)
         .with(warp::log("dips++"));
 
     info!("Starting HTTP server: {}", soc_addr.to_string());
 
-    let tcp_listener = tokio::net::TcpListener::bind(soc_addr).await.unwrap();
-    let tcp_incoming = TcpListenerStream::new(tcp_listener);
-
-    let domains = vec![lets_enc_domain.clone(), "proximity.xk.io".to_string()];
-    let contact = "mailto:dipspp.letsencrypt@xk.io".to_string();
-    let contacts = vec![contact.clone(), contact];
-    #[allow(unused_mut)]
-    let mut cache_dir: Option<String> = Some("acme_cache_staging".to_string());
-    let mut prod = false;
-
+    let mut prod = !dev_mode;
     #[cfg(not(debug_assertions))]
     {
         cache_dir = Some("acme_cache_prod".to_string());
         prod = true;
     }
 
-    let tls_incoming = AcmeConfig::new(domains)
-        .contact(&contacts)
-        .cache_option(cache_dir.clone().map(DirCache::new))
-        .directory_lets_encrypt(prod)
-        .tokio_incoming(tcp_incoming, Vec::new());
+    if prod {
+        let tcp_listener = tokio::net::TcpListener::bind(soc_addr).await.unwrap();
+        let tcp_incoming = TcpListenerStream::new(tcp_listener);
 
+        let domains = vec![lets_enc_domain.clone(), "proximity.xk.io".to_string()];
+        let contact = "mailto:dipspp.letsencrypt@xk.io".to_string();
+        let contacts = vec![contact.clone(), contact];
+        #[allow(unused_mut)]
+        let mut cache_dir: Option<String> = Some("acme_cache_staging".to_string());
+
+        let tls_incoming = AcmeConfig::new(domains)
+            .contact(&contacts)
+            .cache_option(cache_dir.clone().map(DirCache::new))
+            .directory_lets_encrypt(prod)
+            .tokio_incoming(tcp_incoming, Vec::new());
+
+        info!("Running in production mode, using TLS & LetsEncrypt.");
+        warp::serve(site).run_incoming(tls_incoming).await;
+    } else {
+        info!("Running in development mode, using HTTP (no TLS).");
+        warp::serve(site)
+            .bind_with_graceful_shutdown(soc_addr, async move {
+                match cancel_t {
+                    Some(ct) => ct.cancelled().await,
+                    None => tokio::signal::ctrl_c().await.unwrap(),
+                }
+            })
+            .1
+            .await;
+    }
     // #[cfg(debug_assertions)]
-    warp::serve(site).run_incoming(tls_incoming).await;
     // .bind_with_graceful_shutdown(soc_addr, async move {
     //     match cancel_t {
     //         Some(ct) => ct.cancelled().await,

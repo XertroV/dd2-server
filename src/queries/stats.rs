@@ -529,7 +529,7 @@ pub async fn update_server_stats(pool: &Pool<Postgres>, nb_players_live: i32) ->
 }
 
 pub async fn get_server_info(pool: &Pool<Postgres>) -> Result<u32, sqlx::Error> {
-    let r = query!("SELECT SUM(player_count) FROM server_player_counts WHERE updated_at > NOW() - INTERVAL '125 seconds';")
+    let r = query!("SELECT SUM(player_count) FROM server_player_counts WHERE updated_at > NOW() - INTERVAL '150 seconds';")
         .fetch_one(pool)
         .await?;
     Ok(r.sum.unwrap_or(0) as u32)

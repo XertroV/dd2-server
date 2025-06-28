@@ -1,14 +1,19 @@
+pub mod api;
+pub mod auth;
+pub mod clips;
+pub mod context;
+pub mod custom_maps;
+pub mod players;
+pub mod stats;
+pub mod user_settings;
+pub mod custom_map_aux_specs;
+
+pub use api::*;
 pub use auth::*;
 pub use clips::*;
 pub use context::*;
+pub use custom_maps::*;
 pub use players::*;
 pub use stats::*;
-
-pub mod api;
-mod auth;
-mod clips;
-mod context;
-pub mod custom_maps;
-mod players;
-mod stats;
-pub mod user_settings;
+pub use user_settings::*;
+pub use custom_map_aux_specs::*;
