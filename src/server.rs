@@ -272,19 +272,20 @@ impl PlayerMgr {
 
         // update server stats
         let mgr = orig_mgr.clone();
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(Duration::from_secs(150)).await;
-                let nb_players_live = mgr.players.lock().await.len();
-                info!("Updating server(v1) stats: {:?}", nb_players_live);
-                match update_server_stats(&mgr.pool, nb_players_live as i32).await {
-                    Ok(_o) => {}
-                    Err(e) => {
-                        error!("Error updating server stats: {:?}", e);
-                    }
-                };
-            }
-        });
+        // we don't care to do this from the http server.
+        // tokio::spawn(async move {
+        //     loop {
+        //         tokio::time::sleep(Duration::from_secs(150)).await;
+        //         let nb_players_live = mgr.players.lock().await.len();
+        //         info!("Updating server(v1) stats: {:?}", nb_players_live);
+        //         match update_server_stats(&mgr.pool, nb_players_live as i32).await {
+        //             Ok(_o) => {}
+        //             Err(e) => {
+        //                 error!("Error updating server stats: {:?}", e);
+        //             }
+        //         };
+        //     }
+        // });
 
         let mgr = orig_mgr.clone();
         // tokio::spawn(async move {
