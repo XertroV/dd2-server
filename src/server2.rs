@@ -559,6 +559,7 @@ impl XPlayer {
                 Request::DeleteCustomMapAuxSpec { id, name_id } => {
                     XPlayer::delete_custom_map_aux_spec(&pool, id, user_id, &name_id, &queue_tx).await
                 }
+                Request::ListCustomMapAuxSpecs { id } => XPlayer::list_custom_map_aux_spec(&pool, id, user_id, &queue_tx).await,
                 // get requests
                 Request::GetMyStats {} => XPlayer::get_stats(&pool, user_id, &queue_tx).await,
                 Request::GetGlobalLB { start, end } => XPlayer::get_global_lb(&pool, &queue_tx, start as i32, end as i32).await,
@@ -1562,6 +1563,20 @@ impl XPlayer {
             id: request_id,
             success: true,
             error: None,
+        })?;
+        Ok(())
+    }
+
+    pub async fn list_custom_map_aux_spec(
+        pool: &Pool<Postgres>,
+        request_id: u32,
+        user_id: &Uuid,
+        queue_tx: &UnboundedSender<Response>,
+    ) -> Result<(), ApiError> {
+        let specs = queries::custom_map_aux_specs::list_specs(pool, user_id).await?;
+        queue_tx.send(Response::TaskResponseJson {
+            id: request_id,
+            data: specs.into(),
         })?;
         Ok(())
     }

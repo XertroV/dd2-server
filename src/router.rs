@@ -134,6 +134,9 @@ pub enum Request {
         id: u32,
         name_id: String,
     } = 66,
+    ListCustomMapAuxSpecs {
+        id: u32,
+    } = 67,
 
     GetMyStats {} = 128,
     GetGlobalLB {
@@ -215,6 +218,7 @@ impl Request {
             Request::ReportMapCurrPos { .. } => 64,
             Request::ReportCustomMapAuxSpec { .. } => 65,
             Request::DeleteCustomMapAuxSpec { .. } => 66,
+            Request::ListCustomMapAuxSpecs { .. } => 67,
             // get
             Request::GetMyStats { .. } => 128,
             Request::GetGlobalLB { .. } => 129,
@@ -266,6 +270,7 @@ impl Request {
             Request::ReportMapCurrPos { .. } => "ReportMapCurrPos",
             Request::ReportCustomMapAuxSpec { .. } => "ReportCustomMapAuxSpec",
             Request::DeleteCustomMapAuxSpec { .. } => "DeleteCustomMapAuxSpec",
+            Request::ListCustomMapAuxSpecs { .. } => "ListCustomMapAuxSpecs",
             // get
             Request::GetMyStats { .. } => "GetMyStats",
             Request::GetGlobalLB { .. } => "GetGlobalLB",
@@ -516,6 +521,10 @@ pub enum Response {
         success: bool,
         error: Option<String>,
     },
+    TaskResponseJson {
+        id: u32,
+        data: JsonValue,
+    },
     // end
     SecretAssets {
         filenames_and_urls: Vec<AssetRef>,
@@ -557,6 +566,7 @@ impl Response {
             Response::MapLivePlayers { .. } => 194,
             Response::MapRank { .. } => 195,
 
+            Response::TaskResponseJson { .. } => 252,
             Response::TaskResponse { .. } => 253,
             Response::SecretAssets { .. } => 254,
         }
@@ -589,6 +599,7 @@ impl Response {
             Response::MapLivePlayers { .. } => "MapLivePlayers",
             Response::MapRank { .. } => "MapRank",
             //
+            Response::TaskResponseJson { .. } => "TaskResponseJson",
             Response::TaskResponse { .. } => "TaskResponse",
             Response::SecretAssets { .. } => "SecretAssets",
         }
@@ -681,13 +692,6 @@ pub struct Donation {
     pub amount: f64,
     pub comment: String,
     pub ts: i64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TaskResponse {
-    pub id: u32,
-    pub success: bool,
-    pub error: Option<String>,
 }
 
 pub async fn write_response(stream: &mut OwnedWriteHalf, resp: Response) -> io::Result<()> {

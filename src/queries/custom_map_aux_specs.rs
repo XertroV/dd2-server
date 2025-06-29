@@ -15,6 +15,30 @@ pub struct CustomMapAuxSpec {
     pub updated_at: DateTime<Utc>,
 }
 
+impl Into<Value> for CustomMapAuxSpec {
+    fn into(self) -> Value {
+        // destructure so we know if anything is missing.
+        let CustomMapAuxSpec {
+            id,
+            user_id,
+            name_id,
+            spec,
+            hit_counter,
+            created_at,
+            updated_at,
+        } = self;
+        serde_json::json!({
+            "id": id,
+            "user_id": user_id.to_string(),
+            "name_id": name_id,
+            "spec": spec,
+            "hit_counter": hit_counter,
+            "created_at": created_at.timestamp(),
+            "updated_at": updated_at.timestamp(),
+        })
+    }
+}
+
 pub async fn get_spec(pool: &Pool<Postgres>, user_id: &Uuid, name_id: &str) -> Result<Option<CustomMapAuxSpec>, Error> {
     let spec = sqlx::query_as!(
         CustomMapAuxSpec,
@@ -61,4 +85,20 @@ pub async fn delete_spec(pool: &Pool<Postgres>, user_id: &Uuid, name_id: &str) -
     .execute(pool)
     .await?;
     Ok(())
+}
+
+pub async fn list_specs(pool: &Pool<Postgres>, user_id: &Uuid) -> Result<Vec<CustomMapAuxSpec>, Error> {
+    let specs = sqlx::query_as!(
+        CustomMapAuxSpec,
+        r#"
+        SELECT id, user_id, name_id, spec, hit_counter, created_at, updated_at
+        FROM custom_map_aux_specs
+        WHERE user_id = $1
+        ORDER BY created_at DESC;
+        "#,
+        user_id
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(specs)
 }
