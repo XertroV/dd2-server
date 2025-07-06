@@ -196,3 +196,25 @@ pub async fn handle_get_custom_map_aux_spec(pool: &Pool<Postgres>, wsid: String,
         }
     }
 }
+
+pub async fn handle_get_map_uid_nb_climbers(pool: &Pool<Postgres>, map_uid: String) -> Result<impl Reply, warp::Rejection> {
+    let r = super::custom_maps::get_map_nb_playing_live(pool, &map_uid).await;
+    match r {
+        Ok(r) => Ok(warp::reply::json(&serde_json::json!({ "nb_climbers": r }))),
+        Err(e) => {
+            eprintln!("Error: {:?}", e);
+            Err(warp::reject::custom(Into::<ApiErrRejection>::into(e)))
+        }
+    }
+}
+
+pub async fn handle_get_map_uid_leaderboard(pool: &Pool<Postgres>, map_uid: String, page: u32) -> Result<impl Reply, warp::Rejection> {
+    let r = super::custom_maps::get_map_leaderboard_page(pool, &map_uid, page).await;
+    match r {
+        Ok(r) => Ok(warp::reply::json(&r)),
+        Err(e) => {
+            eprintln!("Error: {:?}", e);
+            Err(warp::reject::custom(Into::<ApiErrRejection>::into(e)))
+        }
+    }
+}

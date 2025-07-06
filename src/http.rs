@@ -114,7 +114,22 @@ pub async fn run_http_server(
     let ping_pool2 = pool.clone();
 
     let api_routes = warp::path!("api" / "routes").and(warp::path::end()).map(|| {
-        "Routes: /leaderboard/global, /leaderboard/global/<page>, /leaderboard/<wsid>, /live_heights/global, /live_heights/<wsid> (prefer global), /overview, /server_info, /donations, /twitch/list, /aux_spec/<wsid>/<name_id>.json"
+        let routes = vec![
+            "/leaderboard/global",
+            "/leaderboard/global/<page>",
+            "/leaderboard/<wsid>",
+            "/live_heights/global",
+            "/live_heights/<wsid> (prefer global)",
+            "/overview",
+            "/server_info",
+            "/donations",
+            "/twitch/list",
+            "/aux_spec/<wsid>/<name_id>.json",
+            "/map/<uid>/nb_active_climbers",
+            "/map/<uid>/leaderboard",
+            "/map/<uid>/leaderboard/<page>",
+        ];
+        "Routes: ".to_owned() + &routes.join(", ")
     });
 
     let ping_path = warp::path!("mlping.Script.txt")
@@ -202,6 +217,30 @@ pub async fn run_http_server(
         });
     let req_pool = pool.clone();
 
+    let get_map_uid_nb_climbers = warp::path!("map" / String / "nb_active_climbers")
+        .and(warp::path::end())
+        .map(move |uid| (uid, req_pool.clone()))
+        .and_then(
+            |(uid, pool): (String, Arc<Pool<Postgres>>)| async move { api::handle_get_map_uid_nb_climbers(pool.as_ref(), uid).await },
+        );
+    let req_pool = pool.clone();
+
+    let get_map_uid_leaderboard = warp::path!("map" / String / "leaderboard")
+        .and(warp::path::end())
+        .map(move |uid| (uid, req_pool.clone()))
+        .and_then(
+            |(uid, pool): (String, Arc<Pool<Postgres>>)| async move { api::handle_get_map_uid_leaderboard(pool.as_ref(), uid, 0).await },
+        );
+    let req_pool = pool.clone();
+
+    let get_map_uid_leaderboard_page = warp::path!("map" / String / "leaderboard" / u32)
+        .and(warp::path::end())
+        .map(move |uid, page| (uid, page, req_pool.clone()))
+        .and_then(|(uid, page, pool): (String, u32, Arc<Pool<Postgres>>)| async move {
+            api::handle_get_map_uid_leaderboard(pool.as_ref(), uid, page).await
+        });
+    let req_pool = pool.clone();
+
     // info!("Enabling route: get /mlping_intro");
     // let ping_path = warp::path!("mlping_intro")
     //     .and(warp::path::end())
@@ -235,6 +274,9 @@ pub async fn run_http_server(
         .or(get_donations_totals)
         .or(get_twitch_handles)
         .or(get_custom_map_aux_spec)
+        .or(get_map_uid_nb_climbers)
+        .or(get_map_uid_leaderboard)
+        .or(get_map_uid_leaderboard_page)
         .with(warp::log("dips++"));
 
     info!("Starting HTTP server: {}", soc_addr.to_string());
