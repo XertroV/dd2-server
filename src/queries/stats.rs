@@ -9,7 +9,7 @@ use sqlx::{prelude::FromRow, query, query_as, types::Uuid, Pool, Postgres};
 
 use crate::{
     consts::DD2_MAP_UID,
-    queries::custom_maps::get_map_nb_playing_live,
+    queries::{custom_maps::get_map_nb_playing_live, get_nb_playing_live},
     router::{LeaderboardEntry, Stats},
 };
 
@@ -467,7 +467,8 @@ pub async fn update_global_overview(pool: &Pool<Postgres>) -> Result<serde_json:
     // let falls_count = query!("SELECT COUNT(*) FROM falls_no_jumps;").fetch_one(pool).await?.count;
     // let falls_minor = query!("SELECT COUNT(*) FROM falls_minor;").fetch_one(pool).await?.count;
     let nb_players_live = get_server_info(pool).await.unwrap_or(0);
-    let live_lb = get_live_leaderboard(pool).await?;
+    // let live_lb = get_live_leaderboard(pool).await?;
+    let live_nb = get_nb_playing_live(pool).await.unwrap_or(0);
 
     // let map_loads = query!("SELECT SUM(load_count) FROM maps WHERE uid = $1;", DD2_MAP_UID)
     //     .fetch_one(pool)
@@ -489,8 +490,8 @@ pub async fn update_global_overview(pool: &Pool<Postgres>) -> Result<serde_json:
         // "falls_count": falls_count,
         // "falls_minor": falls_minor,
         "nb_players_live": nb_players_live,
-        "nb_players_climbing": live_lb.len() as i32,
-        "nb_climbing_shallow_dip": get_map_nb_playing_live(pool, "DeepDip2__The_Gentle_Breeze").await?,
+        "nb_players_climbing": live_nb,
+        "nb_climbing_shallow_dip": get_map_nb_playing_live(pool, "DeepDip2__The_Gentle_Breeze").await.unwrap_or(0),
     });
     query!(
         "INSERT INTO cached_json (key, value) VALUES ($1, $2) ON CONFLICT (key) DO UPDATE SET value = $2;",
