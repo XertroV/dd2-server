@@ -839,7 +839,7 @@ impl XPlayer {
                 return Ok(());
             }
         };
-        Self::get_map_lb(pool, queue_tx, &map.uid, 0, 11).await?;
+        Self::get_map_lb(pool, queue_tx, &map.uid, 0, 10).await?;
         Ok(())
     }
 }
