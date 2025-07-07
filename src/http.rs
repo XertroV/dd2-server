@@ -128,6 +128,7 @@ pub async fn run_http_server(
             "/map/<uid>/nb_active_climbers",
             "/map/<uid>/leaderboard",
             "/map/<uid>/leaderboard/<page>",
+            "/map/<uid>/live_heights",
         ];
         "Routes: ".to_owned() + &routes.join(", ")
     });
@@ -241,6 +242,14 @@ pub async fn run_http_server(
         });
     let req_pool = pool.clone();
 
+    let get_map_uid_live_heights = warp::path!("map" / String / "live_heights")
+        .and(warp::path::end())
+        .map(move |uid| (uid, req_pool.clone()))
+        .and_then(
+            |(uid, pool): (String, Arc<Pool<Postgres>>)| async move { api::handle_get_map_uid_live_heights(pool.as_ref(), uid).await },
+        );
+    let req_pool = pool.clone();
+
     // info!("Enabling route: get /mlping_intro");
     // let ping_path = warp::path!("mlping_intro")
     //     .and(warp::path::end())
@@ -277,6 +286,7 @@ pub async fn run_http_server(
         .or(get_map_uid_nb_climbers)
         .or(get_map_uid_leaderboard)
         .or(get_map_uid_leaderboard_page)
+        .or(get_map_uid_live_heights)
         .with(warp::log("dips++"));
 
     info!("Starting HTTP server: {}", soc_addr.to_string());

@@ -1,6 +1,9 @@
 use sqlx::{query, Pool, Postgres};
 
-use crate::router::LeaderboardEntry2;
+use crate::{
+    queries::{vec_to_color, PlayerAtHeight},
+    router::LeaderboardEntry2,
+};
 
 pub async fn get_map_nb_playing_live(pool: &Pool<Postgres>, map_uid: &str) -> Result<i64, sqlx::Error> {
     let nb_playing_now = query!(
@@ -58,6 +61,41 @@ pub async fn get_map_leaderboard(
             update_count: r.update_count,
             color: [r.color[0], r.color[1], r.color[2]],
             race_time: r.race_time as i64,
+        })
+        .collect();
+    Ok(entries)
+}
+
+pub async fn get_map_live_heights(pool: &Pool<Postgres>, map_uid: &str) -> Result<Vec<PlayerAtHeight>, sqlx::Error> {
+    if map_uid.len() > 30 {
+        return Err(sqlx::Error::RowNotFound);
+    }
+    let resp = query!(
+        r#"--sql
+        SELECT m.user_id, u.display_name, c.color, m.pos, m.height, m.updated_at, m.update_count, 0 AS rank
+        FROM map_curr_heights m
+        LEFT JOIN users u ON u.web_services_user_id = m.user_id
+        LEFT JOIN colors c ON c.user_id = m.user_id
+        WHERE m.map_uid = $1
+          AND m.updated_at > now() - interval '180 seconds'
+        ORDER BY m.height DESC
+    "#,
+        map_uid
+    )
+    .fetch_all(pool)
+    .await?;
+    let entries = resp
+        .into_iter()
+        .enumerate()
+        .map(|(i, r)| PlayerAtHeight {
+            user_id: r.user_id.to_string(),
+            pos: Some([r.pos[0], r.pos[1], r.pos[2]]),
+            ts: r.updated_at.and_utc().timestamp(),
+            display_name: r.display_name,
+            color: Some([r.color[0], r.color[1], r.color[2]]),
+            height: r.height,
+            rank: i as i64 + 1,
+            vel: None,
         })
         .collect();
     Ok(entries)

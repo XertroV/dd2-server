@@ -218,3 +218,14 @@ pub async fn handle_get_map_uid_leaderboard(pool: &Pool<Postgres>, map_uid: Stri
         }
     }
 }
+
+pub async fn handle_get_map_uid_live_heights(pool: &Pool<Postgres>, map_uid: String) -> Result<Json, warp::Rejection> {
+    let r = super::custom_maps::get_map_live_heights(pool, &map_uid).await;
+    match r {
+        Ok(r) => Ok(warp::reply::json(&r)),
+        Err(e) => {
+            eprintln!("Error: {:?}", e);
+            Err(warp::reject::custom(Into::<ApiErrRejection>::into(e)))
+        }
+    }
+}

@@ -517,7 +517,16 @@ impl XPlayer {
                     }
                 }
                 Request::ReportGCNodMsg { data } => Ok(()), // XPlayer::on_report_gcnod_msg(&pool, session_token, ctx_id.as_ref(), &data).await,
-                Request::Ping {} => queue_tx.send(Response::Ping {}).map_err(Into::into),
+                Request::Ping {} => {
+                    let r = queue_tx.send(Response::Ping {}).map_err(Into::into);
+                    if let Some(ctx) = ctx.as_ref() {
+                        let r2 = self.check_regular_on_ping(&pool, &queue_tx, ctx).await;
+                        if let Err(e) = r2 {
+                            warn!("Error checking regular on ping (user={}): {:?}", session.display_name(), e);
+                        }
+                    }
+                    r
+                }
                 Request::ReportVehicleState { vel, pos, rotq } => {
                     XPlayer::report_vehicle_state(&pool, session_token, ctx.as_ref(), ctx_id.as_ref(), pos, rotq, vel).await
                 }
@@ -591,7 +600,7 @@ impl XPlayer {
 
                 // get arb maps
                 Request::GetMapOverview { uid } => XPlayer::get_map_overview(&pool, &queue_tx, uid).await,
-                Request::GetMapLB { uid, start, end } => XPlayer::get_map_lb(&pool, &queue_tx, uid, start as i64, end as i64).await,
+                Request::GetMapLB { uid, start, end } => XPlayer::get_map_lb(&pool, &queue_tx, &uid, start as i64, end as i64).await,
                 Request::GetMapLive { uid } => XPlayer::get_map_live(&pool, &queue_tx, uid).await,
                 Request::GetMapMyRank { uid } => XPlayer::get_map_rank(&pool, uid, user_id, &queue_tx).await,
                 Request::GetMapRank { uid, wsid } => {
@@ -815,6 +824,23 @@ impl XPlayer {
             resumed: true,
             plugin_ver,
         })
+    }
+
+    async fn check_regular_on_ping(
+        &self,
+        pool: &Pool<Postgres>,
+        queue_tx: &UnboundedSender<Response>,
+        ctx: &PlayerCtx,
+    ) -> Result<(), api_error::Error> {
+        // do nothing if not in a map
+        let map = match ctx.map.as_ref() {
+            Some(map) if map.uid.len() > 20 => map,
+            _ => {
+                return Ok(());
+            }
+        };
+        Self::get_map_lb(pool, queue_tx, &map.uid, 0, 11).await?;
+        Ok(())
     }
 }
 
@@ -1055,7 +1081,7 @@ impl XPlayer {
     pub async fn get_map_lb(
         pool: &Pool<Postgres>,
         queue_tx: &UnboundedSender<Response>,
-        map_uid: String,
+        map_uid: &String,
         start: i64,
         end: i64,
     ) -> Result<(), api_error::Error> {
