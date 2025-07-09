@@ -23,6 +23,7 @@ use sqlx::{postgres::PgPoolOptions, query, Pool, Postgres};
 use uuid::Uuid;
 
 mod api_error;
+pub mod cache_util;
 mod consts;
 mod db;
 mod donations;

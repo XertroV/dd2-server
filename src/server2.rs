@@ -41,6 +41,7 @@ use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use uuid::Uuid;
 
 use crate::{
+    cache_util::AsyncCache,
     consts::DD2_MAP_UID,
     op_auth::init_op_config,
     player::{check_flags_sf_mi, ToPlayer},
@@ -49,6 +50,7 @@ use crate::{
 };
 
 mod api_error;
+mod cache_util;
 mod consts;
 mod db;
 mod donations;
@@ -60,6 +62,11 @@ mod router;
 
 const MAX_CONNECTIONS: u32 = 4096;
 const MIN_PLUGIN_VERSION: [u32; 3] = [0, 4, 15];
+
+lazy_static! {
+    static ref CACHED_LB_INFO: AsyncCache<String, Vec<LeaderboardEntry2>> = Default::default();
+    static ref CACHED_LIVE_INFO: AsyncCache<String, Vec<LeaderboardEntry2>> = Default::default();
+}
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 10)]
 async fn main() -> Result<(), Box<dyn Error>> {
@@ -316,10 +323,10 @@ pub struct XPlayer {
     stream: Option<TcpStream>,
     permit: OwnedSemaphorePermit,
     pool: Arc<Pool<Postgres>>,
-    // to manager
+    /// to manager
     mgr_tx: UnboundedSender<ToPlayerMgr>,
     addr: SocketAddr,
-    // from manager
+    /// from manager
     p_rx: Option<UnboundedReceiver<ToPlayer>>,
 
     session: OnceCell<LoginSession>,
@@ -329,6 +336,9 @@ pub struct XPlayer {
 
     queue_rx: Option<UnboundedReceiver<Response>>,
     pub queue_tx: UnboundedSender<Response>,
+
+    /// to keep track of when we enter a new map for on-ping auto msgs
+    last_map: Mutex<Option<String>>,
 }
 
 impl XPlayer {
@@ -355,6 +365,7 @@ impl XPlayer {
             ip_address: addr.ip().to_string(),
             queue_rx: Some(queue_rx),
             queue_tx,
+            last_map: Default::default(),
         }
     }
 
@@ -600,8 +611,8 @@ impl XPlayer {
 
                 // get arb maps
                 Request::GetMapOverview { uid } => XPlayer::get_map_overview(&pool, &queue_tx, uid).await,
-                Request::GetMapLB { uid, start, end } => XPlayer::get_map_lb(&pool, &queue_tx, &uid, start as i64, end as i64).await,
-                Request::GetMapLive { uid } => XPlayer::get_map_live(&pool, &queue_tx, uid).await,
+                Request::GetMapLB { uid, start, end } => XPlayer::send_map_lb(&pool, &queue_tx, &uid, start as i64, end as i64).await,
+                Request::GetMapLive { uid } => XPlayer::send_map_live(&pool, &queue_tx, uid).await,
                 Request::GetMapMyRank { uid } => XPlayer::get_map_rank(&pool, uid, user_id, &queue_tx).await,
                 Request::GetMapRank { uid, wsid } => {
                     if let Ok(user_id) = Uuid::from_str(&wsid) {
@@ -832,15 +843,68 @@ impl XPlayer {
         queue_tx: &UnboundedSender<Response>,
         ctx: &PlayerCtx,
     ) -> Result<(), api_error::Error> {
+        // check if this map is new
+        let map_changed: bool = self.on_ping_check_update_last_map(ctx.map.as_ref()).await;
+
         // do nothing if not in a map
         let map = match ctx.map.as_ref() {
-            Some(map) if map.uid.len() > 20 => map,
+            Some(map) if (20..30).contains(&map.uid.len()) => map,
             _ => {
                 return Ok(());
             }
         };
-        Self::get_map_lb(pool, queue_tx, &map.uid, 0, 10).await?;
+        let map_uid = map.uid.clone();
+        // pings come in every 6.7s with current version and 9-10s with next version (0.5.6).
+        let cache_ttl = Duration::from_millis(9000);
+        // add some tolerance for sending updates to avoid missing any (better to send twice than not at all)
+        let send_ttl = Duration::from_millis(11000);
+
+        // send cached info (note: this will also update it if it's old)
+        // map top 10 LB, note: pings are sent from the client every 9-10 seconds (random spread).
+        let (age, entries) = CACHED_LB_INFO
+            .get_or_insert_with(&map_uid, cache_ttl, async || {
+                queries::get_map_leaderboard(pool, &map_uid, 0, 10).await
+            })
+            .await?;
+        if map_changed || age <= send_ttl {
+            queue_tx.send(Response::MapLB {
+                uid: map_uid.to_string(),
+                entries,
+            })?;
+        }
+        // map top 10 live players
+        let (age, players) = CACHED_LIVE_INFO
+            .get_or_insert_with(&map.uid, cache_ttl, async || {
+                queries::get_map_live_heights_top_n(pool, &map_uid, 10).await
+            })
+            .await?;
+        if map_changed || age <= send_ttl {
+            queue_tx.send(Response::MapLivePlayers {
+                uid: map_uid.to_string(),
+                players,
+            })?;
+        }
+
+        // // send map LB info always
+        // Self::send_map_lb(pool, queue_tx, &map.uid, 0, 10).await?;
         Ok(())
+    }
+
+    async fn on_ping_check_update_last_map(&self, map: Option<&Map>) -> bool {
+        let mut last_map = self.last_map.lock().await;
+        let map_changed = match (map, last_map.as_ref()) {
+            (Some(m), Some(lm)) => m.uid != *lm,
+            (Some(m), None) => {
+                *last_map = Some(m.uid.clone());
+                true
+            }
+            (None, Some(_)) => {
+                *last_map = None;
+                true
+            }
+            (None, None) => false,
+        };
+        map_changed
     }
 }
 
@@ -1078,7 +1142,7 @@ impl XPlayer {
         Ok(())
     }
 
-    pub async fn get_map_lb(
+    pub async fn send_map_lb(
         pool: &Pool<Postgres>,
         queue_tx: &UnboundedSender<Response>,
         map_uid: &String,
@@ -1093,36 +1157,12 @@ impl XPlayer {
         Ok(())
     }
 
-    pub async fn get_map_live(
+    pub async fn send_map_live(
         pool: &Pool<Postgres>,
         queue_tx: &UnboundedSender<Response>,
         map_uid: String,
     ) -> Result<(), api_error::Error> {
-        let resp = query!(r#"--sql
-            SELECT m.user_id, u.display_name, c.color, m.pos, m.race_time, m.updated_at, m.update_count, rank() OVER (ORDER BY m.height DESC) AS rank FROM map_curr_heights m
-            LEFT JOIN users u ON u.web_services_user_id = m.user_id
-            LEFT JOIN colors c ON c.user_id = m.user_id
-            WHERE m.map_uid = $1
-                AND m.updated_at > now() - interval '30 seconds'
-            ORDER BY m.height DESC
-        "#,
-            &map_uid
-        )
-        .fetch_all(pool)
-        .await?;
-        let players = resp
-            .into_iter()
-            .map(|r| LeaderboardEntry2 {
-                rank: r.rank.unwrap_or_default() as u32,
-                wsid: r.user_id.to_string(),
-                pos: [r.pos[0], r.pos[1], r.pos[2]],
-                ts: r.updated_at.and_utc().timestamp() as u32,
-                name: r.display_name,
-                update_count: r.update_count,
-                color: [r.color[0], r.color[1], r.color[2]],
-                race_time: r.race_time as i64,
-            })
-            .collect();
+        let players = queries::get_map_live_heights_top_n(pool, &map_uid, 100).await?;
         queue_tx.send(Response::MapLivePlayers { uid: map_uid, players })?;
         Ok(())
     }

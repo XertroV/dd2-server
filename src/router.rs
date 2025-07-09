@@ -674,6 +674,17 @@ pub struct LeaderboardEntry2 {
     pub race_time: i64,
 }
 
+impl PartialEq for LeaderboardEntry2 {
+    fn eq(&self, other: &Self) -> bool {
+        // only cheap stuff:
+        self.ts == other.ts
+            && self.rank == other.rank
+            && self.pos == other.pos
+            && self.update_count == other.update_count
+            && self.race_time == other.race_time
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Donor {
     pub name: String,

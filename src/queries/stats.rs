@@ -530,10 +530,21 @@ pub async fn update_server_stats(pool: &Pool<Postgres>, nb_players_live: i32) ->
 }
 
 pub async fn get_server_info(pool: &Pool<Postgres>) -> Result<u32, sqlx::Error> {
-    let r = query!("SELECT SUM(player_count) FROM server_player_counts WHERE updated_at > NOW() - INTERVAL '150 seconds';")
-        .fetch_one(pool)
-        .await?;
-    Ok(r.sum.unwrap_or(0) as u32)
+    // this gets updated every 150 seconds
+    let r = query!(
+        r#"
+        SELECT SUM(player_count) as total FROM (
+            SELECT DISTINCT ON (server_id) player_count, updated_at
+            FROM server_player_counts
+            ORDER BY server_id, updated_at DESC
+        ) AS latest_counts
+            WHERE updated_at > NOW() - INTERVAL '180 seconds'
+        ;
+    "#
+    )
+    .fetch_one(pool)
+    .await?;
+    Ok(r.total.unwrap_or(0) as u32)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
