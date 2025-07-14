@@ -591,6 +591,7 @@ pub async fn get_users_latest_height(pool: &Pool<Postgres>, user_id: &Uuid) -> R
     })
 }
 
+// Used by API only
 #[derive(Debug, Serialize, Deserialize)]
 pub struct PlayerAtHeight {
     pub display_name: String,
@@ -601,7 +602,9 @@ pub struct PlayerAtHeight {
     pub color: Option<[f64; 3]>,
     pub pos: Option<[f64; 3]>,
     pub vel: Option<[f64; 3]>,
-    pub afk_count: i64,
+    pub afk_count: i32,
+    pub update_count: i32,
+    pub dt: f32,
 }
 
 pub async fn get_live_leaderboard(pool: &Pool<Postgres>) -> Result<Vec<PlayerAtHeight>, sqlx::Error> {
@@ -652,7 +655,9 @@ pub async fn get_live_leaderboard(pool: &Pool<Postgres>) -> Result<Vec<PlayerAtH
             color: r.color.and_then(vec_to_color),
             pos: Some([r.pos[0], r.pos[1], r.pos[2]]),
             vel: Some([r.vel[0], r.vel[1], r.vel[2]]),
-            afk_count: 0,
+            afk_count: -1,
+            update_count: -1,
+            dt: -1.0,
         })
         .collect())
 }
