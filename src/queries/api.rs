@@ -8,7 +8,7 @@ use warp::{
     reply::{Json, Reply, WithStatus},
 };
 
-use crate::{api_error, donations, router::LeaderboardEntry};
+use crate::{api_error, donations, queries::get_global_lb_count, router::LeaderboardEntry};
 
 use super::{get_global_lb, get_users_latest_height, stats};
 
@@ -19,6 +19,19 @@ pub async fn handle_get_global_lb(pool: &Arc<Pool<Postgres>>, page: u32) -> Resu
     match r {
         Ok(r) => Ok(warp::reply::json(
             &r.into_iter().map(|r| Into::<LeaderboardEntry>::into(r)).collect::<Vec<_>>(),
+        )),
+        Err(e) => {
+            eprintln!("Error: {:?}", e);
+            Err(warp::reject::custom(Into::<ApiErrRejection>::into(e)))
+        }
+    }
+}
+
+pub async fn handle_get_global_lb_len(pool: &Arc<Pool<Postgres>>) -> Result<Json, warp::Rejection> {
+    let r = get_global_lb_count(pool).await;
+    match r {
+        Ok(r) => Ok(warp::reply::json(
+            &serde_json::json!({ "len": r, "pages": (r as f64 / 100.0).ceil() as i64 }),
         )),
         Err(e) => {
             eprintln!("Error: {:?}", e);
@@ -212,6 +225,19 @@ pub async fn handle_get_map_uid_leaderboard(pool: &Pool<Postgres>, map_uid: Stri
     let r = super::custom_maps::get_map_leaderboard_page(pool, &map_uid, page).await;
     match r {
         Ok(r) => Ok(warp::reply::json(&r)),
+        Err(e) => {
+            eprintln!("Error: {:?}", e);
+            Err(warp::reject::custom(Into::<ApiErrRejection>::into(e)))
+        }
+    }
+}
+
+pub async fn handle_get_map_uid_leaderboard_len(pool: &Pool<Postgres>, map_uid: String) -> Result<impl Reply, warp::Rejection> {
+    let r = super::custom_maps::get_map_leaderboard_len(pool, &map_uid).await;
+    match r {
+        Ok(r) => Ok(warp::reply::json(
+            &serde_json::json!({ "len": r, "pages": (r as f64 / 100.0).ceil() as i64 }),
+        )),
         Err(e) => {
             eprintln!("Error: {:?}", e);
             Err(warp::reject::custom(Into::<ApiErrRejection>::into(e)))

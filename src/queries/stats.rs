@@ -347,6 +347,11 @@ impl Into<LeaderboardEntry> for LBEntry {
     }
 }
 
+pub async fn get_global_lb_count(pool: &Pool<Postgres>) -> Result<i64, sqlx::Error> {
+    let resp = query!("SELECT COUNT(*) FROM ranked_lb_view;").fetch_one(pool).await?;
+    Ok(resp.count.unwrap_or(0))
+}
+
 pub async fn get_global_lb(pool: &Pool<Postgres>, start: i32, end: i32) -> Result<Vec<LBEntry>, sqlx::Error> {
     if end < start {
         return Ok(vec![]);
@@ -522,8 +527,8 @@ pub async fn update_server_stats(pool: &Pool<Postgres>, nb_players_live: i32) ->
     )
     .execute(pool)
     .await?;
-    let lb = get_live_leaderboard(pool).await?;
-    query!("INSERT INTO active_players_stats (nb_players) VALUES ($1);", lb.len() as i32)
+    let lb = get_nb_playing_live(pool).await.unwrap_or(0);
+    query!("INSERT INTO active_players_stats (nb_players) VALUES ($1);", lb as i32)
         .execute(pool)
         .await?;
     Ok(())
@@ -596,6 +601,7 @@ pub struct PlayerAtHeight {
     pub color: Option<[f64; 3]>,
     pub pos: Option<[f64; 3]>,
     pub vel: Option<[f64; 3]>,
+    pub afk_count: i64,
 }
 
 pub async fn get_live_leaderboard(pool: &Pool<Postgres>) -> Result<Vec<PlayerAtHeight>, sqlx::Error> {
@@ -646,6 +652,7 @@ pub async fn get_live_leaderboard(pool: &Pool<Postgres>) -> Result<Vec<PlayerAtH
             color: r.color.and_then(vec_to_color),
             pos: Some([r.pos[0], r.pos[1], r.pos[2]]),
             vel: Some([r.vel[0], r.vel[1], r.vel[2]]),
+            afk_count: 0,
         })
         .collect())
 }

@@ -116,6 +116,7 @@ pub async fn run_http_server(
     let api_routes = warp::path!("api" / "routes").and(warp::path::end()).map(|| {
         let routes = vec![
             "/leaderboard/global",
+            "/leaderboard/global/len",
             "/leaderboard/global/<page>",
             "/leaderboard/<wsid>",
             "/live_heights/global",
@@ -127,6 +128,7 @@ pub async fn run_http_server(
             "/aux_spec/<wsid>/<name_id>.json",
             "/map/<uid>/nb_active_climbers",
             "/map/<uid>/leaderboard",
+            "/map/<uid>/leaderboard/len",
             "/map/<uid>/leaderboard/<page>",
             "/map/<uid>/live_heights",
         ];
@@ -156,6 +158,12 @@ pub async fn run_http_server(
         .and(warp::path::end())
         .map(move || req_pool.clone())
         .and_then(|pool: Arc<Pool<Postgres>>| async move { api::handle_get_global_lb(&pool, 0).await });
+    let req_pool = pool.clone();
+
+    let get_global_lb_len = warp::path!("leaderboard" / "global" / "len")
+        .and(warp::path::end())
+        .map(move || req_pool.clone())
+        .and_then(|pool: Arc<Pool<Postgres>>| async move { api::handle_get_global_lb_len(&pool).await });
     let req_pool = pool.clone();
 
     let get_global_lb_page = warp::path!("leaderboard" / "global" / u32)
@@ -234,6 +242,14 @@ pub async fn run_http_server(
         );
     let req_pool = pool.clone();
 
+    let get_map_uid_leaderboard_len = warp::path!("map" / String / "leaderboard" / "len")
+        .and(warp::path::end())
+        .map(move |uid| (uid, req_pool.clone()))
+        .and_then(
+            |(uid, pool): (String, Arc<Pool<Postgres>>)| async move { api::handle_get_map_uid_leaderboard_len(pool.as_ref(), uid).await },
+        );
+    let req_pool = pool.clone();
+
     let get_map_uid_leaderboard_page = warp::path!("map" / String / "leaderboard" / u32)
         .and(warp::path::end())
         .map(move |uid, page| (uid, page, req_pool.clone()))
@@ -274,6 +290,7 @@ pub async fn run_http_server(
         .or(api_routes)
         .or(version_route)
         .or(get_global_lb)
+        .or(get_global_lb_len)
         .or(get_global_lb_page)
         .or(get_global_overview)
         .or(get_server_info)
@@ -285,6 +302,7 @@ pub async fn run_http_server(
         .or(get_custom_map_aux_spec)
         .or(get_map_uid_nb_climbers)
         .or(get_map_uid_leaderboard)
+        .or(get_map_uid_leaderboard_len)
         .or(get_map_uid_leaderboard_page)
         .or(get_map_uid_live_heights)
         .with(warp::log("dips++"));

@@ -34,6 +34,21 @@ pub async fn get_map_nb_playing_live(pool: &Pool<Postgres>, map_uid: &str) -> Re
     Ok(nb_playing_now)
 }
 
+pub async fn get_map_leaderboard_len(pool: &Pool<Postgres>, map_uid: &str) -> Result<i64, sqlx::Error> {
+    if map_uid.len() > 30 {
+        return Err(sqlx::Error::RowNotFound);
+    }
+    let resp = query!(
+        r#"--sql
+        SELECT COUNT(*) FROM map_leaderboard WHERE map_uid = $1
+    "#,
+        map_uid
+    )
+    .fetch_one(pool)
+    .await?;
+    Ok(resp.count.unwrap_or(0))
+}
+
 pub async fn get_map_leaderboard_page(pool: &Pool<Postgres>, map_uid: &str, page: u32) -> Result<Vec<LeaderboardEntry2>, sqlx::Error> {
     let start = (page * 100) as i64;
     let end = (start + 100) as i64;
@@ -50,7 +65,8 @@ pub async fn get_map_leaderboard(
         return Err(sqlx::Error::RowNotFound);
     }
     let resp = query!(r#"--sql
-        SELECT m.user_id, u.display_name, c.color, m.pos, m.race_time, m.updated_at, m.update_count, rank() OVER (ORDER BY m.height DESC) AS rank FROM map_leaderboard m
+        SELECT m.user_id, u.display_name, c.color, m.pos, m.race_time, m.updated_at, m.update_count, rank() OVER (ORDER BY m.height DESC) AS rank
+        FROM map_leaderboard m
         LEFT JOIN users u ON u.web_services_user_id = m.user_id
         LEFT JOIN colors c ON c.user_id = m.user_id
         WHERE m.map_uid = $1
@@ -87,7 +103,7 @@ pub async fn get_map_live_heights(pool: &Pool<Postgres>, map_uid: &str) -> Resul
     }
     let resp = query!(
         r#"--sql
-        SELECT m.user_id, u.display_name, c.color, m.pos, m.height, m.updated_at, m.update_count, 0 AS rank
+        SELECT m.user_id, u.display_name, c.color, m.pos, m.height, m.updated_at, m.update_count, m.afk_update_count, 0 AS rank
         FROM map_curr_heights m
         LEFT JOIN users u ON u.web_services_user_id = m.user_id
         LEFT JOIN colors c ON c.user_id = m.user_id
@@ -111,6 +127,7 @@ pub async fn get_map_live_heights(pool: &Pool<Postgres>, map_uid: &str) -> Resul
             height: r.height,
             rank: i as i64 + 1,
             vel: None,
+            afk_count: r.afk_update_count as i64,
         })
         .collect();
     Ok(entries)

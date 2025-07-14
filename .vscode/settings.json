@@ -1,5 +1,5 @@
 {
-    "editor.formatOnSave": true,
+    "editor.formatOnSave": false,
     "cSpell.words": [
         "chrono",
         "respawns"
@@ -18,4 +18,10 @@
     "files.associations": {
         "*.sql": "postgres"
     },
+    "[sql]": {
+        "editor.formatOnSave": false,
+    },
+    "[rust]": {
+        "editor.formatOnSave": true,
+    }
 }
