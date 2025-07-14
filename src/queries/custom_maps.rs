@@ -103,7 +103,7 @@ pub async fn get_map_live_heights(pool: &Pool<Postgres>, map_uid: &str) -> Resul
     }
     let resp = query!(
         r#"--sql
-        SELECT m.user_id, u.display_name, c.color, m.pos, m.height, m.updated_at, m.update_count, m.afk_update_count, 0 AS rank
+        SELECT m.user_id, u.display_name, c.color, m.pos, m.height, m.updated_at, m.update_count, m.afk_update_count, m.velocity, 0 AS rank
         FROM map_curr_heights m
         LEFT JOIN users u ON u.web_services_user_id = m.user_id
         LEFT JOIN colors c ON c.user_id = m.user_id
@@ -126,7 +126,7 @@ pub async fn get_map_live_heights(pool: &Pool<Postgres>, map_uid: &str) -> Resul
             color: Some([r.color[0], r.color[1], r.color[2]]),
             height: r.height,
             rank: i as i64 + 1,
-            vel: None,
+            vel: Some([r.velocity[0], r.velocity[1], r.velocity[2]]),
             afk_count: r.afk_update_count as i64,
         })
         .collect();
