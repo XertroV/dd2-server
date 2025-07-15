@@ -580,6 +580,9 @@ impl XPlayer {
                     XPlayer::delete_custom_map_aux_spec(&pool, id, user_id, &name_id, &queue_tx).await
                 }
                 Request::ListCustomMapAuxSpecs { id } => XPlayer::list_custom_map_aux_spec(&pool, id, user_id, &queue_tx).await,
+
+                Request::ReportMapStats { uid, stats } => XPlayer::report_map_stats(&pool, user_id, uid, stats).await,
+
                 // get requests
                 Request::GetMyStats {} => XPlayer::get_stats(&pool, user_id, &queue_tx).await,
                 Request::GetGlobalLB { start, end } => XPlayer::get_global_lb(&pool, &queue_tx, start as i32, end as i32).await,
@@ -608,6 +611,8 @@ impl XPlayer {
                 Request::GetMyPreferences {} => XPlayer::get_users_preferences(&pool, user_id, &queue_tx).await,
                 Request::SetMyPreferences { body } => XPlayer::set_users_preferences(&pool, user_id, body).await,
                 Request::GetUsersProfile { wsid } => XPlayer::get_users_profile(&pool, &wsid, &queue_tx).await,
+
+                Request::GetPlayersSpecInfo { uid, wsid } => XPlayer::get_players_spec_info(&pool, &uid, &wsid, &queue_tx).await,
 
                 // get arb maps
                 Request::GetMapOverview { uid } => XPlayer::get_map_overview(&pool, &queue_tx, uid).await,
@@ -905,6 +910,35 @@ impl XPlayer {
             (None, None) => false,
         };
         map_changed
+    }
+
+    async fn report_map_stats(pool: &Pool<Postgres>, user_id: &Uuid, uid: String, stats: serde_json::Value) -> Result<(), ApiError> {
+        queries::custom_maps::report_map_stats(pool, user_id, &uid, stats).await?;
+        Ok(())
+    }
+
+    async fn get_players_spec_info(
+        pool: &Pool<Postgres>,
+        uid: &str,
+        wsid: &str,
+        queue_tx: &UnboundedSender<Response>,
+    ) -> Result<(), ApiError> {
+        let wsid = Uuid::from_str(wsid).map_err(|_| ApiError::StrErr("Invalid WSID".to_string()))?;
+        let (total_map_time, updated_at) = match queries::custom_maps::get_players_spec_info(pool, uid, &wsid).await {
+            Ok(r) => r,
+            Err(e) => {
+                warn!("Error getting players spec info: {:?}", e);
+                return Ok(());
+            }
+        };
+        let now_ts = updated_at.timestamp();
+        queue_tx.send(Response::PlayersSpecInfo {
+            uid: uid.to_string(),
+            wsid: wsid.to_string(),
+            total_map_time,
+            now_ts,
+        })?;
+        Ok(())
     }
 }
 

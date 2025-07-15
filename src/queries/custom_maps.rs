@@ -1,4 +1,6 @@
+use chrono::{DateTime, NaiveDateTime, Utc};
 use sqlx::{query, Pool, Postgres};
+use uuid::Uuid;
 
 use crate::{
     queries::{vec_to_color, PlayerAtHeight},
@@ -180,4 +182,41 @@ pub async fn get_map_live_heights_top_n(pool: &Pool<Postgres>, map_uid: &str, n:
         })
         .collect();
     Ok(entries)
+}
+
+pub(crate) async fn get_players_spec_info(pool: &Pool<Postgres>, uid: &str, wsid: &Uuid) -> Result<(i64, DateTime<Utc>), sqlx::Error> {
+    let resp = query!(
+        r#"--sql
+        SELECT updated_at, (stats ->> 'seconds_spent_in_map')::BIGINT AS seconds_spent_in_map
+        FROM custom_map_stats
+        WHERE user_id = $1 AND map_uid = $2
+    "#,
+        wsid,
+        uid
+    )
+    .fetch_one(pool)
+    .await?;
+    Ok((resp.seconds_spent_in_map.unwrap_or(0), resp.updated_at))
+}
+
+pub(crate) async fn report_map_stats(
+    pool: &Pool<Postgres>,
+    user_id: &Uuid,
+    uid: &str,
+    stats: serde_json::Value,
+) -> Result<(), sqlx::Error> {
+    query!(
+        r#"--sql
+        INSERT INTO custom_map_stats (user_id, map_uid, stats)
+        VALUES ($1, $2, $3)
+        ON CONFLICT (user_id, map_uid)
+        DO UPDATE SET stats = $3, updated_at = NOW()
+    "#,
+        user_id,
+        uid,
+        stats
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
 }

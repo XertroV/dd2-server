@@ -137,6 +137,11 @@ pub enum Request {
     ListCustomMapAuxSpecs {
         id: u32,
     } = 67,
+    // stats for custom maps
+    ReportMapStats {
+        uid: String,
+        stats: JsonValue,
+    } = 68,
 
     GetMyStats {} = 128,
     GetGlobalLB {
@@ -170,6 +175,10 @@ pub enum Request {
     GetUsersProfile {
         wsid: String,
     } = 142,
+    GetPlayersSpecInfo {
+        uid: String,
+        wsid: String,
+    } = 143,
 
     GetMapOverview {
         uid: String,
@@ -219,6 +228,7 @@ impl Request {
             Request::ReportCustomMapAuxSpec { .. } => 65,
             Request::DeleteCustomMapAuxSpec { .. } => 66,
             Request::ListCustomMapAuxSpecs { .. } => 67,
+            Request::ReportMapStats { .. } => 68,
             // get
             Request::GetMyStats { .. } => 128,
             Request::GetGlobalLB { .. } => 129,
@@ -235,6 +245,8 @@ impl Request {
             Request::GetMyPreferences { .. } => 140,
             Request::SetMyPreferences { .. } => 141,
             Request::GetUsersProfile { .. } => 142,
+            Request::GetPlayersSpecInfo { .. } => 143,
+
             // get arb maps
             Request::GetMapOverview { .. } => 192,
             Request::GetMapLB { .. } => 193,
@@ -271,6 +283,7 @@ impl Request {
             Request::ReportCustomMapAuxSpec { .. } => "ReportCustomMapAuxSpec",
             Request::DeleteCustomMapAuxSpec { .. } => "DeleteCustomMapAuxSpec",
             Request::ListCustomMapAuxSpecs { .. } => "ListCustomMapAuxSpecs",
+            Request::ReportMapStats { .. } => "ReportMapStats",
             // get
             Request::GetMyStats { .. } => "GetMyStats",
             Request::GetGlobalLB { .. } => "GetGlobalLB",
@@ -287,6 +300,7 @@ impl Request {
             Request::GetMyPreferences {} => "GetMyPreferences",
             Request::SetMyPreferences { .. } => "SetMyPreferences",
             Request::GetUsersProfile { .. } => "GetUsersProfile",
+            Request::GetPlayersSpecInfo { .. } => "GetPlayersSpecInfo",
             // get arb maps
             Request::GetMapOverview { .. } => "GetMapOverview",
             Request::GetMapLB { .. } => "GetMapLB",
@@ -497,6 +511,14 @@ pub enum Response {
         preferences: JsonValue,
     },
 
+    // Info given while spectating players only
+    PlayersSpecInfo {
+        wsid: String,
+        uid: String,
+        total_map_time: i64,
+        now_ts: i64,
+    },
+
     // arbitrary maps
     MapOverview {
         uid: String,
@@ -560,6 +582,8 @@ impl Response {
             Response::TwitchName { .. } => 137,
             Response::UsersProfile { .. } => 138,
             Response::YourPreferences { .. } => 139,
+            // space for some preference/profile stuff
+            Response::PlayersSpecInfo { .. } => 143,
             // arb maps
             Response::MapOverview { .. } => 192,
             Response::MapLB { .. } => 193,
@@ -593,6 +617,7 @@ impl Response {
             Response::TwitchName { .. } => "TwitchName",
             Response::UsersProfile { .. } => "UsersProfile",
             Response::YourPreferences { .. } => "YourPreferences",
+            Response::PlayersSpecInfo { .. } => "PlayersSpecInfo",
             // arb maps
             Response::MapOverview { .. } => "MapOverview",
             Response::MapLB { .. } => "MapLB",
