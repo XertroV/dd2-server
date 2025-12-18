@@ -62,6 +62,7 @@ mod router;
 
 const MAX_CONNECTIONS: u32 = 4096;
 const MIN_PLUGIN_VERSION: [u32; 3] = [0, 4, 15];
+const MAX_HEIGHT: f64 = 5000.0;
 
 lazy_static! {
     static ref CACHED_LB_INFO: AsyncCache<String, Vec<LeaderboardEntry2>> = Default::default();
@@ -1209,7 +1210,7 @@ impl XPlayer {
         race_time: i32,
     ) -> Result<(), api_error::Error> {
         // bad height, discard report
-        if pos[1] > 3000.0 {
+        if pos[1] > MAX_HEIGHT {
             return Ok(());
         }
         if map_uid.len() != 27 {
