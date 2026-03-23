@@ -7,6 +7,12 @@
 
 cargo build --release || exit 1
 
+# Strip x86-64-v4 ISA metadata added by aws-lc-sys AVX-512 assembly.
+# The AVX-512 code is runtime-dispatched (checks CPUID), but the ELF property
+# causes the dynamic linker to reject the binary on older CPUs.
+objcopy --remove-section=.note.gnu.property target/release/dd2-server
+objcopy --remove-section=.note.gnu.property target/release/dd2-server2
+
 
 function sync_server() {
     SERVERNAME=$1

@@ -696,7 +696,7 @@ checksum = "0e60eed09d8c01d3cee5b7d30acb059b76614c918fa0f992e0dd6eeb10daad6f"
 
 [[package]]
 name = "dd2-server"
-version = "0.4.20"
+version = "0.5.0"
 dependencies = [
  "ahash",
  "base64 0.22.1",
