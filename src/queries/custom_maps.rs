@@ -10,8 +10,10 @@ use crate::{
 pub async fn get_nb_playing_live(pool: &Pool<Postgres>) -> Result<i64, sqlx::Error> {
     let nb_playing_now = query!(
         r#"--sql
-        SELECT COUNT(*) FROM map_curr_heights
-            WHERE updated_at > now() - interval '120 seconds'
+        SELECT COUNT(*) FROM map_curr_heights m
+            LEFT JOIN shadow_bans sb ON m.user_id = sb.user_id
+            WHERE sb.user_id IS NULL
+              AND m.updated_at > now() - interval '120 seconds'
     "#,
     )
     .fetch_one(pool)
@@ -24,8 +26,11 @@ pub async fn get_nb_playing_live(pool: &Pool<Postgres>) -> Result<i64, sqlx::Err
 pub async fn get_map_nb_playing_live(pool: &Pool<Postgres>, map_uid: &str) -> Result<i64, sqlx::Error> {
     let nb_playing_now = query!(
         r#"--sql
-        SELECT COUNT(*) FROM map_curr_heights WHERE map_uid = $1
-            AND updated_at > now() - interval '120 seconds'
+        SELECT COUNT(*) FROM map_curr_heights m
+            LEFT JOIN shadow_bans sb ON m.user_id = sb.user_id
+            WHERE sb.user_id IS NULL
+              AND m.map_uid = $1
+              AND m.updated_at > now() - interval '120 seconds'
     "#,
         map_uid
     )
@@ -42,7 +47,9 @@ pub async fn get_map_leaderboard_len(pool: &Pool<Postgres>, map_uid: &str) -> Re
     }
     let resp = query!(
         r#"--sql
-        SELECT COUNT(*) FROM map_leaderboard WHERE map_uid = $1
+        SELECT COUNT(*) FROM map_leaderboard m
+        LEFT JOIN shadow_bans sb ON m.user_id = sb.user_id
+        WHERE sb.user_id IS NULL AND m.map_uid = $1
     "#,
         map_uid
     )
@@ -71,7 +78,8 @@ pub async fn get_map_leaderboard(
         FROM map_leaderboard m
         LEFT JOIN users u ON u.web_services_user_id = m.user_id
         LEFT JOIN colors c ON c.user_id = m.user_id
-        WHERE m.map_uid = $1
+        LEFT JOIN shadow_bans sb ON m.user_id = sb.user_id
+        WHERE sb.user_id IS NULL AND m.map_uid = $1
         ORDER BY m.height DESC
         LIMIT $2
         OFFSET $3
@@ -109,7 +117,9 @@ pub async fn get_map_live_heights(pool: &Pool<Postgres>, map_uid: &str) -> Resul
         FROM map_curr_heights m
         LEFT JOIN users u ON u.web_services_user_id = m.user_id
         LEFT JOIN colors c ON c.user_id = m.user_id
-        WHERE m.map_uid = $1
+        LEFT JOIN shadow_bans sb ON m.user_id = sb.user_id
+        WHERE sb.user_id IS NULL
+          AND m.map_uid = $1
           AND m.updated_at > now() - interval '120 seconds'
         ORDER BY m.height DESC
     "#,
@@ -156,7 +166,9 @@ pub async fn get_map_live_heights_top_n(pool: &Pool<Postgres>, map_uid: &str, n:
             SELECT m.user_id, u.display_name, c.color, m.pos, m.race_time, m.updated_at, m.update_count, rank() OVER (ORDER BY m.height DESC) AS rank FROM map_curr_heights m
             LEFT JOIN users u ON u.web_services_user_id = m.user_id
             LEFT JOIN colors c ON c.user_id = m.user_id
-            WHERE m.map_uid = $1
+            LEFT JOIN shadow_bans sb ON m.user_id = sb.user_id
+            WHERE sb.user_id IS NULL
+                AND m.map_uid = $1
                 AND m.updated_at > now() - interval '120 seconds'
             ORDER BY m.height DESC
             LIMIT $2
