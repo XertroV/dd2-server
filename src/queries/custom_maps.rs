@@ -13,6 +13,7 @@ pub async fn get_nb_playing_live(pool: &Pool<Postgres>) -> Result<i64, sqlx::Err
         SELECT COUNT(*) FROM map_curr_heights m
             LEFT JOIN shadow_bans sb ON m.user_id = sb.user_id
             WHERE sb.user_id IS NULL
+              AND m.afk_update_count < 360
               AND m.updated_at > now() - interval '120 seconds'
     "#,
     )
@@ -29,6 +30,7 @@ pub async fn get_map_nb_playing_live(pool: &Pool<Postgres>, map_uid: &str) -> Re
         SELECT COUNT(*) FROM map_curr_heights m
             LEFT JOIN shadow_bans sb ON m.user_id = sb.user_id
             WHERE sb.user_id IS NULL
+              AND m.afk_update_count < 360
               AND m.map_uid = $1
               AND m.updated_at > now() - interval '120 seconds'
     "#,
@@ -119,6 +121,7 @@ pub async fn get_map_live_heights(pool: &Pool<Postgres>, map_uid: &str) -> Resul
         LEFT JOIN colors c ON c.user_id = m.user_id
         LEFT JOIN shadow_bans sb ON m.user_id = sb.user_id
         WHERE sb.user_id IS NULL
+          AND m.afk_update_count < 360
           AND m.map_uid = $1
           AND m.updated_at > now() - interval '120 seconds'
         ORDER BY m.height DESC
@@ -168,6 +171,7 @@ pub async fn get_map_live_heights_top_n(pool: &Pool<Postgres>, map_uid: &str, n:
             LEFT JOIN colors c ON c.user_id = m.user_id
             LEFT JOIN shadow_bans sb ON m.user_id = sb.user_id
             WHERE sb.user_id IS NULL
+                AND m.afk_update_count < 360
                 AND m.map_uid = $1
                 AND m.updated_at > now() - interval '120 seconds'
             ORDER BY m.height DESC
