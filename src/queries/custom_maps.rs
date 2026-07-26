@@ -108,6 +108,34 @@ pub async fn get_map_leaderboard(
     Ok(entries)
 }
 
+/// Upsert a player's current live position for a map (custom-map live heights path).
+pub async fn upsert_map_curr_height(
+    pool: &Pool<Postgres>,
+    map_uid: &str,
+    user_id: &Uuid,
+    pos: [f64; 3],
+    race_time: i32,
+) -> Result<(), sqlx::Error> {
+    if map_uid.len() != 27 {
+        return Err(sqlx::Error::RowNotFound);
+    }
+    query!(
+        r#"--sql
+            INSERT INTO map_curr_heights (map_uid, user_id, height, pos, race_time) VALUES ($1, $2, $3, $4, $5)
+            ON CONFLICT (map_uid, user_id)
+            DO UPDATE SET height = $3, pos = $4, race_time = $5, updated_at = now(), update_count = map_curr_heights.update_count + 1
+        "#,
+        map_uid,
+        user_id,
+        pos[1],
+        &pos,
+        race_time
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 /// This returns PlayerAtHeight entries for API
 pub async fn get_map_live_heights(pool: &Pool<Postgres>, map_uid: &str) -> Result<Vec<PlayerAtHeight>, sqlx::Error> {
     if !(20..30).contains(&map_uid.len()) {
@@ -235,4 +263,256 @@ pub(crate) async fn report_map_stats(
     .execute(pool)
     .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::consts::DD2_MAP_UID;
+    use crate::queries::api::handle_get_map_uid_live_heights;
+    use crate::queries::stats::{get_live_leaderboard, report_live_vehicle_state};
+    use sqlx::postgres::PgPoolOptions;
+    use std::sync::{Mutex, OnceLock};
+    use uuid::Uuid;
+
+    /// Serialize DB-backed live-height tests (shared DD2_MAP_UID rows).
+    fn test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    async fn test_pool() -> Pool<Postgres> {
+        dotenv::dotenv().ok();
+        let url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set for live height tests");
+        PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&url)
+            .await
+            .expect("connect to DATABASE_URL")
+    }
+
+    async fn seed_user(pool: &Pool<Postgres>, name: &str) -> Uuid {
+        let user_id = Uuid::now_v7();
+        query!(
+            "INSERT INTO users (web_services_user_id, display_name) VALUES ($1, $2)",
+            user_id,
+            name
+        )
+        .execute(pool)
+        .await
+        .expect("insert user");
+        query!(
+            "INSERT INTO colors (user_id, color) VALUES ($1, $2)",
+            user_id,
+            &[0.1_f64, 0.2, 0.3] as &[f64]
+        )
+        .execute(pool)
+        .await
+        .expect("insert color");
+        user_id
+    }
+
+    async fn seed_session(pool: &Pool<Postgres>, user_id: &Uuid) -> Uuid {
+        let session_token = Uuid::now_v7();
+        query!(
+            "INSERT INTO sessions (session_token, user_id, ip_address) VALUES ($1, $2, $3)",
+            session_token,
+            user_id,
+            "127.0.0.1"
+        )
+        .execute(pool)
+        .await
+        .expect("insert session");
+        session_token
+    }
+
+    async fn cleanup_user(pool: &Pool<Postgres>, user_id: &Uuid) {
+        let _ = query!("DELETE FROM users WHERE web_services_user_id = $1", user_id)
+            .execute(pool)
+            .await;
+    }
+
+    /// Characterization: non-DD2 custom maps keep working via map_curr_heights.
+    #[tokio::test]
+    async fn custom_map_live_heights_unaffected_for_other_uids() {
+        let _guard = test_lock();
+        let pool = test_pool().await;
+        let user_id = seed_user(&pool, "custom-map-live-ctrl").await;
+        let map_uid = "CustomClimbMap_____________"; // 27 chars
+        assert_eq!(map_uid.len(), 27);
+
+        upsert_map_curr_height(&pool, map_uid, &user_id, [1.0, 55.5, 2.0], 500)
+            .await
+            .expect("upsert custom map height");
+
+        let rows = get_map_live_heights(&pool, map_uid).await.expect("get_map_live_heights");
+        let dd2_rows = get_map_live_heights(&pool, DD2_MAP_UID).await.expect("dd2 live");
+
+        cleanup_user(&pool, &user_id).await;
+
+        assert!(
+            rows.iter().any(|p| p.user_id == user_id.to_string() && (p.height - 55.5).abs() < 1e-6),
+            "custom map live heights must still work; got: {:?}",
+            rows
+        );
+        assert!(
+            !dd2_rows.iter().any(|p| p.user_id == user_id.to_string()),
+            "custom-map upsert must not appear under DD2 live heights"
+        );
+    }
+
+    /// Control: custom-map live heights read path works when `map_curr_heights` is populated
+    /// for the DD2 UID (same table/API as other maps).
+    #[tokio::test]
+    async fn dd2_map_live_heights_api_returns_rows_from_map_curr_heights() {
+        let _guard = test_lock();
+        let pool = test_pool().await;
+        let user_id = seed_user(&pool, "dd2-live-ctrl").await;
+        let pos = [10.0_f64, 123.45, 20.0];
+        upsert_map_curr_height(&pool, DD2_MAP_UID, &user_id, pos, 1000)
+            .await
+            .expect("upsert map_curr_heights");
+
+        let rows = get_map_live_heights(&pool, DD2_MAP_UID)
+            .await
+            .expect("get_map_live_heights");
+        let handler_ok = handle_get_map_uid_live_heights(&pool, DD2_MAP_UID.to_string())
+            .await
+            .is_ok();
+
+        cleanup_user(&pool, &user_id).await;
+
+        assert!(handler_ok, "handle_get_map_uid_live_heights should succeed for DD2 UID");
+        assert!(
+            rows.iter().any(|p| p.user_id == user_id.to_string() && (p.height - 123.45).abs() < 1e-6),
+            "expected seeded DD2 player in map live heights, got: {:?}",
+            rows
+        );
+    }
+
+    /// Official DD2 vehicle reports must surface on `/map/{DD2}/live_heights`.
+    #[tokio::test]
+    async fn dd2_vehicle_live_report_visible_on_map_live_heights_api() {
+        let _guard = test_lock();
+        let pool = test_pool().await;
+        let user_id = seed_user(&pool, "dd2-live-red").await;
+        let session = seed_session(&pool, &user_id).await;
+
+        report_live_vehicle_state(
+            &pool,
+            &session,
+            &user_id,
+            None,
+            true, // official DD2 climb
+            [10.0, 250.0, 20.0],
+            [0.0, 0.0, 0.0, 1.0],
+            [0.0, 1.0, 0.0],
+        )
+        .await
+        .expect("report_live_vehicle_state");
+
+        let rows = get_map_live_heights(&pool, DD2_MAP_UID)
+            .await
+            .expect("get_map_live_heights should not error");
+
+        cleanup_user(&pool, &user_id).await;
+
+        assert!(
+            rows.iter().any(|p| p.user_id == user_id.to_string() && (p.height - 250.0).abs() < 1e-6),
+            "DD2 vehicle-state live report must appear on map live heights API \
+             (migration onto custom-map path). got: {:?}",
+            rows
+        );
+    }
+
+    /// Unofficial vehicle reports must not pollute DD2 map live heights.
+    #[tokio::test]
+    async fn unofficial_vehicle_report_does_not_appear_on_dd2_map_live_heights() {
+        let _guard = test_lock();
+        let pool = test_pool().await;
+        let user_id = seed_user(&pool, "dd2-live-unofficial").await;
+        let session = seed_session(&pool, &user_id).await;
+
+        report_live_vehicle_state(
+            &pool,
+            &session,
+            &user_id,
+            None,
+            false,
+            [10.0, 999.0, 20.0],
+            [0.0, 0.0, 0.0, 1.0],
+            [0.0, 0.0, 0.0],
+        )
+        .await
+        .expect("report_live_vehicle_state");
+
+        let rows = get_map_live_heights(&pool, DD2_MAP_UID)
+            .await
+            .expect("get_map_live_heights");
+
+        cleanup_user(&pool, &user_id).await;
+
+        assert!(
+            !rows.iter().any(|p| p.user_id == user_id.to_string()),
+            "unofficial vehicle reports must not mirror into DD2 map live heights; got: {:?}",
+            rows
+        );
+    }
+
+    /// `/live_heights/global` must read DD2 live heights from map_curr_heights
+    /// (same source as `/map/{DD2}/live_heights`).
+    #[tokio::test]
+    async fn dd2_live_heights_global_reads_map_curr_heights() {
+        let _guard = test_lock();
+        let pool = test_pool().await;
+        let user_id = seed_user(&pool, "dd2-global-map").await;
+
+        upsert_map_curr_height(&pool, DD2_MAP_UID, &user_id, [10.0, 300.0, 20.0], -1)
+            .await
+            .expect("upsert map_curr_heights");
+
+        let rows = get_live_leaderboard(&pool).await.expect("get_live_leaderboard");
+
+        cleanup_user(&pool, &user_id).await;
+
+        assert!(
+            rows.iter().any(|p| p.user_id == user_id.to_string() && (p.height - 300.0).abs() < 1e-6),
+            "global live heights should include DD2 map_curr_heights rows; got: {:?}",
+            rows
+        );
+    }
+
+    /// End-to-end: official vehicle report must also appear on global live heights.
+    #[tokio::test]
+    async fn dd2_official_vehicle_report_visible_on_global_live_heights() {
+        let _guard = test_lock();
+        let pool = test_pool().await;
+        let user_id = seed_user(&pool, "dd2-global-veh").await;
+        let session = seed_session(&pool, &user_id).await;
+
+        report_live_vehicle_state(
+            &pool,
+            &session,
+            &user_id,
+            None,
+            true,
+            [10.0, 275.0, 20.0],
+            [0.0, 0.0, 0.0, 1.0],
+            [0.0, 1.0, 0.0],
+        )
+        .await
+        .expect("report_live_vehicle_state");
+
+        let rows = get_live_leaderboard(&pool).await.expect("get_live_leaderboard");
+
+        cleanup_user(&pool, &user_id).await;
+
+        assert!(
+            rows.iter().any(|p| p.user_id == user_id.to_string() && (p.height - 275.0).abs() < 1e-6),
+            "global live heights should include official DD2 vehicle reports after mirror; got: {:?}",
+            rows
+        );
+    }
 }

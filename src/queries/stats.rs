@@ -259,6 +259,7 @@ pub async fn insert_vehicle_state(
     rotq: [f32; 4],
     vel: [f32; 3],
 ) -> Result<(), sqlx::Error> {
+    let _ = context_id; // retained for call-site compatibility; column write dropped in 1c64e7c
     query!(
         "INSERT INTO vehicle_states (session_token, is_official, pos, rotq, vel) VALUES ($1, $2, $3, $4, $5);",
         session_id,
@@ -269,6 +270,29 @@ pub async fn insert_vehicle_state(
     )
     .execute(pool)
     .await?;
+    Ok(())
+}
+
+/// DD2 live write path: persist vehicle_states, and when official also mirror into
+/// `map_curr_heights` so DD2 uses the same live-heights source as custom maps.
+pub async fn report_live_vehicle_state(
+    pool: &Pool<Postgres>,
+    session_id: &Uuid,
+    user_id: &Uuid,
+    context_id: Option<&Uuid>,
+    is_official: bool,
+    pos: [f32; 3],
+    rotq: [f32; 4],
+    vel: [f32; 3],
+) -> Result<(), sqlx::Error> {
+    insert_vehicle_state(pool, session_id, context_id, is_official, pos, rotq, vel).await?;
+    if is_official {
+        let pos64 = pos.map(|f| f as f64);
+        // Match custom-map discard threshold (server2::MAX_HEIGHT).
+        if pos64[1] <= 5000.0 {
+            crate::queries::custom_maps::upsert_map_curr_height(pool, DD2_MAP_UID, user_id, pos64, -1).await?;
+        }
+    }
     Ok(())
 }
 
@@ -607,59 +631,9 @@ pub struct PlayerAtHeight {
     pub dt: f32,
 }
 
+/// Global live heights for DD2 — same source as `/map/{DD2_UID}/live_heights`.
 pub async fn get_live_leaderboard(pool: &Pool<Postgres>) -> Result<Vec<PlayerAtHeight>, sqlx::Error> {
-    let r = query!(
-        r#"--sql
-        WITH recent_points AS (
-            SELECT * FROM vehicle_states
-            WHERE ts > NOW() - INTERVAL '180 seconds' AND is_official = true
-            ORDER BY ts DESC
-        ),
-        rankings AS (
-            SELECT *,
-                    ROW_NUMBER() OVER (PARTITION BY session_token ORDER BY ts DESC) AS rn
-            FROM recent_points
-        ),
-        rankings2 AS (
-            SELECT s.user_id, s.session_token, r.pos[2] as height, r.pos, r.vel, r.ts, r.rn, r.context_id,
-                    ROW_NUMBER() OVER (PARTITION BY s.user_id ORDER BY r.ts DESC) AS rn2
-            FROM rankings r
-            INNER JOIN sessions s ON s.session_token = r.session_token
-            WHERE r.rn = 1
-        ),
-        r_contexts AS (
-            SELECT r.*, c.flags, ROW_NUMBER() OVER (PARTITION BY r.user_id ORDER BY c.created_ts DESC) AS rn3
-            FROM rankings2 r
-            INNER JOIN contexts c ON r.context_id = c.context_id
-            AND r.rn2 = 1
-        )
-        SELECT u.display_name, r.user_id, r.height, r.pos, r.vel, r.ts, c.color as "color?" FROM r_contexts r
-        LEFT JOIN users u on r.user_id = u.web_services_user_id
-        LEFT JOIN shadow_bans sb ON r.user_id = sb.user_id
-        LEFT JOIN colors c on r.user_id = c.user_id
-        WHERE rn = 1 AND rn2 = 1 AND rn3 = 1 AND NOT (r.flags[6] OR r.flags[8] OR r.flags[10] OR r.flags[12])
-            AND sb.user_id IS NULL
-        ORDER BY height DESC;
-    "#
-    )
-    .fetch_all(pool)
-    .await?;
-    Ok(r.into_iter()
-        .enumerate()
-        .map(|(i, r)| PlayerAtHeight {
-            display_name: r.display_name,
-            user_id: r.user_id.map(|u| u.to_string()).unwrap_or_else(|| "? unknown ?".to_string()),
-            height: r.height.unwrap_or_default(),
-            ts: r.ts.and_utc().timestamp(),
-            rank: (i + 1) as i64,
-            color: r.color.and_then(vec_to_color),
-            pos: Some([r.pos[0], r.pos[1], r.pos[2]]),
-            vel: Some([r.vel[0], r.vel[1], r.vel[2]]),
-            afk_count: -1,
-            update_count: -1,
-            dt: -1.0,
-        })
-        .collect())
+    crate::queries::custom_maps::get_map_live_heights(pool, DD2_MAP_UID).await
 }
 
 pub async fn update_user_color(pool: &Pool<Postgres>, user_id: &Uuid, color: [f64; 3]) -> Result<(), sqlx::Error> {

@@ -10,8 +10,8 @@ use op_auth::check_token;
 use player::{parse_u64_str, LoginSession};
 use queries::{
     context_mark_succeeded, create_session, custom_maps::get_map_nb_playing_live, get_global_lb, get_global_overview, get_user_in_lb,
-    get_user_stats, insert_context_packed, insert_finish, insert_respawn, insert_start_fall, insert_vehicle_state, register_or_login,
-    resume_session, update_fall_with_end, update_server_stats, update_user_color, update_users_stats, user_settings, PBUpdateRes,
+    get_user_stats, insert_context_packed, insert_finish, insert_respawn, insert_start_fall, register_or_login, resume_session,
+    update_fall_with_end, update_server_stats, update_user_color, update_users_stats, user_settings, PBUpdateRes,
 };
 use router::{AssetRef, LeaderboardEntry2, Map, PlayerCtx, Request, Response, Stats, ToPlayerMgr};
 
@@ -540,7 +540,7 @@ impl XPlayer {
                     r
                 }
                 Request::ReportVehicleState { vel, pos, rotq } => {
-                    XPlayer::report_vehicle_state(&pool, session_token, ctx.as_ref(), ctx_id.as_ref(), pos, rotq, vel).await
+                    XPlayer::report_vehicle_state(&pool, session_token, user_id, ctx.as_ref(), ctx_id.as_ref(), pos, rotq, vel).await
                 }
                 Request::ReportRespawn { race_time } => XPlayer::report_respawn(&pool, session_token, race_time).await,
                 Request::ReportFinish { race_time } => XPlayer::report_finish(&pool, session_token, race_time).await,
@@ -1217,24 +1217,10 @@ impl XPlayer {
             warn!("Invalid map_uid: {:?} from {:?}", map_uid, user_id);
             Err("Invalid map_uid".to_string())?;
         }
-        let r = query!(
-            r#"--sql
-            INSERT INTO map_curr_heights (map_uid, user_id, height, pos, race_time) VALUES ($1, $2, $3, $4, $5)
-            ON CONFLICT (map_uid, user_id)
-            DO UPDATE SET height = $3, pos = $4, race_time = $5, updated_at = now(), update_count = map_curr_heights.update_count + 1
-            RETURNING height, update_count
-        "#,
-            &map_uid,
-            user_id,
-            pos[1],
-            &pos,
-            race_time as i32
-        )
-        .fetch_one(pool)
-        .await?;
+        queries::custom_maps::upsert_map_curr_height(pool, &map_uid, user_id, pos, race_time).await?;
 
         #[cfg(debug_assertions)]
-        info!("User {:?} reported map curr pos: {:?}", user_id, r);
+        info!("User {:?} reported map curr pos: {:?}", user_id, pos);
 
         // do insert and on conflict update if height is higher
 
@@ -1425,6 +1411,7 @@ impl XPlayer {
     pub async fn report_vehicle_state(
         pool: &Pool<Postgres>,
         sess: &Uuid,
+        user_id: &Uuid,
         ctx: Option<&PlayerCtx>,
         ctx_id: Option<&Uuid>,
         pos: [f32; 3],
@@ -1432,7 +1419,7 @@ impl XPlayer {
         vel: [f32; 3],
     ) -> Result<(), ApiError> {
         let is_official = ctx.map(|ctx| ctx.is_official()).unwrap_or(false);
-        Ok(insert_vehicle_state(pool, sess, ctx_id, is_official, pos, rotq, vel).await?)
+        Ok(queries::report_live_vehicle_state(pool, sess, user_id, ctx_id, is_official, pos, rotq, vel).await?)
     }
 
     pub async fn report_respawn(pool: &Pool<Postgres>, session_id: &Uuid, race_time: i64) -> Result<(), ApiError> {
