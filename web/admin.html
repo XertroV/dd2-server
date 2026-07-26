@@ -232,12 +232,13 @@
     <section id="map-card">
       <h2>Open Map</h2>
       <label for="map-uid">Map UID</label>
-      <div class="row">
+      <form id="map-form" class="row" onsubmit="event.preventDefault(); loadMap();">
         <div class="field">
-          <input id="map-uid" placeholder="27-char map UID" autocomplete="off" />
+          <input id="map-uid" list="map-uid-history" placeholder="27-char map UID" autocomplete="on" />
+          <datalist id="map-uid-history"></datalist>
         </div>
-        <button type="button" onclick="loadMap()">Load</button>
-      </div>
+        <button type="submit">Load</button>
+      </form>
       <p id="map-info" class="meta"></p>
       <p id="map-err" class="err"></p>
     </section>
@@ -325,6 +326,37 @@
       location.reload();
     }
 
+    const MAP_UID_HISTORY_KEY = 'dd2_mod_map_uid_history';
+    const MAP_UID_HISTORY_MAX = 30;
+
+    function readMapUidHistory() {
+      try {
+        const raw = localStorage.getItem(MAP_UID_HISTORY_KEY);
+        const list = raw ? JSON.parse(raw) : [];
+        return Array.isArray(list) ? list.filter(u => typeof u === 'string' && u.trim()) : [];
+      } catch (_) {
+        return [];
+      }
+    }
+
+    function writeMapUidHistory(uids) {
+      localStorage.setItem(MAP_UID_HISTORY_KEY, JSON.stringify(uids.slice(0, MAP_UID_HISTORY_MAX)));
+    }
+
+    function rememberMapUid(uid) {
+      const next = [uid, ...readMapUidHistory().filter(u => u !== uid)];
+      writeMapUidHistory(next);
+      renderMapUidHistory();
+    }
+
+    function renderMapUidHistory() {
+      const dl = document.getElementById('map-uid-history');
+      const uids = readMapUidHistory();
+      dl.innerHTML = uids.map(u => `<option value="${escapeHtml(u)}"></option>`).join('');
+      const input = document.getElementById('map-uid');
+      if (!input.value && uids[0]) input.value = uids[0];
+    }
+
     async function loadMap() {
       const uid = document.getElementById('map-uid').value.trim();
       document.getElementById('map-err').textContent = '';
@@ -333,6 +365,7 @@
       try {
         const data = await api('/api/mod/map/' + encodeURIComponent(uid));
         currentUid = uid;
+        rememberMapUid(uid);
         canModerate = data.can_moderate;
         canManageDelegates = data.is_author || data.is_super_mod;
         const m = data.meta;
@@ -479,6 +512,7 @@
     }
 
     document.getElementById('ban-expires-tz').textContent = localTzLabel();
+    renderMapUidHistory();
     refreshMe();
   </script>
 </body>
