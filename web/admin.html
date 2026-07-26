@@ -4,131 +4,282 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Dips++ Map Moderation</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/geist@1.3.1/dist/fonts/geist-mono/style.css" />
   <style>
     :root {
-      --bg: #0b0f19;
-      --card: #141a28;
-      --text: #f3f4f6;
-      --muted: #9ca3af;
-      --accent: #6366f1;
-      --danger: #ef4444;
-      --ok: #22c55e;
-      --border: #1f2937;
+      --bg: #0e0e0e;
+      --panel: #161616;
+      --fg: #e8e8e8;
+      --muted: #8b8b8b;
+      --line: #1a1a1a;
+      --edge: #2c2c2c;
+      --warn: #b89a5a;
+      --err: #b86a6a;
+      --ok: #6f9a72;
+      --accent: #7a8f9e;
+      --accent-2: #8a7e92;
+      --accent-3: #9a8568;
     }
     * { box-sizing: border-box; }
+    html, body { margin: 0; min-height: 100%; }
     body {
-      margin: 0; font-family: "Segoe UI", system-ui, sans-serif;
-      background: var(--bg); color: var(--text);
-      min-height: 100vh;
+      font-family: "Geist Mono", ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+      font-size: 13px;
+      line-height: 1.55;
+      background: var(--bg);
+      color: var(--fg);
+      letter-spacing: -0.01em;
     }
-    .wrap { max-width: 900px; margin: 0 auto; padding: 2rem 1.25rem; }
-    h1 { font-size: 1.6rem; margin: 0 0 .25rem; }
-    .sub { color: var(--muted); margin-bottom: 1.5rem; }
-    .card {
-      background: var(--card); border: 1px solid var(--border);
-      border-radius: 16px; padding: 1.25rem; margin-bottom: 1rem;
+    .wrap {
+      max-width: 740px;
+      margin: 0 auto;
+      padding: 2.5rem 1.25rem 4rem;
     }
-    label { display: block; font-size: .85rem; color: var(--muted); margin: .6rem 0 .25rem; }
-    input, textarea, button, select {
-      font: inherit; border-radius: 8px; border: 1px solid var(--border);
-      background: #0b0f19; color: var(--text); padding: .55rem .7rem; width: 100%;
+    h1 {
+      font-size: 14px;
+      font-weight: 500;
+      margin: 0 0 0.2rem;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
     }
-    textarea { min-height: 70px; resize: vertical; }
-    button {
-      cursor: pointer; background: linear-gradient(135deg, #6366f1, #a855f7);
-      border: none; font-weight: 600; margin-top: .75rem;
+    h2 {
+      font-size: 11px;
+      font-weight: 500;
+      margin: 0 0 1rem;
+      text-transform: uppercase;
+      letter-spacing: 0.1em;
+      color: var(--muted);
     }
-    button.secondary { background: #1f2937; }
-    button.danger { background: var(--danger); }
-    .row { display: flex; gap: .75rem; flex-wrap: wrap; }
-    .row > * { flex: 1 1 180px; }
-    .pill {
-      display: inline-block; padding: .15rem .55rem; border-radius: 999px;
-      background: #1f2937; font-size: .75rem; margin-right: .35rem;
+    .sub { color: var(--muted); margin: 0 0 2rem; }
+    header {
+      margin-bottom: 1.1rem;
+      padding: 1rem 1.1rem;
+      background: var(--panel);
+      border: 2px solid var(--edge);
+      box-shadow: 4px 4px 0 var(--accent);
     }
-    .pill.ok { background: #14532d; }
-    .pill.warn { background: #7c2d12; }
-    table { width: 100%; border-collapse: collapse; font-size: .9rem; }
-    th, td { text-align: left; padding: .45rem .3rem; border-bottom: 1px solid var(--border); vertical-align: top; }
-    .err { color: var(--danger); white-space: pre-wrap; }
-    .okmsg { color: var(--ok); }
-    a { color: #a5b4fc; }
-    .hidden { display: none; }
+    section {
+      background: var(--panel);
+      border: 2px solid var(--edge);
+      padding: 1.2rem 1.1rem 1.35rem;
+      margin: 0 0 1.15rem;
+      box-shadow: 4px 4px 0 var(--accent-2);
+    }
+    #map-card { box-shadow: 4px 4px 0 var(--accent-3); }
+    #ban-card { box-shadow: 4px 4px 0 var(--err); }
+    #delegate-card { box-shadow: 4px 4px 0 var(--ok); }
+    label {
+      display: block;
+      color: var(--muted);
+      font-size: 11px;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      margin: 0.85rem 0 0.4rem;
+    }
+    input, textarea {
+      font: inherit;
+      color: var(--fg);
+      background: #101010;
+      border: 2px solid var(--edge);
+      border-radius: 0;
+      padding: 0.55rem 0.65rem;
+      width: 100%;
+      outline: none;
+      box-shadow: 3px 3px 0 var(--accent);
+      color-scheme: dark;
+    }
+    input:focus, textarea:focus {
+      border-color: #555;
+      box-shadow: 3px 3px 0 var(--warn);
+    }
+    textarea { min-height: 4.5rem; resize: vertical; }
+    button, .act {
+      font: inherit;
+      color: var(--fg);
+      background: #101010;
+      border: 2px solid var(--edge);
+      border-radius: 0;
+      padding: 0.45rem 0.75rem;
+      margin: 0.85rem 0.55rem 0 0;
+      cursor: pointer;
+      width: auto;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      font-size: 11px;
+      box-shadow: 3px 3px 0 var(--accent-2);
+      flex: 0 0 auto;
+    }
+    button:hover, .act:hover {
+      transform: translate(1px, 1px);
+      box-shadow: 2px 2px 0 var(--accent-2);
+      border-color: #444;
+    }
+    button:active, .act:active {
+      transform: translate(3px, 3px);
+      box-shadow: 0 0 0 var(--accent-2);
+    }
+    button:focus-visible, .act:focus-visible, input:focus-visible, textarea:focus-visible {
+      outline: 1px solid var(--warn);
+      outline-offset: 2px;
+    }
+    button.danger {
+      box-shadow: 3px 3px 0 var(--err);
+    }
+    button.danger:hover { box-shadow: 2px 2px 0 var(--err); }
+    button.danger:active { box-shadow: 0 0 0 var(--err); }
+    .row { display: flex; gap: 1rem; flex-wrap: wrap; align-items: flex-end; }
+    .row > *:not(button) { flex: 1 1 200px; min-width: 0; }
+    .row.actions { align-items: center; }
+    .field { min-width: 0; }
+    .tag {
+      display: inline;
+      color: var(--muted);
+      font-size: 11px;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+    }
+    .tag::before { content: "["; }
+    .tag::after { content: "]"; }
+    .tag.ok { color: var(--ok); }
+    .tag.warn { color: var(--warn); }
+    .entry {
+      border: 2px solid var(--edge);
+      padding: 0.85rem 0.9rem;
+      margin: 0 0 0.85rem;
+      background: #101010;
+      box-shadow: 3px 3px 0 var(--accent-2);
+    }
+    .entry-grid {
+      display: grid;
+      grid-template-columns: 5.5rem 1fr;
+      gap: 0.35rem 0.75rem;
+      align-items: start;
+    }
+    .entry-grid .k {
+      color: var(--muted);
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      padding-top: 0.1rem;
+    }
+    .entry-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.5rem;
+      margin-top: 0.85rem;
+      padding-top: 0.75rem;
+      border-top: 1px solid var(--edge);
+    }
+    .entry-actions button { margin: 0; }
+    .expires-lines { display: flex; flex-direction: column; gap: 0.15rem; }
+    table { width: 100%; border-collapse: collapse; margin: 0.5rem 0 1rem; }
+    th, td {
+      text-align: left;
+      padding: 0.55rem 0.4rem 0.55rem 0;
+      border-bottom: 1px solid var(--edge);
+      vertical-align: top;
+      font-weight: 400;
+    }
+    th {
+      color: var(--muted);
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+    }
+    code {
+      font: inherit;
+      color: var(--muted);
+      overflow-wrap: anywhere;
+      word-break: normal;
+    }
+    code.wsid { font-size: 12px; }
+    a { color: var(--accent); text-decoration: underline; text-underline-offset: 3px; }
+    .err { color: var(--err); white-space: pre-wrap; margin: 0.5rem 0 0; }
+    .okmsg { color: var(--ok); margin: 0.5rem 0 0; }
+    .hidden { display: none !important; }
+    .meta { margin: 1rem 0 0; color: var(--muted); }
+    .identity { margin: 0 0 0.75rem; }
+    @media (prefers-reduced-motion: reduce) {
+      button:hover, .act:hover, button:active, .act:active { transform: none; }
+    }
   </style>
 </head>
 <body>
   <div class="wrap">
-    <h1>Dips++ Map Moderation</h1>
-    <p class="sub">Map Ban · Delegates · Trackmania OAuth</p>
+    <header>
+      <h1>Dips++ Map Moderation</h1>
+      <p class="sub">Map Ban · Delegates · Trackmania OAuth</p>
+    </header>
 
-    <div class="card" id="auth-card">
+    <section id="auth-card">
       <div id="logged-out">
-        <p>Sign in with your Trackmania account to moderate Maps you author (or as Super-mod / Delegate).</p>
-        <button onclick="location.href='/api/mod/oauth/start'">Login with Trackmania</button>
+        <p class="sub" style="margin-bottom:0.75rem">Sign in with Trackmania to moderate Maps you author, or as Super-mod / Delegate.</p>
+        <button type="button" onclick="location.href='/api/mod/oauth/start'">Login with Trackmania</button>
       </div>
       <div id="logged-in" class="hidden">
-        <p>Signed in as <strong id="me-name"></strong>
-          <span class="pill" id="me-role"></span>
+        <p class="identity">
+          Signed in as <strong id="me-name"></strong>
+          <span class="tag" id="me-role"></span>
         </p>
-        <code id="me-wsid" style="color:var(--muted);font-size:.8rem"></code>
-        <div class="row">
-          <button class="secondary" onclick="logout()">Logout</button>
+        <code id="me-wsid"></code>
+        <div class="row actions">
+          <button type="button" onclick="logout()">Logout</button>
         </div>
       </div>
-    </div>
+    </section>
 
-    <div class="card" id="map-card">
-      <h2 style="margin-top:0;font-size:1.1rem">Open Map</h2>
-      <label>Map UID</label>
+    <section id="map-card">
+      <h2>Open Map</h2>
+      <label for="map-uid">Map UID</label>
       <div class="row">
-        <input id="map-uid" placeholder="27-char map UID" />
-        <button onclick="loadMap()">Load</button>
+        <input id="map-uid" placeholder="27-char map UID" autocomplete="off" />
+        <button type="button" onclick="loadMap()">Load</button>
       </div>
-      <p id="map-info" class="sub"></p>
+      <p id="map-info" class="meta"></p>
       <p id="map-err" class="err"></p>
-    </div>
+    </section>
 
-    <div class="card hidden" id="ban-card">
-      <h2 style="margin-top:0;font-size:1.1rem">Map Bans</h2>
+    <section class="hidden" id="ban-card">
+      <h2>Map Bans</h2>
       <div id="ban-list"></div>
-      <hr style="border-color:var(--border);margin:1rem 0" />
-      <h3 style="font-size:1rem">Apply Map Ban</h3>
+      <h2 style="margin-top:1.75rem">Apply Map Ban</h2>
       <div class="row">
-        <div>
-          <label>Display name</label>
-          <input id="ban-name" placeholder="player name" />
+        <div class="field">
+          <label for="ban-name">Display name</label>
+          <input id="ban-name" placeholder="player name" autocomplete="off" />
         </div>
-        <div>
-          <label>or WSID</label>
-          <input id="ban-wsid" placeholder="uuid" />
+        <div class="field">
+          <label for="ban-wsid">or WSID</label>
+          <input id="ban-wsid" placeholder="uuid" autocomplete="off" />
         </div>
       </div>
-      <label>Private reason (mods only)</label>
+      <label for="ban-private">Private reason (mods only)</label>
       <textarea id="ban-private"></textarea>
-      <label>Public message (shown to player)</label>
+      <label for="ban-public">Public message (shown to player)</label>
       <textarea id="ban-public"></textarea>
-      <label>Expires at (optional, ISO-8601)</label>
-      <input id="ban-expires" placeholder="2026-08-01T00:00:00Z" />
-      <button class="danger" onclick="createBan()">Ban from this Map's LB</button>
+      <label for="ban-expires">Expires at <span class="sub" style="margin:0;text-transform:none;letter-spacing:0">(optional · <span id="ban-expires-tz">local time</span>)</span></label>
+      <input id="ban-expires" type="datetime-local" />
+      <p class="sub" style="margin:0.4rem 0 0;font-size:11px">Interpreted in your browser timezone; stored and enforced as UTC.</p>
+      <button type="button" class="danger" onclick="createBan()">Ban from this Map's LB</button>
       <p id="ban-msg"></p>
-    </div>
+    </section>
 
-    <div class="card hidden" id="delegate-card">
-      <h2 style="margin-top:0;font-size:1.1rem">Map Delegates</h2>
+    <section class="hidden" id="delegate-card">
+      <h2>Map Delegates</h2>
       <div id="delegate-list"></div>
-      <div class="row" style="margin-top:.75rem">
-        <div>
-          <label>Display name</label>
-          <input id="del-name" />
+      <div class="row" style="margin-top:1rem">
+        <div class="field">
+          <label for="del-name">Display name</label>
+          <input id="del-name" autocomplete="off" />
         </div>
-        <div>
-          <label>or WSID</label>
-          <input id="del-wsid" />
+        <div class="field">
+          <label for="del-wsid">or WSID</label>
+          <input id="del-wsid" autocomplete="off" />
         </div>
       </div>
-      <button onclick="addDelegate()">Add Delegate</button>
+      <button type="button" onclick="addDelegate()">Add Delegate</button>
       <p id="del-msg"></p>
-    </div>
+    </section>
   </div>
 
   <script>
@@ -158,7 +309,7 @@
         document.getElementById('me-name').textContent = me.display_name;
         document.getElementById('me-wsid').textContent = me.wsid;
         document.getElementById('me-role').textContent = me.is_super_mod ? 'Super-mod' : 'Player';
-        document.getElementById('me-role').className = 'pill ' + (me.is_super_mod ? 'ok' : '');
+        document.getElementById('me-role').className = 'tag' + (me.is_super_mod ? ' ok' : '');
       } catch (_) {
         me = null;
         document.getElementById('logged-out').classList.remove('hidden');
@@ -183,11 +334,11 @@
         canManageDelegates = data.is_author || data.is_super_mod;
         const m = data.meta;
         document.getElementById('map-info').innerHTML =
-          `<span class="pill">${escapeHtml(m.map_name || '(unnamed)')}</span>` +
+          `<span class="tag">${escapeHtml(m.map_name || 'unnamed')}</span>` +
           ` author <code>${m.author_id}</code>` +
-          (data.is_author ? ' <span class="pill ok">You are Map Author</span>' : '') +
-          (data.is_delegate ? ' <span class="pill ok">Delegate</span>' : '') +
-          (data.can_moderate ? '' : ' <span class="pill warn">No mod rights</span>');
+          (data.is_author ? ' <span class="tag ok">Map Author</span>' : '') +
+          (data.is_delegate ? ' <span class="tag ok">Delegate</span>' : '') +
+          (data.can_moderate ? '' : ' <span class="tag warn">No mod rights</span>');
         document.getElementById('ban-card').classList.toggle('hidden', !canModerate);
         document.getElementById('delegate-card').classList.toggle('hidden', !canModerate);
         if (canModerate) {
@@ -205,31 +356,39 @@
       const bans = await api('/api/mod/map/' + encodeURIComponent(currentUid) + '/bans');
       const el = document.getElementById('ban-list');
       if (!bans.length) { el.innerHTML = '<p class="sub">No active Map Bans.</p>'; return; }
-      el.innerHTML = '<table><tr><th>User</th><th>Public</th><th>Private</th><th>Expires</th><th></th></tr>' +
-        bans.map(b => `<tr>
-          <td><code>${b.user_id}</code></td>
-          <td>${escapeHtml(b.public_message)}</td>
-          <td>${escapeHtml(b.private_reason)}</td>
-          <td>${b.expires_at || '—'}</td>
-          <td>
-            <button class="secondary" onclick="liftBan('${b.user_id}', true)">Unban (keep unofficial)</button>
-            <button class="secondary" onclick="liftBan('${b.user_id}', false)">Unban (clear unofficial)</button>
-          </td>
-        </tr>`).join('') + '</table>';
+      el.innerHTML = bans.map(b => `<div class="entry">
+        <div class="entry-grid">
+          <div class="k">User</div><div><code class="wsid">${b.user_id}</code></div>
+          <div class="k">Public</div><div>${escapeHtml(b.public_message)}</div>
+          <div class="k">Private</div><div>${escapeHtml(b.private_reason)}</div>
+          <div class="k">Expires</div><div class="expires-lines">${formatExpires(b.expires_at)}</div>
+        </div>
+        <div class="entry-actions">
+          <button type="button" onclick="liftBan('${b.user_id}', true)">Unban · keep unofficial</button>
+          <button type="button" onclick="liftBan('${b.user_id}', false)">Unban · clear unofficial</button>
+        </div>
+      </div>`).join('');
     }
 
     async function createBan() {
       const msg = document.getElementById('ban-msg');
       msg.textContent = '';
       msg.className = '';
-      const body = {
-        display_name: document.getElementById('ban-name').value.trim() || null,
-        user_id: document.getElementById('ban-wsid').value.trim() || null,
-        private_reason: document.getElementById('ban-private').value,
-        public_message: document.getElementById('ban-public').value,
-        expires_at: document.getElementById('ban-expires').value.trim() || null,
-      };
       try {
+        const expiresRaw = document.getElementById('ban-expires').value.trim();
+        let expires_at = null;
+        if (expiresRaw) {
+          const d = new Date(expiresRaw);
+          if (Number.isNaN(d.getTime())) throw new Error('invalid expires_at');
+          expires_at = d.toISOString();
+        }
+        const body = {
+          display_name: document.getElementById('ban-name').value.trim() || null,
+          user_id: document.getElementById('ban-wsid').value.trim() || null,
+          private_reason: document.getElementById('ban-private').value,
+          public_message: document.getElementById('ban-public').value,
+          expires_at,
+        };
         await api('/api/mod/map/' + encodeURIComponent(currentUid) + '/bans', {
           method: 'POST', body: JSON.stringify(body),
         });
@@ -253,12 +412,15 @@
       const dels = await api('/api/mod/map/' + encodeURIComponent(currentUid) + '/delegates');
       const el = document.getElementById('delegate-list');
       if (!dels.length) { el.innerHTML = '<p class="sub">No Delegates.</p>'; return; }
-      el.innerHTML = '<table><tr><th>Name</th><th>WSID</th><th></th></tr>' +
-        dels.map(d => `<tr>
-          <td>${escapeHtml(d.display_name || '')}</td>
-          <td><code>${d.user_id}</code></td>
-          <td>${canManageDelegates ? `<button class="danger" onclick="removeDelegate('${d.user_id}')">Remove</button>` : ''}</td>
-        </tr>`).join('') + '</table>';
+      el.innerHTML = dels.map(d => `<div class="entry">
+        <div class="entry-grid">
+          <div class="k">Name</div><div>${escapeHtml(d.display_name || '')}</div>
+          <div class="k">WSID</div><div><code class="wsid">${d.user_id}</code></div>
+        </div>
+        ${canManageDelegates ? `<div class="entry-actions">
+          <button type="button" class="danger" onclick="removeDelegate('${d.user_id}')">Remove</button>
+        </div>` : ''}
+      </div>`).join('');
     }
 
     async function addDelegate() {
@@ -290,6 +452,30 @@
       return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
     }
 
+    function localTzLabel() {
+      try {
+        const tz = Intl.DateTimeFormat().resolvedOptions().timeZone || 'local';
+        const parts = new Intl.DateTimeFormat('en-AU', { timeZoneName: 'short' }).formatToParts(new Date());
+        const short = parts.find(p => p.type === 'timeZoneName')?.value || '';
+        return short ? `${tz} · ${short}` : tz;
+      } catch (_) {
+        return 'local time';
+      }
+    }
+
+    function formatExpires(iso) {
+      if (!iso) return '—';
+      const d = new Date(iso);
+      if (Number.isNaN(d.getTime())) return escapeHtml(String(iso));
+      const local = d.toLocaleString('en-AU', {
+        year: 'numeric', month: 'short', day: 'numeric',
+        hour: '2-digit', minute: '2-digit', timeZoneName: 'short',
+      });
+      const utc = d.toISOString().replace('T', ' ').replace(/\.\d{3}Z$/, ' UTC');
+      return `<span>${escapeHtml(local)}</span><span>${escapeHtml(utc)}</span>`;
+    }
+
+    document.getElementById('ban-expires-tz').textContent = localTzLabel();
     refreshMe();
   </script>
 </body>
