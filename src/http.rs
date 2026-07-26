@@ -20,6 +20,11 @@ use warp::{
 };
 
 use crate::queries::{api, log_ml_ping};
+use crate::{
+    moderation_http::{self, ModerationState},
+    nadeo::NadeoLiveClient,
+    tm_oauth::TmOauthConfig,
+};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -131,6 +136,13 @@ pub async fn run_http_server(
             "/map/<uid>/leaderboard/len",
             "/map/<uid>/leaderboard/<page>",
             "/map/<uid>/live_heights",
+            "/admin",
+            "/api/mod/oauth/start",
+            "/api/mod/oauth/callback",
+            "/api/mod/me",
+            "/api/mod/map/<uid>",
+            "/api/mod/map/<uid>/bans",
+            "/api/mod/map/<uid>/delegates",
         ];
         "Routes: ".to_owned() + &routes.join(", ")
     });
@@ -266,6 +278,13 @@ pub async fn run_http_server(
         );
     let req_pool = pool.clone();
 
+    let mod_state = ModerationState {
+        pool: req_pool,
+        nadeo: NadeoLiveClient::from_env(),
+        oauth: TmOauthConfig::from_env(),
+    };
+    let mod_routes = moderation_http::routes(mod_state);
+
     // info!("Enabling route: get /mlping_intro");
     // let ping_path = warp::path!("mlping_intro")
     //     .and(warp::path::end())
@@ -305,6 +324,7 @@ pub async fn run_http_server(
         .or(get_map_uid_leaderboard_len)
         .or(get_map_uid_leaderboard_page)
         .or(get_map_uid_live_heights)
+        .or(mod_routes)
         .with(warp::log("dips++"));
 
     info!("Starting HTTP server: {}", soc_addr.to_string());

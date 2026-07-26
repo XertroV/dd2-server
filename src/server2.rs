@@ -55,10 +55,13 @@ mod consts;
 mod db;
 mod donations;
 mod http;
+mod moderation_http;
+mod nadeo;
 mod op_auth;
 mod player;
 mod queries;
 mod router;
+mod tm_oauth;
 
 const MAX_CONNECTIONS: u32 = 4096;
 const MIN_PLUGIN_VERSION: [u32; 3] = [0, 4, 15];
@@ -1111,6 +1114,8 @@ impl XPlayer {
         map_uid: &str,
         user_id: &Uuid,
     ) -> Result<Option<LeaderboardEntry2>, api_error::Error> {
+        // Include the requesting user even if Map-Banned so they still see their Standing;
+        // public LB queries exclude Map Bans. Shadowbans remain filtered.
         let resp = query!(
             r#"--sql
             WITH lb AS (
@@ -1119,7 +1124,11 @@ impl XPlayer {
                 LEFT JOIN users u ON u.web_services_user_id = m.user_id
                 LEFT JOIN colors c ON c.user_id = m.user_id
                 LEFT JOIN shadow_bans AS sb ON m.user_id = sb.user_id
+                LEFT JOIN map_bans mb ON m.user_id = mb.user_id AND mb.map_uid = m.map_uid
+                    AND mb.lifted_at IS NULL
+                    AND (mb.expires_at IS NULL OR mb.expires_at > NOW())
                 WHERE m.map_uid = $1 AND sb.user_id IS NULL
+                  AND (mb.user_id IS NULL OR m.user_id = $2)
             )
             SELECT * FROM lb WHERE user_id = $2
         "#,
@@ -1148,7 +1157,14 @@ impl XPlayer {
         queue_tx: &UnboundedSender<Response>,
     ) -> Result<(), api_error::Error> {
         let r = XPlayer::get_map_rank_query(pool, &map_uid, user_id).await?;
-        queue_tx.send(Response::MapRank { uid: map_uid, r })?;
+        let status = queries::moderation::get_ban_status(pool, &map_uid, user_id).await?;
+        queue_tx.send(Response::MapRank {
+            uid: map_uid,
+            r,
+            banned: status.banned,
+            ban_public_message: status.public_message,
+            unofficial: status.unofficial,
+        })?;
         Ok(())
     }
 
@@ -1159,7 +1175,12 @@ impl XPlayer {
     ) -> Result<(), api_error::Error> {
         let nb_players_on_lb: u32 = query!(
             r#"--sql
-            SELECT COUNT(*) FROM map_leaderboard WHERE map_uid = $1
+            SELECT COUNT(*) FROM map_leaderboard m
+            LEFT JOIN shadow_bans sb ON m.user_id = sb.user_id
+            LEFT JOIN map_bans mb ON m.user_id = mb.user_id AND mb.map_uid = m.map_uid
+                AND mb.lifted_at IS NULL
+                AND (mb.expires_at IS NULL OR mb.expires_at > NOW())
+            WHERE m.map_uid = $1 AND sb.user_id IS NULL AND mb.user_id IS NULL
         "#,
             &map_uid
         )

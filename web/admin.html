@@ -1,0 +1,296 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Dips++ Map Moderation</title>
+  <style>
+    :root {
+      --bg: #0b0f19;
+      --card: #141a28;
+      --text: #f3f4f6;
+      --muted: #9ca3af;
+      --accent: #6366f1;
+      --danger: #ef4444;
+      --ok: #22c55e;
+      --border: #1f2937;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; font-family: "Segoe UI", system-ui, sans-serif;
+      background: var(--bg); color: var(--text);
+      min-height: 100vh;
+    }
+    .wrap { max-width: 900px; margin: 0 auto; padding: 2rem 1.25rem; }
+    h1 { font-size: 1.6rem; margin: 0 0 .25rem; }
+    .sub { color: var(--muted); margin-bottom: 1.5rem; }
+    .card {
+      background: var(--card); border: 1px solid var(--border);
+      border-radius: 16px; padding: 1.25rem; margin-bottom: 1rem;
+    }
+    label { display: block; font-size: .85rem; color: var(--muted); margin: .6rem 0 .25rem; }
+    input, textarea, button, select {
+      font: inherit; border-radius: 8px; border: 1px solid var(--border);
+      background: #0b0f19; color: var(--text); padding: .55rem .7rem; width: 100%;
+    }
+    textarea { min-height: 70px; resize: vertical; }
+    button {
+      cursor: pointer; background: linear-gradient(135deg, #6366f1, #a855f7);
+      border: none; font-weight: 600; margin-top: .75rem;
+    }
+    button.secondary { background: #1f2937; }
+    button.danger { background: var(--danger); }
+    .row { display: flex; gap: .75rem; flex-wrap: wrap; }
+    .row > * { flex: 1 1 180px; }
+    .pill {
+      display: inline-block; padding: .15rem .55rem; border-radius: 999px;
+      background: #1f2937; font-size: .75rem; margin-right: .35rem;
+    }
+    .pill.ok { background: #14532d; }
+    .pill.warn { background: #7c2d12; }
+    table { width: 100%; border-collapse: collapse; font-size: .9rem; }
+    th, td { text-align: left; padding: .45rem .3rem; border-bottom: 1px solid var(--border); vertical-align: top; }
+    .err { color: var(--danger); white-space: pre-wrap; }
+    .okmsg { color: var(--ok); }
+    a { color: #a5b4fc; }
+    .hidden { display: none; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>Dips++ Map Moderation</h1>
+    <p class="sub">Map Ban · Delegates · Trackmania OAuth</p>
+
+    <div class="card" id="auth-card">
+      <div id="logged-out">
+        <p>Sign in with your Trackmania account to moderate Maps you author (or as Super-mod / Delegate).</p>
+        <button onclick="location.href='/api/mod/oauth/start'">Login with Trackmania</button>
+      </div>
+      <div id="logged-in" class="hidden">
+        <p>Signed in as <strong id="me-name"></strong>
+          <span class="pill" id="me-role"></span>
+        </p>
+        <code id="me-wsid" style="color:var(--muted);font-size:.8rem"></code>
+        <div class="row">
+          <button class="secondary" onclick="logout()">Logout</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="card" id="map-card">
+      <h2 style="margin-top:0;font-size:1.1rem">Open Map</h2>
+      <label>Map UID</label>
+      <div class="row">
+        <input id="map-uid" placeholder="27-char map UID" />
+        <button onclick="loadMap()">Load</button>
+      </div>
+      <p id="map-info" class="sub"></p>
+      <p id="map-err" class="err"></p>
+    </div>
+
+    <div class="card hidden" id="ban-card">
+      <h2 style="margin-top:0;font-size:1.1rem">Map Bans</h2>
+      <div id="ban-list"></div>
+      <hr style="border-color:var(--border);margin:1rem 0" />
+      <h3 style="font-size:1rem">Apply Map Ban</h3>
+      <div class="row">
+        <div>
+          <label>Display name</label>
+          <input id="ban-name" placeholder="player name" />
+        </div>
+        <div>
+          <label>or WSID</label>
+          <input id="ban-wsid" placeholder="uuid" />
+        </div>
+      </div>
+      <label>Private reason (mods only)</label>
+      <textarea id="ban-private"></textarea>
+      <label>Public message (shown to player)</label>
+      <textarea id="ban-public"></textarea>
+      <label>Expires at (optional, ISO-8601)</label>
+      <input id="ban-expires" placeholder="2026-08-01T00:00:00Z" />
+      <button class="danger" onclick="createBan()">Ban from this Map's LB</button>
+      <p id="ban-msg"></p>
+    </div>
+
+    <div class="card hidden" id="delegate-card">
+      <h2 style="margin-top:0;font-size:1.1rem">Map Delegates</h2>
+      <div id="delegate-list"></div>
+      <div class="row" style="margin-top:.75rem">
+        <div>
+          <label>Display name</label>
+          <input id="del-name" />
+        </div>
+        <div>
+          <label>or WSID</label>
+          <input id="del-wsid" />
+        </div>
+      </div>
+      <button onclick="addDelegate()">Add Delegate</button>
+      <p id="del-msg"></p>
+    </div>
+  </div>
+
+  <script>
+    let me = null;
+    let currentUid = null;
+    let canModerate = false;
+    let canManageDelegates = false;
+
+    async function api(path, opts = {}) {
+      const res = await fetch(path, {
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json', ...(opts.headers || {}) },
+        ...opts,
+      });
+      const text = await res.text();
+      let data = null;
+      try { data = JSON.parse(text); } catch (_) { data = { raw: text }; }
+      if (!res.ok) throw new Error(data.error || text || res.statusText);
+      return data;
+    }
+
+    async function refreshMe() {
+      try {
+        me = await api('/api/mod/me');
+        document.getElementById('logged-out').classList.add('hidden');
+        document.getElementById('logged-in').classList.remove('hidden');
+        document.getElementById('me-name').textContent = me.display_name;
+        document.getElementById('me-wsid').textContent = me.wsid;
+        document.getElementById('me-role').textContent = me.is_super_mod ? 'Super-mod' : 'Player';
+        document.getElementById('me-role').className = 'pill ' + (me.is_super_mod ? 'ok' : '');
+      } catch (_) {
+        me = null;
+        document.getElementById('logged-out').classList.remove('hidden');
+        document.getElementById('logged-in').classList.add('hidden');
+      }
+    }
+
+    async function logout() {
+      await api('/api/mod/logout', { method: 'POST', body: '{}' });
+      location.reload();
+    }
+
+    async function loadMap() {
+      const uid = document.getElementById('map-uid').value.trim();
+      document.getElementById('map-err').textContent = '';
+      document.getElementById('map-info').textContent = '';
+      if (!uid) return;
+      try {
+        const data = await api('/api/mod/map/' + encodeURIComponent(uid));
+        currentUid = uid;
+        canModerate = data.can_moderate;
+        canManageDelegates = data.is_author || data.is_super_mod;
+        const m = data.meta;
+        document.getElementById('map-info').innerHTML =
+          `<span class="pill">${m.map_name || '(unnamed)'}</span>` +
+          ` author <code>${m.author_id}</code>` +
+          (data.is_author ? ' <span class="pill ok">You are Map Author</span>' : '') +
+          (data.is_delegate ? ' <span class="pill ok">Delegate</span>' : '') +
+          (data.can_moderate ? '' : ' <span class="pill warn">No mod rights</span>');
+        document.getElementById('ban-card').classList.toggle('hidden', !canModerate);
+        document.getElementById('delegate-card').classList.toggle('hidden', !canModerate);
+        if (canModerate) {
+          await refreshBans();
+          await refreshDelegates();
+        }
+      } catch (e) {
+        document.getElementById('map-err').textContent = e.message;
+        document.getElementById('ban-card').classList.add('hidden');
+        document.getElementById('delegate-card').classList.add('hidden');
+      }
+    }
+
+    async function refreshBans() {
+      const bans = await api('/api/mod/map/' + encodeURIComponent(currentUid) + '/bans');
+      const el = document.getElementById('ban-list');
+      if (!bans.length) { el.innerHTML = '<p class="sub">No active Map Bans.</p>'; return; }
+      el.innerHTML = '<table><tr><th>User</th><th>Public</th><th>Private</th><th>Expires</th><th></th></tr>' +
+        bans.map(b => `<tr>
+          <td><code>${b.user_id}</code></td>
+          <td>${escapeHtml(b.public_message)}</td>
+          <td>${escapeHtml(b.private_reason)}</td>
+          <td>${b.expires_at || '—'}</td>
+          <td>
+            <button class="secondary" onclick="liftBan('${b.user_id}', true)">Unban (keep unofficial)</button>
+            <button class="secondary" onclick="liftBan('${b.user_id}', false)">Unban (clear unofficial)</button>
+          </td>
+        </tr>`).join('') + '</table>';
+    }
+
+    async function createBan() {
+      const msg = document.getElementById('ban-msg');
+      msg.textContent = '';
+      msg.className = '';
+      const body = {
+        display_name: document.getElementById('ban-name').value.trim() || null,
+        user_id: document.getElementById('ban-wsid').value.trim() || null,
+        private_reason: document.getElementById('ban-private').value,
+        public_message: document.getElementById('ban-public').value,
+        expires_at: document.getElementById('ban-expires').value.trim() || null,
+      };
+      try {
+        await api('/api/mod/map/' + encodeURIComponent(currentUid) + '/bans', {
+          method: 'POST', body: JSON.stringify(body),
+        });
+        msg.textContent = 'Map Ban applied.';
+        msg.className = 'okmsg';
+        await refreshBans();
+      } catch (e) {
+        msg.textContent = e.message;
+        msg.className = 'err';
+      }
+    }
+
+    async function liftBan(userId, keep) {
+      await api('/api/mod/map/' + encodeURIComponent(currentUid) + '/bans/' + userId + '/lift', {
+        method: 'POST', body: JSON.stringify({ keep_unofficial: keep }),
+      });
+      await refreshBans();
+    }
+
+    async function refreshDelegates() {
+      const dels = await api('/api/mod/map/' + encodeURIComponent(currentUid) + '/delegates');
+      const el = document.getElementById('delegate-list');
+      if (!dels.length) { el.innerHTML = '<p class="sub">No Delegates.</p>'; return; }
+      el.innerHTML = '<table><tr><th>Name</th><th>WSID</th><th></th></tr>' +
+        dels.map(d => `<tr>
+          <td>${escapeHtml(d.display_name || '')}</td>
+          <td><code>${d.user_id}</code></td>
+          <td>${canManageDelegates ? `<button class="danger" onclick="removeDelegate('${d.user_id}')">Remove</button>` : ''}</td>
+        </tr>`).join('') + '</table>';
+    }
+
+    async function addDelegate() {
+      const msg = document.getElementById('del-msg');
+      msg.textContent = '';
+      try {
+        await api('/api/mod/map/' + encodeURIComponent(currentUid) + '/delegates', {
+          method: 'POST',
+          body: JSON.stringify({
+            display_name: document.getElementById('del-name').value.trim() || null,
+            user_id: document.getElementById('del-wsid').value.trim() || null,
+          }),
+        });
+        msg.textContent = 'Delegate added.';
+        msg.className = 'okmsg';
+        await refreshDelegates();
+      } catch (e) {
+        msg.textContent = e.message;
+        msg.className = 'err';
+      }
+    }
+
+    async function removeDelegate(userId) {
+      await api('/api/mod/map/' + encodeURIComponent(currentUid) + '/delegates/' + userId, { method: 'DELETE' });
+      await refreshDelegates();
+    }
+
+    function escapeHtml(s) {
+      return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+    }
+
+    refreshMe();
+  </script>
+</body>
+</html>

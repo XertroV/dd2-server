@@ -27,10 +27,13 @@ mod consts;
 mod db;
 mod donations;
 mod http;
+mod moderation_http;
+mod nadeo;
 mod op_auth;
 mod player;
 mod queries;
 mod router;
+mod tm_oauth;
 
 const MAX_CONNECTIONS: u32 = 4096;
 

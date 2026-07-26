@@ -536,6 +536,12 @@ pub enum Response {
     MapRank {
         uid: String,
         r: Option<LeaderboardEntry2>,
+        #[serde(default)]
+        banned: bool,
+        #[serde(default)]
+        ban_public_message: Option<String>,
+        #[serde(default)]
+        unofficial: bool,
     },
     // near end
     TaskResponse {
