@@ -183,7 +183,7 @@
         canManageDelegates = data.is_author || data.is_super_mod;
         const m = data.meta;
         document.getElementById('map-info').innerHTML =
-          `<span class="pill">${m.map_name || '(unnamed)'}</span>` +
+          `<span class="pill">${escapeHtml(m.map_name || '(unnamed)')}</span>` +
           ` author <code>${m.author_id}</code>` +
           (data.is_author ? ' <span class="pill ok">You are Map Author</span>' : '') +
           (data.is_delegate ? ' <span class="pill ok">Delegate</span>' : '') +

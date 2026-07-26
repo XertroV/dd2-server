@@ -296,9 +296,7 @@ mod tests {
     /// Serialize DB-backed live-height tests (shared DD2_MAP_UID rows).
     fn test_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap_or_else(|e| e.into_inner())
     }
 
     async fn test_pool() -> Pool<Postgres> {
@@ -371,7 +369,8 @@ mod tests {
         cleanup_user(&pool, &user_id).await;
 
         assert!(
-            rows.iter().any(|p| p.user_id == user_id.to_string() && (p.height - 55.5).abs() < 1e-6),
+            rows.iter()
+                .any(|p| p.user_id == user_id.to_string() && (p.height - 55.5).abs() < 1e-6),
             "custom map live heights must still work; got: {:?}",
             rows
         );
@@ -379,6 +378,64 @@ mod tests {
             !dd2_rows.iter().any(|p| p.user_id == user_id.to_string()),
             "custom-map upsert must not appear under DD2 live heights"
         );
+    }
+
+    #[tokio::test]
+    async fn active_map_ban_soft_filters_all_public_map_reads() {
+        let _guard = test_lock();
+        let pool = test_pool().await;
+        let actor = seed_user(&pool, "map-ban-filter-actor").await;
+        let target = seed_user(&pool, "map-ban-filter-target").await;
+        let map_uid = format!("MapBanFilter{}", Uuid::new_v4().simple());
+        let map_uid = &map_uid[..27];
+
+        upsert_map_curr_height(&pool, map_uid, &target, [1.0, 100.0, 2.0], 1000)
+            .await
+            .expect("seed live height");
+        query!(
+            r#"
+            INSERT INTO map_leaderboard (map_uid, user_id, height, pos, race_time)
+            VALUES ($1, $2, $3, $4, $5)
+            "#,
+            map_uid,
+            target,
+            100.0,
+            &[1.0_f64, 100.0, 2.0] as &[f64],
+            1000
+        )
+        .execute(&pool)
+        .await
+        .expect("seed leaderboard");
+
+        crate::queries::moderation::apply_map_ban(&pool, map_uid, &target, &actor, "private", "public", None)
+            .await
+            .expect("apply Map Ban");
+
+        assert!(get_map_leaderboard(&pool, map_uid, 0, 10).await.expect("leaderboard").is_empty());
+        assert_eq!(get_map_leaderboard_len(&pool, map_uid).await.expect("leaderboard count"), 0);
+        assert!(get_map_live_heights(&pool, map_uid).await.expect("live heights").is_empty());
+        assert!(get_map_live_heights_top_n(&pool, map_uid, 10)
+            .await
+            .expect("top live heights")
+            .is_empty());
+        assert_eq!(get_map_nb_playing_live(&pool, map_uid).await.expect("live count"), 0);
+
+        upsert_map_curr_height(&pool, map_uid, &target, [1.0, 101.0, 2.0], 1100)
+            .await
+            .expect("update soft-filtered live height");
+        let row = query!(
+            "SELECT height, update_count FROM map_curr_heights WHERE map_uid = $1 AND user_id = $2",
+            map_uid,
+            target
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read retained live row");
+        assert_eq!(row.height, 101.0);
+        assert_eq!(row.update_count, 1);
+
+        cleanup_user(&pool, &target).await;
+        cleanup_user(&pool, &actor).await;
     }
 
     /// Control: custom-map live heights read path works when `map_curr_heights` is populated
@@ -393,18 +450,15 @@ mod tests {
             .await
             .expect("upsert map_curr_heights");
 
-        let rows = get_map_live_heights(&pool, DD2_MAP_UID)
-            .await
-            .expect("get_map_live_heights");
-        let handler_ok = handle_get_map_uid_live_heights(&pool, DD2_MAP_UID.to_string())
-            .await
-            .is_ok();
+        let rows = get_map_live_heights(&pool, DD2_MAP_UID).await.expect("get_map_live_heights");
+        let handler_ok = handle_get_map_uid_live_heights(&pool, DD2_MAP_UID.to_string()).await.is_ok();
 
         cleanup_user(&pool, &user_id).await;
 
         assert!(handler_ok, "handle_get_map_uid_live_heights should succeed for DD2 UID");
         assert!(
-            rows.iter().any(|p| p.user_id == user_id.to_string() && (p.height - 123.45).abs() < 1e-6),
+            rows.iter()
+                .any(|p| p.user_id == user_id.to_string() && (p.height - 123.45).abs() < 1e-6),
             "expected seeded DD2 player in map live heights, got: {:?}",
             rows
         );
@@ -438,7 +492,8 @@ mod tests {
         cleanup_user(&pool, &user_id).await;
 
         assert!(
-            rows.iter().any(|p| p.user_id == user_id.to_string() && (p.height - 250.0).abs() < 1e-6),
+            rows.iter()
+                .any(|p| p.user_id == user_id.to_string() && (p.height - 250.0).abs() < 1e-6),
             "DD2 vehicle-state live report must appear on map live heights API \
              (migration onto custom-map path). got: {:?}",
             rows
@@ -466,9 +521,7 @@ mod tests {
         .await
         .expect("report_live_vehicle_state");
 
-        let rows = get_map_live_heights(&pool, DD2_MAP_UID)
-            .await
-            .expect("get_map_live_heights");
+        let rows = get_map_live_heights(&pool, DD2_MAP_UID).await.expect("get_map_live_heights");
 
         cleanup_user(&pool, &user_id).await;
 
@@ -496,7 +549,8 @@ mod tests {
         cleanup_user(&pool, &user_id).await;
 
         assert!(
-            rows.iter().any(|p| p.user_id == user_id.to_string() && (p.height - 300.0).abs() < 1e-6),
+            rows.iter()
+                .any(|p| p.user_id == user_id.to_string() && (p.height - 300.0).abs() < 1e-6),
             "global live heights should include DD2 map_curr_heights rows; got: {:?}",
             rows
         );
@@ -528,7 +582,8 @@ mod tests {
         cleanup_user(&pool, &user_id).await;
 
         assert!(
-            rows.iter().any(|p| p.user_id == user_id.to_string() && (p.height - 275.0).abs() < 1e-6),
+            rows.iter()
+                .any(|p| p.user_id == user_id.to_string() && (p.height - 275.0).abs() < 1e-6),
             "global live heights should include official DD2 vehicle reports after mirror; got: {:?}",
             rows
         );

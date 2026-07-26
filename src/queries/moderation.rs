@@ -85,12 +85,9 @@ pub async fn get_map_meta(pool: &Pool<Postgres>, map_uid: &str) -> Result<Option
 }
 
 pub async fn is_super_mod(pool: &Pool<Postgres>, user_id: &Uuid) -> Result<bool, sqlx::Error> {
-    let r = query!(
-        r#"SELECT 1 AS one FROM super_mods WHERE user_id = $1"#,
-        user_id
-    )
-    .fetch_optional(pool)
-    .await?;
+    let r = query!(r#"SELECT 1 AS one FROM super_mods WHERE user_id = $1"#, user_id)
+        .fetch_optional(pool)
+        .await?;
     Ok(r.is_some())
 }
 
@@ -153,12 +150,7 @@ pub async fn list_delegates(pool: &Pool<Postgres>, map_uid: &str) -> Result<Vec<
     .await
 }
 
-pub async fn add_delegate(
-    pool: &Pool<Postgres>,
-    map_uid: &str,
-    user_id: &Uuid,
-    granted_by: &Uuid,
-) -> Result<(), sqlx::Error> {
+pub async fn add_delegate(pool: &Pool<Postgres>, map_uid: &str, user_id: &Uuid, granted_by: &Uuid) -> Result<(), sqlx::Error> {
     query!(
         r#"
         INSERT INTO map_delegates (map_uid, user_id, granted_by)
@@ -175,13 +167,9 @@ pub async fn add_delegate(
 }
 
 pub async fn remove_delegate(pool: &Pool<Postgres>, map_uid: &str, user_id: &Uuid) -> Result<(), sqlx::Error> {
-    query!(
-        r#"DELETE FROM map_delegates WHERE map_uid = $1 AND user_id = $2"#,
-        map_uid,
-        user_id
-    )
-    .execute(pool)
-    .await?;
+    query!(r#"DELETE FROM map_delegates WHERE map_uid = $1 AND user_id = $2"#, map_uid, user_id)
+        .execute(pool)
+        .await?;
     Ok(())
 }
 
@@ -202,11 +190,7 @@ pub async fn list_active_bans(pool: &Pool<Postgres>, map_uid: &str) -> Result<Ve
     .await
 }
 
-pub async fn get_active_ban(
-    pool: &Pool<Postgres>,
-    map_uid: &str,
-    user_id: &Uuid,
-) -> Result<Option<MapBan>, sqlx::Error> {
+pub async fn get_active_ban(pool: &Pool<Postgres>, map_uid: &str, user_id: &Uuid) -> Result<Option<MapBan>, sqlx::Error> {
     query_as!(
         MapBan,
         r#"
@@ -235,11 +219,7 @@ pub async fn is_unofficial(pool: &Pool<Postgres>, map_uid: &str, user_id: &Uuid)
     Ok(r.is_some())
 }
 
-pub async fn get_ban_status(
-    pool: &Pool<Postgres>,
-    map_uid: &str,
-    user_id: &Uuid,
-) -> Result<MapBanStatus, sqlx::Error> {
+pub async fn get_ban_status(pool: &Pool<Postgres>, map_uid: &str, user_id: &Uuid) -> Result<MapBanStatus, sqlx::Error> {
     let ban = get_active_ban(pool, map_uid, user_id).await?;
     let unofficial = is_unofficial(pool, map_uid, user_id).await?;
     Ok(MapBanStatus {
@@ -308,13 +288,16 @@ pub async fn lift_map_ban(
     user_id: &Uuid,
     lifted_by: &Uuid,
     keep_unofficial: bool,
-) -> Result<(), sqlx::Error> {
+) -> Result<bool, sqlx::Error> {
     let mut tx = pool.begin().await?;
-    query!(
+    let result = query!(
         r#"
         UPDATE map_bans
         SET lifted_at = NOW(), lifted_by = $3
-        WHERE map_uid = $1 AND user_id = $2 AND lifted_at IS NULL
+        WHERE map_uid = $1
+          AND user_id = $2
+          AND lifted_at IS NULL
+          AND (expires_at IS NULL OR expires_at > NOW())
         "#,
         map_uid,
         user_id,
@@ -322,8 +305,9 @@ pub async fn lift_map_ban(
     )
     .execute(&mut *tx)
     .await?;
+    let lifted = result.rows_affected() == 1;
 
-    if !keep_unofficial {
+    if lifted && !keep_unofficial {
         query!(
             r#"DELETE FROM map_unofficial WHERE map_uid = $1 AND user_id = $2"#,
             map_uid,
@@ -334,7 +318,7 @@ pub async fn lift_map_ban(
     }
 
     tx.commit().await?;
-    Ok(())
+    Ok(lifted)
 }
 
 pub async fn ensure_user(pool: &Pool<Postgres>, user_id: &Uuid, display_name: &str) -> Result<(), sqlx::Error> {
@@ -348,6 +332,23 @@ pub async fn ensure_user(pool: &Pool<Postgres>, user_id: &Uuid, display_name: &s
         "#,
         user_id,
         display_name
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Ensure a moderation target satisfies foreign keys without changing an
+/// existing user's canonical display name or login timestamp.
+pub async fn ensure_user_reference(pool: &Pool<Postgres>, user_id: &Uuid, display_name: Option<&str>) -> Result<(), sqlx::Error> {
+    query!(
+        r#"
+        INSERT INTO users (web_services_user_id, display_name)
+        VALUES ($1, $2)
+        ON CONFLICT (web_services_user_id) DO NOTHING
+        "#,
+        user_id,
+        display_name.unwrap_or("unknown")
     )
     .execute(pool)
     .await?;
@@ -389,30 +390,23 @@ pub async fn create_web_session(
     user_id: &Uuid,
     display_name: &str,
     expires_at: DateTime<Utc>,
-    access_token: Option<&str>,
-    refresh_token: Option<&str>,
 ) -> Result<(), sqlx::Error> {
     query!(
         r#"
-        INSERT INTO web_sessions (session_id, user_id, display_name, expires_at, oauth_access_token, oauth_refresh_token)
-        VALUES ($1, $2, $3, $4, $5, $6)
+        INSERT INTO web_sessions (session_id, user_id, display_name, expires_at)
+        VALUES ($1, $2, $3, $4)
         "#,
         session_id,
         user_id,
         display_name,
-        expires_at,
-        access_token,
-        refresh_token
+        expires_at
     )
     .execute(pool)
     .await?;
     Ok(())
 }
 
-pub async fn get_web_session(
-    pool: &Pool<Postgres>,
-    session_id: &Uuid,
-) -> Result<Option<(Uuid, String)>, sqlx::Error> {
+pub async fn get_web_session(pool: &Pool<Postgres>, session_id: &Uuid) -> Result<Option<(Uuid, String)>, sqlx::Error> {
     let r = query!(
         r#"
         SELECT user_id, display_name FROM web_sessions
@@ -433,13 +427,9 @@ pub async fn delete_web_session(pool: &Pool<Postgres>, session_id: &Uuid) -> Res
 }
 
 pub async fn save_oauth_state(pool: &Pool<Postgres>, state: &str, expires_at: DateTime<Utc>) -> Result<(), sqlx::Error> {
-    query!(
-        r#"INSERT INTO oauth_states (state, expires_at) VALUES ($1, $2)"#,
-        state,
-        expires_at
-    )
-    .execute(pool)
-    .await?;
+    query!(r#"INSERT INTO oauth_states (state, expires_at) VALUES ($1, $2)"#, state, expires_at)
+        .execute(pool)
+        .await?;
     Ok(())
 }
 
@@ -458,11 +448,121 @@ pub async fn take_oauth_state(pool: &Pool<Postgres>, state: &str) -> Result<bool
 }
 
 pub async fn find_user_id_by_display_name(pool: &Pool<Postgres>, name: &str) -> Result<Option<Uuid>, sqlx::Error> {
-    let r = query!(
-        r#"SELECT web_services_user_id FROM users WHERE display_name = $1 LIMIT 1"#,
-        name
-    )
-    .fetch_optional(pool)
-    .await?;
+    let r = query!(r#"SELECT web_services_user_id FROM users WHERE display_name = $1 LIMIT 1"#, name)
+        .fetch_optional(pool)
+        .await?;
     Ok(r.map(|row| row.web_services_user_id))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqlx::postgres::PgPoolOptions;
+
+    async fn test_pool() -> Pool<Postgres> {
+        dotenv::dotenv().ok();
+        let url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set for moderation tests");
+        PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&url)
+            .await
+            .expect("connect to DATABASE_URL")
+    }
+
+    async fn cleanup(pool: &Pool<Postgres>, map_uid: &str, user_ids: &[Uuid]) {
+        for user_id in user_ids {
+            let _ = query!("DELETE FROM map_unofficial WHERE map_uid = $1 AND user_id = $2", map_uid, user_id)
+                .execute(pool)
+                .await;
+            let _ = query!("DELETE FROM map_bans WHERE map_uid = $1 AND user_id = $2", map_uid, user_id)
+                .execute(pool)
+                .await;
+            let _ = query!("DELETE FROM users WHERE web_services_user_id = $1", user_id)
+                .execute(pool)
+                .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn expired_ban_cannot_be_lifted_to_clear_unofficial() {
+        let pool = test_pool().await;
+        let actor = Uuid::now_v7();
+        let target = Uuid::now_v7();
+        let map_uid = format!("ModerationTest{}", Uuid::new_v4().simple());
+        let map_uid = &map_uid[..27];
+
+        ensure_user(&pool, &actor, "moderation-test-actor").await.expect("insert actor");
+        ensure_user(&pool, &target, "moderation-test-target").await.expect("insert target");
+        apply_map_ban(
+            &pool,
+            map_uid,
+            &target,
+            &actor,
+            "private",
+            "public",
+            Some(Utc::now() - chrono::Duration::minutes(1)),
+        )
+        .await
+        .expect("apply expired ban");
+
+        let status = get_ban_status(&pool, map_uid, &target).await.expect("read expired status");
+        assert!(!status.banned);
+        assert!(status.unofficial);
+
+        let lifted = lift_map_ban(&pool, map_uid, &target, &actor, false).await.expect("attempt lift");
+        assert!(!lifted, "an expired ban is not manually liftable");
+        assert!(
+            is_unofficial(&pool, map_uid, &target).await.expect("read unofficial"),
+            "expiry must keep the Unofficial mark"
+        );
+
+        cleanup(&pool, map_uid, &[target, actor]).await;
+    }
+
+    #[tokio::test]
+    async fn manual_unban_can_clear_or_keep_unofficial() {
+        let pool = test_pool().await;
+        let actor = Uuid::now_v7();
+        let target = Uuid::now_v7();
+        let map_uid = format!("ManualUnban{}", Uuid::new_v4().simple());
+        let map_uid = &map_uid[..27];
+
+        ensure_user(&pool, &actor, "manual-unban-actor").await.expect("insert actor");
+        ensure_user(&pool, &target, "manual-unban-target").await.expect("insert target");
+
+        apply_map_ban(&pool, map_uid, &target, &actor, "private", "public", None)
+            .await
+            .expect("apply first ban");
+        assert!(lift_map_ban(&pool, map_uid, &target, &actor, false).await.expect("lift and clear"));
+        assert!(!is_unofficial(&pool, map_uid, &target).await.expect("read cleared unofficial"));
+
+        apply_map_ban(&pool, map_uid, &target, &actor, "private", "public", None)
+            .await
+            .expect("apply second ban");
+        assert!(lift_map_ban(&pool, map_uid, &target, &actor, true).await.expect("lift and keep"));
+        assert!(is_unofficial(&pool, map_uid, &target).await.expect("read kept unofficial"));
+
+        cleanup(&pool, map_uid, &[target, actor]).await;
+    }
+
+    #[tokio::test]
+    async fn moderation_reference_does_not_rename_existing_user() {
+        let pool = test_pool().await;
+        let user_id = Uuid::now_v7();
+
+        ensure_user(&pool, &user_id, "canonical-name").await.expect("insert user");
+        ensure_user_reference(&pool, &user_id, None)
+            .await
+            .expect("ensure existing reference");
+
+        let row = query!("SELECT display_name FROM users WHERE web_services_user_id = $1", user_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read user");
+        assert_eq!(row.display_name, "canonical-name");
+
+        let _ = query!("DELETE FROM users WHERE web_services_user_id = $1", user_id)
+            .execute(&pool)
+            .await;
+    }
 }

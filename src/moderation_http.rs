@@ -19,6 +19,7 @@ use crate::{
 };
 
 const SESSION_COOKIE: &str = "dd2_session";
+const OAUTH_STATE_COOKIE: &str = "dd2_oauth_state";
 
 #[derive(Clone)]
 pub struct ModerationState {
@@ -52,22 +53,27 @@ fn json_ok<T: Serialize>(v: &T) -> Result<HttpResponse<String>, Rejection> {
 
 async fn session_user(pool: &Pool<Postgres>, cookie_header: Option<String>) -> Option<(Uuid, String)> {
     let header = cookie_header?;
-    let sid = header
-        .split(';')
-        .filter_map(|p| {
-            let p = p.trim();
-            p.strip_prefix(&format!("{}=", SESSION_COOKIE))
-        })
-        .next()?;
+    let sid = cookie_value(&header, SESSION_COOKIE)?;
     let sid = Uuid::parse_str(sid).ok()?;
     moderation::get_web_session(pool, &sid).await.ok().flatten()
 }
 
-pub async fn ensure_map_meta(
-    pool: &Pool<Postgres>,
-    nadeo: &NadeoLiveClient,
-    map_uid: &str,
-) -> Result<moderation::MapMeta, String> {
+fn cookie_value<'a>(header: &'a str, name: &str) -> Option<&'a str> {
+    header.split(';').find_map(|part| {
+        let (cookie_name, value) = part.trim().split_once('=')?;
+        (cookie_name == name).then_some(value)
+    })
+}
+
+fn secure_cookie_suffix(oauth: &TmOauthConfig) -> &'static str {
+    if oauth.redirect_uri.starts_with("https://") {
+        "; Secure"
+    } else {
+        ""
+    }
+}
+
+pub async fn ensure_map_meta(pool: &Pool<Postgres>, nadeo: &NadeoLiveClient, map_uid: &str) -> Result<moderation::MapMeta, String> {
     if let Some(meta) = moderation::get_map_meta(pool, map_uid).await.map_err(|e| e.to_string())? {
         // refresh if older than 7 days
         if meta.fetched_at > Utc::now() - Duration::days(7) {
@@ -81,20 +87,12 @@ pub async fn ensure_map_meta(
         return Err("map meta missing and Nadeo client not configured".into());
     }
     let (author_id, info) = nadeo.author_id_for_uid(map_uid).await?;
-    moderation::upsert_map_meta(
-        pool,
-        map_uid,
-        author_id,
-        info.name.as_deref(),
-        info.thumbnail_url.as_deref(),
-    )
-    .await
-    .map_err(|e| e.to_string())
+    moderation::upsert_map_meta(pool, map_uid, author_id, info.name.as_deref(), info.thumbnail_url.as_deref())
+        .await
+        .map_err(|e| e.to_string())
 }
 
-pub fn routes(
-    state: ModerationState,
-) -> impl Filter<Extract = (impl Reply,), Error = Rejection> + Clone {
+pub fn routes(state: ModerationState) -> impl Filter<Extract = (impl Reply,), Error = Rejection> + Clone {
     let st = state.clone();
     let with_state = warp::any().map(move || st.clone());
 
@@ -107,6 +105,7 @@ pub fn routes(
         .and(warp::get())
         .and(with_state.clone())
         .and(warp::query::<OauthCallbackQuery>())
+        .and(warp::header::optional::<String>("cookie"))
         .and_then(handle_oauth_callback);
 
     let logout = warp::path!("api" / "mod" / "logout")
@@ -203,17 +202,21 @@ async fn handle_oauth_start(state: ModerationState) -> Result<impl Reply, Reject
         return json_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
     }
     let url = oauth.authorize_url(&st);
+    let state_cookie = format!(
+        "{}={}; Path=/api/mod/oauth/callback; HttpOnly; SameSite=Lax; Max-Age=600{}",
+        OAUTH_STATE_COOKIE,
+        st,
+        secure_cookie_suffix(oauth)
+    );
     Ok(HttpResponse::builder()
         .status(StatusCode::FOUND)
         .header(header::LOCATION, url)
+        .header(header::SET_COOKIE, state_cookie)
         .body(String::new())
         .unwrap())
 }
 
-async fn handle_oauth_callback(
-    state: ModerationState,
-    q: OauthCallbackQuery,
-) -> Result<impl Reply, Rejection> {
+async fn handle_oauth_callback(state: ModerationState, q: OauthCallbackQuery, cookie: Option<String>) -> Result<impl Reply, Rejection> {
     if let Some(err) = q.error {
         return json_err(StatusCode::BAD_REQUEST, format!("oauth error: {}", err));
     }
@@ -222,6 +225,10 @@ async fn handle_oauth_callback(
     };
     let code = q.code.ok_or_else(warp::reject::not_found)?;
     let st = q.state.ok_or_else(warp::reject::not_found)?;
+    let state_matches_browser = cookie.as_deref().and_then(|header| cookie_value(header, OAUTH_STATE_COOKIE)) == Some(st.as_str());
+    if !state_matches_browser {
+        return json_err(StatusCode::BAD_REQUEST, "oauth state does not match browser");
+    }
     match moderation::take_oauth_state(state.pool.as_ref(), &st).await {
         Ok(true) => {}
         Ok(false) => return json_err(StatusCode::BAD_REQUEST, "invalid oauth state"),
@@ -244,37 +251,31 @@ async fn handle_oauth_callback(
     }
     let session_id = Uuid::new_v4();
     let expires = Utc::now() + Duration::days(14);
-    if let Err(e) = moderation::create_web_session(
-        state.pool.as_ref(),
-        &session_id,
-        &user_id,
-        &user.display_name,
-        expires,
-        Some(&token.access_token),
-        token.refresh_token.as_deref(),
-    )
-    .await
-    {
+    if let Err(e) = moderation::create_web_session(state.pool.as_ref(), &session_id, &user_id, &user.display_name, expires).await {
         return json_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
     }
     let cookie = format!(
-        "{}={}; Path=/; HttpOnly; SameSite=Lax; Max-Age={}",
+        "{}={}; Path=/; HttpOnly; SameSite=Lax; Max-Age={}{}",
         SESSION_COOKIE,
         session_id,
-        14 * 24 * 3600
+        14 * 24 * 3600,
+        secure_cookie_suffix(oauth)
+    );
+    let clear_state = format!(
+        "{}=; Path=/api/mod/oauth/callback; HttpOnly; SameSite=Lax; Max-Age=0{}",
+        OAUTH_STATE_COOKIE,
+        secure_cookie_suffix(oauth)
     );
     Ok(HttpResponse::builder()
         .status(StatusCode::FOUND)
         .header(header::LOCATION, "/admin")
         .header(header::SET_COOKIE, cookie)
+        .header(header::SET_COOKIE, clear_state)
         .body(String::new())
         .unwrap())
 }
 
-async fn handle_logout(
-    state: ModerationState,
-    cookie: Option<String>,
-) -> Result<impl Reply, Rejection> {
+async fn handle_logout(state: ModerationState, cookie: Option<String>) -> Result<impl Reply, Rejection> {
     if let Some(header) = cookie {
         if let Some(sid) = header
             .split(';')
@@ -306,9 +307,7 @@ async fn handle_me(state: ModerationState, cookie: Option<String>) -> Result<imp
     let Some((user_id, name)) = session_user(state.pool.as_ref(), cookie).await else {
         return json_err(StatusCode::UNAUTHORIZED, "not logged in");
     };
-    let is_sm = moderation::is_super_mod(state.pool.as_ref(), &user_id)
-        .await
-        .unwrap_or(false);
+    let is_sm = moderation::is_super_mod(state.pool.as_ref(), &user_id).await.unwrap_or(false);
     json_ok(&MeResp {
         wsid: user_id.to_string(),
         display_name: name,
@@ -325,11 +324,7 @@ struct MapResp {
     is_super_mod: bool,
 }
 
-async fn handle_get_map(
-    map_uid: String,
-    state: ModerationState,
-    cookie: Option<String>,
-) -> Result<impl Reply, Rejection> {
+async fn handle_get_map(map_uid: String, state: ModerationState, cookie: Option<String>) -> Result<impl Reply, Rejection> {
     let Some((user_id, _)) = session_user(state.pool.as_ref(), cookie).await else {
         return json_err(StatusCode::UNAUTHORIZED, "not logged in");
     };
@@ -337,9 +332,7 @@ async fn handle_get_map(
         Ok(m) => m,
         Err(e) => return json_err(StatusCode::BAD_GATEWAY, e),
     };
-    let is_sm = moderation::is_super_mod(state.pool.as_ref(), &user_id)
-        .await
-        .unwrap_or(false);
+    let is_sm = moderation::is_super_mod(state.pool.as_ref(), &user_id).await.unwrap_or(false);
     let is_author = moderation::is_map_author(state.pool.as_ref(), &map_uid, &user_id)
         .await
         .unwrap_or(false);
@@ -356,11 +349,7 @@ async fn handle_get_map(
     })
 }
 
-async fn require_moderator(
-    state: &ModerationState,
-    map_uid: &str,
-    cookie: Option<String>,
-) -> Result<Uuid, HttpResponse<String>> {
+async fn require_moderator(state: &ModerationState, map_uid: &str, cookie: Option<String>) -> Result<Uuid, HttpResponse<String>> {
     let Some((user_id, _)) = session_user(state.pool.as_ref(), cookie).await else {
         return Err(json_err(StatusCode::UNAUTHORIZED, "not logged in").unwrap());
     };
@@ -375,11 +364,7 @@ async fn require_moderator(
     }
 }
 
-async fn handle_list_bans(
-    map_uid: String,
-    state: ModerationState,
-    cookie: Option<String>,
-) -> Result<impl Reply, Rejection> {
+async fn handle_list_bans(map_uid: String, state: ModerationState, cookie: Option<String>) -> Result<impl Reply, Rejection> {
     if let Err(resp) = require_moderator(&state, &map_uid, cookie).await {
         return Ok(resp);
     }
@@ -411,6 +396,9 @@ async fn handle_create_ban(
     if body.private_reason.trim().is_empty() || body.public_message.trim().is_empty() {
         return json_err(StatusCode::BAD_REQUEST, "private_reason and public_message required");
     }
+    if body.expires_at.is_some_and(|expires_at| expires_at <= Utc::now()) {
+        return json_err(StatusCode::BAD_REQUEST, "expires_at must be in the future");
+    }
     let target = if let Some(id) = body.user_id.as_ref() {
         match Uuid::parse_str(id) {
             Ok(u) => u,
@@ -427,18 +415,14 @@ async fn handle_create_ban(
     };
 
     match moderation::is_protected_from_map_ban(state.pool.as_ref(), &map_uid, &target).await {
-        Ok(true) => {
-            return json_err(
-                StatusCode::FORBIDDEN,
-                "cannot Map-Ban Map Author, Super-mod, or Map Delegate",
-            )
-        }
+        Ok(true) => return json_err(StatusCode::FORBIDDEN, "cannot Map-Ban Map Author, Super-mod, or Map Delegate"),
         Ok(false) => {}
         Err(e) => return json_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
 
-    // ensure target exists in users for FK
-    let _ = moderation::ensure_user(state.pool.as_ref(), &target, body.display_name.as_deref().unwrap_or("unknown")).await;
+    if let Err(e) = moderation::ensure_user_reference(state.pool.as_ref(), &target, body.display_name.as_deref()).await {
+        return json_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
+    }
 
     match moderation::apply_map_ban(
         state.pool.as_ref(),
@@ -476,25 +460,39 @@ async fn handle_lift_ban(
         Ok(u) => u,
         Err(_) => return json_err(StatusCode::BAD_REQUEST, "invalid user_id"),
     };
-    match moderation::lift_map_ban(
-        state.pool.as_ref(),
-        &map_uid,
-        &target,
-        &actor,
-        body.keep_unofficial,
-    )
-    .await
-    {
-        Ok(()) => json_ok(&serde_json::json!({"ok": true})),
+    match moderation::lift_map_ban(state.pool.as_ref(), &map_uid, &target, &actor, body.keep_unofficial).await {
+        Ok(true) => json_ok(&serde_json::json!({"ok": true})),
+        Ok(false) => json_err(StatusCode::NOT_FOUND, "no active Map Ban"),
         Err(e) => json_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
 }
 
-async fn handle_list_delegates(
-    map_uid: String,
-    state: ModerationState,
-    cookie: Option<String>,
-) -> Result<impl Reply, Rejection> {
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cookie_value_matches_exact_cookie_name() {
+        let header = "dd2_oauth_state=state-1; dd2_session=session-1";
+        assert_eq!(cookie_value(header, OAUTH_STATE_COOKIE), Some("state-1"));
+        assert_eq!(cookie_value(header, SESSION_COOKIE), Some("session-1"));
+        assert_eq!(cookie_value("not_dd2_session=value", SESSION_COOKIE), None);
+    }
+
+    #[test]
+    fn oauth_cookies_are_secure_for_https_redirects_only() {
+        let mut oauth = TmOauthConfig {
+            client_id: "client".into(),
+            client_secret: "secret".into(),
+            redirect_uri: "https://example.test/api/mod/oauth/callback".into(),
+        };
+        assert_eq!(secure_cookie_suffix(&oauth), "; Secure");
+        oauth.redirect_uri = "http://localhost:8077/api/mod/oauth/callback".into();
+        assert_eq!(secure_cookie_suffix(&oauth), "");
+    }
+}
+
+async fn handle_list_delegates(map_uid: String, state: ModerationState, cookie: Option<String>) -> Result<impl Reply, Rejection> {
     if let Err(resp) = require_moderator(&state, &map_uid, cookie).await {
         return Ok(resp);
     }
@@ -542,7 +540,14 @@ async fn handle_add_delegate(
     } else {
         return json_err(StatusCode::BAD_REQUEST, "user_id or display_name required");
     };
-    let _ = moderation::ensure_user(state.pool.as_ref(), &target, body.display_name.as_deref().unwrap_or("unknown")).await;
+    match moderation::get_active_ban(state.pool.as_ref(), &map_uid, &target).await {
+        Ok(Some(_)) => return json_err(StatusCode::CONFLICT, "lift the active Map Ban before adding this Delegate"),
+        Ok(None) => {}
+        Err(e) => return json_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+    if let Err(e) = moderation::ensure_user_reference(state.pool.as_ref(), &target, body.display_name.as_deref()).await {
+        return json_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
+    }
     match moderation::add_delegate(state.pool.as_ref(), &map_uid, &target, &actor).await {
         Ok(()) => json_ok(&serde_json::json!({"ok": true})),
         Err(e) => json_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
