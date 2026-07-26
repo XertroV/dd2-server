@@ -11,3 +11,5 @@ log*
 output-*
 survey.md
 backup_*
+.worktrees/
+*.tmp.*
