@@ -426,7 +426,7 @@
     const MAP_UID_HISTORY_MAX = 30;
     const enriching = new Set();
 
-    async function api(path, opts = {}) {
+    let api = async (path, opts = {}) => {
       const res = await fetch(path, {
         credentials: 'same-origin',
         headers: { 'Content-Type': 'application/json', ...(opts.headers || {}) },
@@ -435,7 +435,7 @@
       const data = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(data.error || res.statusText || 'request failed');
       return data;
-    }
+    };
     const realApi = api;
 
     function escapeHtml(s) {
