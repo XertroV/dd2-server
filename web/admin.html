@@ -4,285 +4,396 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Dips++ Map Moderation</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/geist@1.3.1/dist/fonts/geist-sans/style.css" />
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/geist@1.3.1/dist/fonts/geist-mono/style.css" />
   <style>
     :root {
-      --bg: #0e0e0e;
-      --panel: #161616;
-      --fg: #e8e8e8;
-      --muted: #8b8b8b;
-      --line: #1a1a1a;
-      --edge: #2c2c2c;
-      --warn: #b89a5a;
-      --err: #b86a6a;
-      --ok: #6f9a72;
-      --accent: #7a8f9e;
-      --accent-2: #8a7e92;
-      --accent-3: #9a8568;
+      --background: #09090b;
+      --foreground: #fafafa;
+      --card: #0c0c0e;
+      --card-fg: #fafafa;
+      --muted: #18181b;
+      --muted-fg: #a1a1aa;
+      --border: #27272a;
+      --input: #18181b;
+      --ring: #3f3f46;
+      --primary: #fafafa;
+      --primary-fg: #18181b;
+      --secondary: #27272a;
+      --secondary-fg: #fafafa;
+      --destructive: #7f1d1d;
+      --destructive-fg: #fecaca;
+      --accent: #1c1c1f;
+      --accent-fg: #fafafa;
+      --ok: #14532d;
+      --ok-fg: #bbf7d0;
+      --warn: #713f12;
+      --warn-fg: #fde68a;
+      --radius: 8px;
+      --font: "Geist Sans", ui-sans-serif, system-ui, sans-serif;
+      --mono: "Geist Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
     }
     * { box-sizing: border-box; }
     html, body { margin: 0; min-height: 100%; }
     body {
-      font-family: "Geist Mono", ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
-      font-size: 13px;
-      line-height: 1.55;
-      background: var(--bg);
-      color: var(--fg);
-      letter-spacing: -0.01em;
-    }
-    .wrap {
-      max-width: 740px;
-      margin: 0 auto;
-      padding: 2.5rem 1.25rem 4rem;
-    }
-    h1 {
+      font-family: var(--font);
       font-size: 14px;
-      font-weight: 500;
-      margin: 0 0 0.2rem;
-      text-transform: uppercase;
-      letter-spacing: 0.08em;
+      line-height: 1.5;
+      background: var(--background);
+      color: var(--foreground);
+      -webkit-font-smoothing: antialiased;
     }
-    h2 {
-      font-size: 11px;
-      font-weight: 500;
-      margin: 0 0 1rem;
-      text-transform: uppercase;
-      letter-spacing: 0.1em;
-      color: var(--muted);
+    code, .mono { font-family: var(--mono); font-size: 12.5px; }
+    .wrap { max-width: 960px; margin: 0 auto; padding: 2rem 1.25rem 4rem; }
+    header.top {
+      display: flex; align-items: flex-start; justify-content: space-between; gap: 1rem;
+      margin-bottom: 1.5rem; padding-bottom: 1.25rem; border-bottom: 1px solid var(--border);
     }
-    .sub { color: var(--muted); margin: 0 0 2rem; }
-    header {
-      margin-bottom: 1.1rem;
-      padding: 1rem 1.1rem;
-      background: var(--panel);
-      border: 2px solid var(--edge);
-      box-shadow: 4px 4px 0 var(--accent);
+    header.top h1 { font-size: 1.125rem; font-weight: 600; letter-spacing: -0.02em; margin: 0 0 0.25rem; }
+    header.top .sub { color: var(--muted-fg); margin: 0; font-size: 13px; }
+    .session { text-align: right; font-size: 13px; color: var(--muted-fg); max-width: 280px; }
+    .session strong { color: var(--foreground); font-weight: 500; }
+    .session .wsid {
+      font-family: var(--mono); font-size: 11px; margin: 0.2rem 0 0.5rem;
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
     }
-    section {
-      background: var(--panel);
-      border: 2px solid var(--edge);
-      padding: 1.2rem 1.25rem 1.5rem;
-      margin: 0 0 1.35rem;
-      box-shadow: 4px 4px 0 var(--accent-2);
-      overflow: visible;
+    .tabs {
+      display: flex; gap: 0.25rem; border-bottom: 1px solid var(--border);
+      margin-bottom: 1.25rem; overflow-x: auto;
     }
-    #map-card { box-shadow: 4px 4px 0 var(--accent-3); }
-    #ban-card { box-shadow: 4px 4px 0 var(--err); }
-    #delegate-card { box-shadow: 4px 4px 0 var(--ok); }
+    .tabs button {
+      appearance: none; border: 0; background: transparent; color: var(--muted-fg);
+      font: inherit; font-size: 13px; font-weight: 500; padding: 0.65rem 0.85rem;
+      cursor: pointer; border-bottom: 2px solid transparent; margin-bottom: -1px;
+      white-space: nowrap; border-radius: 0;
+    }
+    .tabs button:hover { color: var(--foreground); }
+    .tabs button.active { color: var(--foreground); border-bottom-color: var(--foreground); }
+    .subtabs { display: flex; gap: 0.35rem; flex-wrap: wrap; margin: 0 0 1rem; }
+    .subtabs button {
+      appearance: none; border: 1px solid var(--border); background: var(--muted);
+      color: var(--muted-fg); font: inherit; font-size: 12px; font-weight: 500;
+      padding: 0.35rem 0.7rem; border-radius: 999px; cursor: pointer;
+    }
+    .subtabs button:hover { color: var(--foreground); border-color: var(--ring); }
+    .subtabs button.active { background: var(--secondary); color: var(--foreground); border-color: var(--ring); }
+    .panel { display: none; }
+    .panel.active { display: block; }
+    .card {
+      background: var(--card); color: var(--card-fg);
+      border: 1px solid var(--border); border-radius: var(--radius);
+      padding: 1.1rem 1.2rem 1.25rem; margin: 0 0 1rem;
+    }
+    .card h2 { font-size: 13px; font-weight: 600; margin: 0 0 0.75rem; letter-spacing: -0.01em; }
+    .docs {
+      background: var(--muted); border: 1px solid var(--border); border-radius: var(--radius);
+      padding: 0.85rem 1rem; margin: 0 0 1rem; color: var(--muted-fg); font-size: 13px;
+    }
+    .docs strong { color: var(--foreground); font-weight: 550; }
+    .docs p { margin: 0 0 0.4rem; }
+    .docs p:last-child { margin: 0; }
     label {
-      display: block;
-      color: var(--muted);
-      font-size: 11px;
-      letter-spacing: 0.06em;
-      text-transform: uppercase;
-      margin: 0.85rem 0 0.4rem;
+      display: block; color: var(--muted-fg); font-size: 12px; font-weight: 500;
+      margin: 0.75rem 0 0.35rem;
     }
-    input, textarea {
-      font: inherit;
-      color: var(--fg);
-      background: #101010;
-      border: 2px solid var(--edge);
-      border-radius: 0;
-      padding: 0.55rem 0.65rem;
-      width: 100%;
-      outline: none;
-      box-shadow: 3px 3px 0 var(--accent);
-      color-scheme: dark;
+    label:first-child, .field > label:first-child { margin-top: 0; }
+    input, textarea, select {
+      font: inherit; color: var(--foreground); background: var(--input);
+      border: 1px solid var(--border); border-radius: calc(var(--radius) - 2px);
+      padding: 0.5rem 0.65rem; width: 100%; outline: none; color-scheme: dark;
     }
-    input:focus, textarea:focus {
-      border-color: #555;
-      box-shadow: 3px 3px 0 var(--warn);
+    input:focus, textarea:focus, select:focus {
+      border-color: var(--ring); box-shadow: 0 0 0 3px rgba(63, 63, 70, 0.45);
     }
-    textarea { min-height: 4.5rem; resize: vertical; }
-    button, .act {
-      font: inherit;
-      color: var(--fg);
-      background: #101010;
-      border: 2px solid var(--edge);
-      border-radius: 0;
-      padding: 0.45rem 0.75rem;
-      margin: 0.85rem 0.55rem 0 0;
-      cursor: pointer;
-      width: auto;
-      text-transform: uppercase;
-      letter-spacing: 0.06em;
-      font-size: 11px;
-      box-shadow: 3px 3px 0 var(--accent-2);
-      flex: 0 0 auto;
+    textarea { min-height: 4.25rem; resize: vertical; }
+    .row { display: flex; gap: 0.6rem; align-items: flex-end; flex-wrap: wrap; }
+    .row .field { flex: 1 1 220px; min-width: 0; }
+    .hint { color: var(--muted-fg); font-size: 12px; margin: 0.35rem 0 0; }
+    button, .btn {
+      font: inherit; font-size: 13px; font-weight: 500; border-radius: calc(var(--radius) - 2px);
+      padding: 0.45rem 0.85rem; cursor: pointer; border: 1px solid var(--border);
+      background: var(--secondary); color: var(--secondary-fg);
     }
-    button:hover, .act:hover {
-      transform: translate(1px, 1px);
-      box-shadow: 2px 2px 0 var(--accent-2);
-      border-color: #444;
+    button.primary, .btn.primary {
+      background: var(--primary); color: var(--primary-fg); border-color: var(--primary);
     }
-    button:active, .act:active {
-      transform: translate(3px, 3px);
-      box-shadow: 0 0 0 var(--accent-2);
+    button.ghost, .btn.ghost { background: transparent; }
+    button.danger, .btn.danger {
+      background: var(--destructive); color: var(--destructive-fg); border-color: #991b1b;
     }
-    button:focus-visible, .act:focus-visible, input:focus-visible, textarea:focus-visible {
-      outline: 1px solid var(--warn);
-      outline-offset: 2px;
-    }
-    button.danger {
-      box-shadow: 3px 3px 0 var(--err);
-    }
-    button.danger:hover { box-shadow: 2px 2px 0 var(--err); }
-    button.danger:active { box-shadow: 0 0 0 var(--err); }
-    .row { display: flex; gap: 1rem; flex-wrap: wrap; align-items: flex-end; }
-    .row > *:not(button) { flex: 1 1 200px; min-width: 0; }
-    .row.actions { align-items: center; }
-    .field { min-width: 0; }
+    button:hover, .btn:hover { filter: brightness(1.08); }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
     .tag {
-      display: inline;
-      color: var(--muted);
-      font-size: 11px;
-      letter-spacing: 0.04em;
-      text-transform: uppercase;
+      display: inline-flex; align-items: center; gap: 0.25rem;
+      font-size: 11px; font-weight: 500; padding: 0.15rem 0.45rem;
+      border-radius: 999px; border: 1px solid var(--border);
+      background: var(--muted); color: var(--muted-fg); vertical-align: middle;
     }
-    .tag::before { content: "["; }
-    .tag::after { content: "]"; }
-    .tag.ok { color: var(--ok); }
-    .tag.warn { color: var(--warn); }
-    .entry {
-      border: 2px solid var(--edge);
-      padding: 0.85rem 0.9rem;
-      margin: 0 0 1rem;
-      background: #101010;
-      box-shadow: 3px 3px 0 var(--accent-2);
-    }
-    .entry-grid {
-      display: grid;
-      grid-template-columns: 5.75rem minmax(0, 1fr);
-      gap: 0.4rem 0.85rem;
-      align-items: start;
-    }
-    .entry-grid .k {
-      color: var(--muted);
-      font-size: 11px;
-      text-transform: uppercase;
-      letter-spacing: 0.06em;
-      padding-top: 0.1rem;
-    }
-    .entry-actions {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 0.75rem 0.7rem;
-      margin-top: 0.85rem;
-      padding-top: 0.75rem;
-      border-top: 1px solid var(--edge);
-    }
-    .entry-actions button { margin: 0; }
-    .expires-lines { display: flex; flex-direction: column; gap: 0.15rem; }
-    table { width: 100%; border-collapse: collapse; margin: 0.5rem 0 1rem; }
-    th, td {
-      text-align: left;
-      padding: 0.55rem 0.4rem 0.55rem 0;
-      border-bottom: 1px solid var(--edge);
-      vertical-align: top;
-      font-weight: 400;
-    }
-    th {
-      color: var(--muted);
-      font-size: 11px;
-      text-transform: uppercase;
-      letter-spacing: 0.06em;
-    }
-    code {
-      font: inherit;
-      color: var(--muted);
-      overflow-wrap: anywhere;
-      word-break: normal;
-    }
-    code.wsid { font-size: 12px; }
-    a { color: var(--accent); text-decoration: underline; text-underline-offset: 3px; }
-    .err { color: var(--err); white-space: pre-wrap; margin: 0.5rem 0 0; }
-    .okmsg { color: var(--ok); margin: 0.5rem 0 0; }
+    .tag.ok { background: var(--ok); color: var(--ok-fg); border-color: #166534; }
+    .tag.warn { background: var(--warn); color: var(--warn-fg); border-color: #a16207; }
+    .err { color: #fca5a5; font-size: 13px; margin: 0.5rem 0 0; }
+    .ok-msg { color: #86efac; font-size: 13px; margin: 0.5rem 0 0; }
     .hidden { display: none !important; }
-    .meta { margin: 1rem 0 0; color: var(--muted); }
-    .identity { margin: 0 0 0.75rem; }
-    @media (prefers-reduced-motion: reduce) {
-      button:hover, .act:hover, button:active, .act:active { transform: none; }
+    .entry {
+      border: 1px solid var(--border); border-radius: calc(var(--radius) - 2px);
+      padding: 0.75rem 0.85rem; margin: 0 0 0.55rem; background: var(--background);
     }
+    .entry:hover { border-color: var(--ring); }
+    .entry .title { font-weight: 500; margin: 0 0 0.25rem; }
+    .entry .meta { color: var(--muted-fg); font-size: 12px; margin: 0 0 0.35rem; }
+    .entry .actions { display: flex; gap: 0.4rem; flex-wrap: wrap; margin-top: 0.5rem; }
+    .empty { color: var(--muted-fg); font-size: 13px; padding: 0.5rem 0; }
+    .map-info { margin: 0.75rem 0 0; font-size: 13px; color: var(--muted-fg); }
+    .map-info .tag { margin-right: 0.25rem; }
+    .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 0.75rem; }
+    @media (max-width: 720px) {
+      .grid-2 { grid-template-columns: 1fr; }
+      header.top { flex-direction: column; }
+      .session { text-align: left; }
+    }
+    a.linkish { color: var(--foreground); text-decoration: underline; text-underline-offset: 3px; cursor: pointer; }
   </style>
 </head>
 <body>
   <div class="wrap">
-    <header>
-      <h1>Dips++ Map Moderation</h1>
-      <p class="sub">Map Ban · Delegates · Trackmania OAuth</p>
+    <header class="top">
+      <div>
+        <h1>Dips++ Map Moderation</h1>
+        <p class="sub">Author-led Map Bans and Delegates for Dips++ Maps.</p>
+      </div>
+      <div class="session" id="session-box">
+        <div id="auth-logged-out">
+          <a class="btn primary" href="/api/mod/oauth/start">Sign in with Trackmania</a>
+        </div>
+        <div id="auth-logged-in" class="hidden">
+          <div><strong id="me-name">—</strong> <span id="me-role" class="tag">—</span></div>
+          <div class="wsid" id="me-wsid" title=""></div>
+          <button type="button" class="ghost" onclick="logout()">Sign out</button>
+        </div>
+      </div>
     </header>
 
-    <section id="auth-card">
-      <div id="logged-out">
-        <p class="sub" style="margin-bottom:0.75rem">Sign in with Trackmania to moderate Maps you author, or as Super-mod / Delegate.</p>
-        <button type="button" onclick="location.href='/api/mod/oauth/start'">Login with Trackmania</button>
+    <nav class="tabs hidden" id="top-tabs" role="tablist">
+      <button type="button" data-tab="my-maps" class="active">My Maps</button>
+      <button type="button" data-tab="map">Map</button>
+      <button type="button" data-tab="super" id="tab-super" class="hidden">SuperMod Tools</button>
+    </nav>
+
+    <!-- My Maps -->
+    <section class="panel active" id="panel-my-maps">
+      <aside class="docs">
+        <p><strong>My Maps</strong> lists Maps you’ve authored (from Nadeo meta we’ve seen) and Maps where you’re a Delegate.</p>
+        <p>Open a Map to manage Bans and Delegates. New Maps appear here after they’re loaded once (or appear in game traffic with meta cached).</p>
+      </aside>
+      <div class="card">
+        <h2>Authored</h2>
+        <div id="my-authored" class="empty">Sign in to load your maps.</div>
       </div>
-      <div id="logged-in" class="hidden">
-        <p class="identity">
-          Signed in as <strong id="me-name"></strong>
-          <span class="tag" id="me-role"></span>
-        </p>
-        <code id="me-wsid"></code>
-        <div class="row actions">
-          <button type="button" onclick="logout()">Logout</button>
+      <div class="card">
+        <h2>Delegated to you</h2>
+        <div id="my-delegated" class="empty">—</div>
+      </div>
+    </section>
+
+    <!-- Map workspace -->
+    <section class="panel" id="panel-map">
+      <aside class="docs" id="map-panel-docs">
+        <p><strong>Map</strong> workspace: open any Map by UID. Map Authors, Delegates, and Super-mods can moderate that Map.</p>
+        <p>Height updates still record under a Map Ban; banned players are hidden from public leaderboards and live presence.</p>
+      </aside>
+      <div class="card">
+        <h2>Open Map</h2>
+        <form id="map-form" class="row" onsubmit="event.preventDefault(); loadMap();">
+          <div class="field">
+            <label for="map-uid">Map UID</label>
+            <input id="map-uid" list="map-uid-history" placeholder="27-char map UID" autocomplete="on" />
+            <datalist id="map-uid-history"></datalist>
+          </div>
+          <button type="submit" class="primary">Load</button>
+        </form>
+        <p class="hint">Recent UIDs are remembered locally with name/author when known.</p>
+        <div id="map-err" class="err"></div>
+        <div id="map-info" class="map-info"></div>
+      </div>
+
+      <div id="map-workspace" class="hidden">
+        <nav class="subtabs" id="map-subtabs">
+          <button type="button" data-msub="overview" class="active">Overview</button>
+          <button type="button" data-msub="bans">Map Bans</button>
+          <button type="button" data-msub="delegates">Delegates</button>
+        </nav>
+
+        <div class="panel active" id="msub-overview">
+          <aside class="docs">
+            <p><strong>Overview</strong> shows cached Nadeo meta and your role on this Map.</p>
+            <p>Map Authors and Super-mods can appoint Delegates. Any moderator can apply or lift Map Bans.</p>
+          </aside>
+          <div class="card" id="overview-card">
+            <h2>Map details</h2>
+            <div id="overview-body" class="empty">Load a Map.</div>
+          </div>
+        </div>
+
+        <div class="panel" id="msub-bans">
+          <aside class="docs">
+            <p><strong>Map Bans</strong> hide a player from this Map’s public leaderboard and live presence. Private reason is mod-only; public message is shown to the player.</p>
+            <p>Lifting can keep or clear the Unofficial mark. Authors, Delegates, and Super-mods cannot be banned.</p>
+          </aside>
+          <div class="card" id="ban-card">
+            <h2>Active bans</h2>
+            <div id="ban-list" class="empty">None</div>
+            <h2 style="margin-top:1.25rem">Apply ban</h2>
+            <div class="grid-2">
+              <div>
+                <label for="ban-user">User WSID</label>
+                <input id="ban-user" placeholder="uuid" />
+              </div>
+              <div>
+                <label for="ban-name">or display name</label>
+                <input id="ban-name" placeholder="exact name" />
+              </div>
+            </div>
+            <label for="ban-private">Private reason</label>
+            <textarea id="ban-private"></textarea>
+            <label for="ban-public">Public message</label>
+            <textarea id="ban-public"></textarea>
+            <label for="ban-expires">Expires <span id="ban-expires-tz" class="mono"></span></label>
+            <input id="ban-expires" type="datetime-local" />
+            <p class="hint">Leave empty for no expiry. Value is treated as UTC.</p>
+            <div style="margin-top:0.75rem">
+              <button type="button" class="primary" onclick="createBan()">Apply Map Ban</button>
+            </div>
+            <div id="ban-err" class="err"></div>
+          </div>
+        </div>
+
+        <div class="panel" id="msub-delegates">
+          <aside class="docs">
+            <p><strong>Delegates</strong> share day-to-day Map Ban powers with the Map Author on this Map only.</p>
+            <p>Only the Map Author or a Super-mod can add or remove Delegates.</p>
+          </aside>
+          <div class="card" id="delegate-card">
+            <h2>Delegates</h2>
+            <div id="delegate-list" class="empty">None</div>
+            <div id="delegate-manage">
+              <h2 style="margin-top:1.25rem">Add delegate</h2>
+              <div class="grid-2">
+                <div>
+                  <label for="del-user">User WSID</label>
+                  <input id="del-user" placeholder="uuid" />
+                </div>
+                <div>
+                  <label for="del-name">or display name</label>
+                  <input id="del-name" placeholder="exact name" />
+                </div>
+              </div>
+              <div style="margin-top:0.75rem">
+                <button type="button" class="primary" onclick="addDelegate()">Add Delegate</button>
+              </div>
+              <div id="del-err" class="err"></div>
+            </div>
+          </div>
         </div>
       </div>
     </section>
 
-    <section id="map-card">
-      <h2>Open Map</h2>
-      <label for="map-uid">Map UID</label>
-      <form id="map-form" class="row" onsubmit="event.preventDefault(); loadMap();">
-        <div class="field">
-          <input id="map-uid" list="map-uid-history" placeholder="27-char map UID" autocomplete="on" />
-          <datalist id="map-uid-history"></datalist>
-        </div>
-        <button type="submit">Load</button>
-      </form>
-      <p id="map-info" class="meta"></p>
-      <p id="map-err" class="err"></p>
-    </section>
+    <!-- SuperMod -->
+    <section class="panel" id="panel-super">
+      <nav class="subtabs" id="super-subtabs">
+        <button type="button" data-ssub="maps" class="active">Maps</button>
+        <button type="button" data-ssub="users">Users</button>
+        <button type="button" data-ssub="admins">Map Admins</button>
+        <button type="button" data-ssub="bans">Map Bans</button>
+        <button type="button" data-ssub="audit">Audit Log</button>
+        <button type="button" data-ssub="supermods">Super-mods</button>
+      </nav>
 
-    <section class="hidden" id="ban-card">
-      <h2>Map Bans</h2>
-      <div id="ban-list"></div>
-      <h2 style="margin-top:1.75rem">Apply Map Ban</h2>
-      <div class="row">
-        <div class="field">
-          <label for="ban-name">Display name</label>
-          <input id="ban-name" placeholder="player name" autocomplete="off" />
-        </div>
-        <div class="field">
-          <label for="ban-wsid">or WSID</label>
-          <input id="ban-wsid" placeholder="uuid" autocomplete="off" />
+      <div class="panel active" id="ssub-maps">
+        <aside class="docs">
+          <p><strong>Maps</strong> (Super-mod): browse cached map meta across the platform. Search by UID, name, or author id.</p>
+        </aside>
+        <div class="card">
+          <form class="row" onsubmit="event.preventDefault(); loadSuperMaps();">
+            <div class="field">
+              <label for="super-map-q">Search</label>
+              <input id="super-map-q" placeholder="uid, name, or author…" />
+            </div>
+            <button type="submit" class="primary">Search</button>
+          </form>
+          <div id="super-maps" style="margin-top:1rem" class="empty">—</div>
         </div>
       </div>
-      <label for="ban-private">Private reason (mods only)</label>
-      <textarea id="ban-private"></textarea>
-      <label for="ban-public">Public message (shown to player)</label>
-      <textarea id="ban-public"></textarea>
-      <label for="ban-expires">Expires at <span class="sub" style="margin:0;text-transform:none;letter-spacing:0">(optional · <span id="ban-expires-tz">local time</span>)</span></label>
-      <input id="ban-expires" type="datetime-local" />
-      <p class="sub" style="margin:0.4rem 0 0;font-size:11px">Interpreted in your browser timezone; stored and enforced as UTC.</p>
-      <button type="button" class="danger" onclick="createBan()">Ban from this Map's LB</button>
-      <p id="ban-msg"></p>
-    </section>
 
-    <section class="hidden" id="delegate-card">
-      <h2>Map Delegates</h2>
-      <div id="delegate-list"></div>
-      <div class="row" style="margin-top:1rem">
-        <div class="field">
-          <label for="del-name">Display name</label>
-          <input id="del-name" autocomplete="off" />
-        </div>
-        <div class="field">
-          <label for="del-wsid">or WSID</label>
-          <input id="del-wsid" autocomplete="off" />
+      <div class="panel" id="ssub-users">
+        <aside class="docs">
+          <p><strong>Users</strong> looks up a player by display name or WSID and shows Super-mod / author / ban / delegate counts.</p>
+        </aside>
+        <div class="card">
+          <form class="row" onsubmit="event.preventDefault(); loadSuperUsers();">
+            <div class="field">
+              <label for="super-user-q">Name or WSID</label>
+              <input id="super-user-q" placeholder="exact-ish name or uuid" />
+            </div>
+            <button type="submit" class="primary">Lookup</button>
+          </form>
+          <div id="super-users" style="margin-top:1rem" class="empty">—</div>
         </div>
       </div>
-      <button type="button" onclick="addDelegate()">Add Delegate</button>
-      <p id="del-msg"></p>
+
+      <div class="panel" id="ssub-admins">
+        <aside class="docs">
+          <p><strong>Map Admins</strong> lists Map Authors (with map counts) and all Delegates across Maps.</p>
+        </aside>
+        <div class="card">
+          <h2>Authors</h2>
+          <div id="super-authors" class="empty">—</div>
+          <h2 style="margin-top:1.25rem">Delegates</h2>
+          <div id="super-delegates" class="empty">—</div>
+        </div>
+      </div>
+
+      <div class="panel" id="ssub-bans">
+        <aside class="docs">
+          <p><strong>Map Bans</strong> (global) shows active bans across all Maps. Open a Map to lift or edit.</p>
+        </aside>
+        <div class="card">
+          <div id="super-bans" class="empty">—</div>
+        </div>
+      </div>
+
+      <div class="panel" id="ssub-audit">
+        <aside class="docs">
+          <p><strong>Audit Log</strong> records ban, delegate, and Super-mod mutations going forward. Older actions may be incomplete.</p>
+        </aside>
+        <div class="card">
+          <div id="super-audit" class="empty">—</div>
+        </div>
+      </div>
+
+      <div class="panel" id="ssub-supermods">
+        <aside class="docs">
+          <p><strong>Super-mods</strong> manage platform operators. The last Super-mod cannot be removed.</p>
+        </aside>
+        <div class="card">
+          <h2>Current Super-mods</h2>
+          <div id="super-mods-list" class="empty">—</div>
+          <h2 style="margin-top:1.25rem">Add Super-mod</h2>
+          <div class="grid-2">
+            <div>
+              <label for="sm-user">User WSID</label>
+              <input id="sm-user" placeholder="uuid" />
+            </div>
+            <div>
+              <label for="sm-name">or display name</label>
+              <input id="sm-name" placeholder="exact name" />
+            </div>
+          </div>
+          <div style="margin-top:0.75rem">
+            <button type="button" class="primary" onclick="addSuperMod()">Add</button>
+          </div>
+          <div id="sm-err" class="err"></div>
+        </div>
+      </div>
     </section>
   </div>
 
@@ -291,6 +402,10 @@
     let currentUid = null;
     let canModerate = false;
     let canManageDelegates = false;
+    let mapData = null;
+    const MAP_UID_HISTORY_KEY = 'dd2_mod_map_uid_history';
+    const MAP_UID_HISTORY_MAX = 30;
+    const enriching = new Set();
 
     async function api(path, opts = {}) {
       const res = await fetch(path, {
@@ -298,26 +413,203 @@
         headers: { 'Content-Type': 'application/json', ...(opts.headers || {}) },
         ...opts,
       });
-      const text = await res.text();
-      let data = null;
-      try { data = JSON.parse(text); } catch (_) { data = { raw: text }; }
-      if (!res.ok) throw new Error(data.error || text || res.statusText);
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || res.statusText || 'request failed');
       return data;
     }
+    const realApi = api;
 
+    function escapeHtml(s) {
+      return String(s ?? '').replace(/[&<>"']/g, c => ({
+        '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+      }[c]));
+    }
+
+    function localTzLabel() {
+      try {
+        const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+        const off = -new Date().getTimezoneOffset();
+        const sign = off >= 0 ? '+' : '-';
+        const abs = Math.abs(off);
+        const hh = String(Math.floor(abs / 60)).padStart(2, '0');
+        const mm = String(abs % 60).padStart(2, '0');
+        return `(${tz}, UTC${sign}${hh}:${mm})`;
+      } catch (_) { return '(local)'; }
+    }
+
+    function formatExpires(iso) {
+      if (!iso) return 'never';
+      const d = new Date(iso);
+      if (Number.isNaN(d.getTime())) return escapeHtml(iso);
+      return `<span class="mono">${escapeHtml(d.toLocaleString())}</span> <span class="hint">UTC ${escapeHtml(d.toISOString())}</span>`;
+    }
+
+    function expiresToIso() {
+      const raw = document.getElementById('ban-expires').value.trim();
+      if (!raw) return null;
+      return raw.length === 16 ? raw + ':00Z' : raw + 'Z';
+    }
+
+    /* ---- tabs ---- */
+    function setTopTab(name) {
+      document.querySelectorAll('#top-tabs button').forEach(b => b.classList.toggle('active', b.dataset.tab === name));
+      document.querySelectorAll('#panel-my-maps, #panel-map, #panel-super').forEach(p => p.classList.remove('active'));
+      const panel = document.getElementById('panel-' + name);
+      if (panel) panel.classList.add('active');
+      const hash = name === 'super' ? 'super/' + (currentSuperSub() || 'maps') : name;
+      if (location.hash.slice(1) !== hash) history.replaceState(null, '', '#' + hash);
+      if (name === 'my-maps' && me) refreshMyMaps();
+      if (name === 'super' && me?.is_super_mod) refreshSuperSub();
+    }
+
+    function setMapSub(name) {
+      document.querySelectorAll('#map-subtabs button').forEach(b => b.classList.toggle('active', b.dataset.msub === name));
+      ['overview', 'bans', 'delegates'].forEach(id => {
+        document.getElementById('msub-' + id).classList.toggle('active', id === name);
+      });
+    }
+
+    function currentSuperSub() {
+      const a = document.querySelector('#super-subtabs button.active');
+      return a ? a.dataset.ssub : 'maps';
+    }
+
+    function setSuperSub(name) {
+      document.querySelectorAll('#super-subtabs button').forEach(b => b.classList.toggle('active', b.dataset.ssub === name));
+      ['maps', 'users', 'admins', 'bans', 'audit', 'supermods'].forEach(id => {
+        document.getElementById('ssub-' + id).classList.toggle('active', id === name);
+      });
+      history.replaceState(null, '', '#super/' + name);
+      refreshSuperSub();
+    }
+
+    function refreshSuperSub() {
+      const s = currentSuperSub();
+      if (s === 'maps') loadSuperMaps();
+      else if (s === 'users') { /* wait for search */ }
+      else if (s === 'admins') loadSuperAdmins();
+      else if (s === 'bans') loadSuperBans();
+      else if (s === 'audit') loadSuperAudit();
+      else if (s === 'supermods') loadSuperMods();
+    }
+
+    function applyHash() {
+      const h = (location.hash || '#my-maps').slice(1);
+      if (h.startsWith('super')) {
+        if (!me?.is_super_mod) { setTopTab('my-maps'); return; }
+        setTopTab('super');
+        const sub = h.split('/')[1] || 'maps';
+        setSuperSub(sub);
+      } else if (h === 'map') setTopTab('map');
+      else setTopTab('my-maps');
+    }
+
+    document.getElementById('top-tabs').addEventListener('click', e => {
+      const btn = e.target.closest('button[data-tab]');
+      if (btn) setTopTab(btn.dataset.tab);
+    });
+    document.getElementById('map-subtabs').addEventListener('click', e => {
+      const btn = e.target.closest('button[data-msub]');
+      if (btn) setMapSub(btn.dataset.msub);
+    });
+    document.getElementById('super-subtabs').addEventListener('click', e => {
+      const btn = e.target.closest('button[data-ssub]');
+      if (btn) setSuperSub(btn.dataset.ssub);
+    });
+
+    /* ---- UID history ---- */
+    function normalizeHistoryEntry(item) {
+      if (typeof item === 'string' && item.trim()) return { uid: item.trim(), map_name: null, author_id: null, updated_at: Date.now() };
+      if (item && typeof item === 'object' && typeof item.uid === 'string' && item.uid.trim()) {
+        return {
+          uid: item.uid.trim(),
+          map_name: item.map_name || null,
+          author_id: item.author_id || null,
+          updated_at: item.updated_at || Date.now(),
+        };
+      }
+      return null;
+    }
+
+    function readMapUidHistory() {
+      try {
+        const raw = localStorage.getItem(MAP_UID_HISTORY_KEY);
+        const list = raw ? JSON.parse(raw) : [];
+        if (!Array.isArray(list)) return [];
+        return list.map(normalizeHistoryEntry).filter(Boolean);
+      } catch (_) { return []; }
+    }
+
+    function writeMapUidHistory(entries) {
+      localStorage.setItem(MAP_UID_HISTORY_KEY, JSON.stringify(entries.slice(0, MAP_UID_HISTORY_MAX)));
+    }
+
+    function rememberMapUid(uid, meta = {}) {
+      const entry = {
+        uid,
+        map_name: meta.map_name || null,
+        author_id: meta.author_id || null,
+        updated_at: Date.now(),
+      };
+      const next = [entry, ...readMapUidHistory().filter(e => e.uid !== uid)];
+      writeMapUidHistory(next);
+      renderMapUidHistory();
+      if (!entry.map_name) maybeEnrichUid(uid);
+    }
+
+    function renderMapUidHistory() {
+      const dl = document.getElementById('map-uid-history');
+      const entries = readMapUidHistory();
+      dl.innerHTML = entries.map(e => {
+        const label = e.map_name ? `${e.map_name} (${e.uid})` : e.uid;
+        return `<option value="${escapeHtml(e.uid)}" label="${escapeHtml(label)}"></option>`;
+      }).join('');
+      const input = document.getElementById('map-uid');
+      if (!input.value && entries[0]) input.value = entries[0].uid;
+      entries.filter(e => !e.map_name).slice(0, 5).forEach(e => maybeEnrichUid(e.uid));
+    }
+
+    async function maybeEnrichUid(uid) {
+      if (!me || enriching.has(uid)) return;
+      enriching.add(uid);
+      try {
+        const data = await api('/api/mod/map/' + encodeURIComponent(uid));
+        const meta = data.meta || {};
+        if (meta.map_name || meta.author_id) {
+          const next = readMapUidHistory().map(e => e.uid === uid ? {
+            ...e,
+            map_name: meta.map_name || e.map_name,
+            author_id: meta.author_id || e.author_id,
+            updated_at: Date.now(),
+          } : e);
+          writeMapUidHistory(next);
+          renderMapUidHistory();
+        }
+      } catch (_) { /* ignore enrichment failures */ }
+      finally { enriching.delete(uid); }
+    }
+
+    /* ---- auth ---- */
     async function refreshMe() {
       try {
         me = await api('/api/mod/me');
-        document.getElementById('logged-out').classList.add('hidden');
-        document.getElementById('logged-in').classList.remove('hidden');
+        document.getElementById('auth-logged-out').classList.add('hidden');
+        document.getElementById('auth-logged-in').classList.remove('hidden');
         document.getElementById('me-name').textContent = me.display_name;
-        document.getElementById('me-wsid').textContent = me.wsid;
+        const wsidEl = document.getElementById('me-wsid');
+        wsidEl.textContent = me.wsid;
+        wsidEl.title = me.wsid;
         document.getElementById('me-role').textContent = me.is_super_mod ? 'Super-mod' : 'Player';
         document.getElementById('me-role').className = 'tag' + (me.is_super_mod ? ' ok' : '');
+        document.getElementById('top-tabs').classList.remove('hidden');
+        document.getElementById('tab-super').classList.toggle('hidden', !me.is_super_mod);
+        applyHash();
+        refreshMyMaps();
       } catch (_) {
         me = null;
-        document.getElementById('logged-out').classList.remove('hidden');
-        document.getElementById('logged-in').classList.add('hidden');
+        document.getElementById('auth-logged-out').classList.remove('hidden');
+        document.getElementById('auth-logged-in').classList.add('hidden');
+        document.getElementById('top-tabs').classList.add('hidden');
       }
     }
 
@@ -326,37 +618,50 @@
       location.reload();
     }
 
-    const MAP_UID_HISTORY_KEY = 'dd2_mod_map_uid_history';
-    const MAP_UID_HISTORY_MAX = 30;
+    /* ---- My Maps ---- */
+    function mapRowHtml(m, role) {
+      const name = m.map_name || 'unnamed';
+      const uidJs = JSON.stringify(m.map_uid);
+      return `<div class="entry">
+        <div class="title">${escapeHtml(name)} <span class="tag">${escapeHtml(role)}</span></div>
+        <div class="meta mono">${escapeHtml(m.map_uid)}</div>
+        <div class="actions">
+          <button type="button" class="primary" onclick='openMap(${uidJs})'>Open</button>
+        </div>
+      </div>`;
+    }
 
-    function readMapUidHistory() {
+    async function refreshMyMaps() {
+      if (!me) return;
+      const authoredEl = document.getElementById('my-authored');
+      const delegatedEl = document.getElementById('my-delegated');
+      authoredEl.textContent = 'Loading…';
+      delegatedEl.textContent = 'Loading…';
       try {
-        const raw = localStorage.getItem(MAP_UID_HISTORY_KEY);
-        const list = raw ? JSON.parse(raw) : [];
-        return Array.isArray(list) ? list.filter(u => typeof u === 'string' && u.trim()) : [];
-      } catch (_) {
-        return [];
+        const data = await api('/api/mod/my-maps');
+        authoredEl.innerHTML = data.authored?.length
+          ? data.authored.map(m => mapRowHtml(m, 'Author')).join('')
+          : '<div class="empty">No authored Maps in cache yet. Load a Map UID you own to register it.</div>';
+        delegatedEl.innerHTML = data.delegated?.length
+          ? data.delegated.map(m => mapRowHtml(m, 'Delegate')).join('')
+          : '<div class="empty">No delegated Maps.</div>';
+        [...(data.authored || []), ...(data.delegated || [])]
+          .filter(m => !m.map_name)
+          .slice(0, 8)
+          .forEach(m => maybeEnrichUid(m.map_uid));
+      } catch (e) {
+        authoredEl.innerHTML = `<div class="err">${escapeHtml(e.message)}</div>`;
+        delegatedEl.innerHTML = '';
       }
     }
 
-    function writeMapUidHistory(uids) {
-      localStorage.setItem(MAP_UID_HISTORY_KEY, JSON.stringify(uids.slice(0, MAP_UID_HISTORY_MAX)));
+    function openMap(uid) {
+      document.getElementById('map-uid').value = uid;
+      setTopTab('map');
+      loadMap();
     }
 
-    function rememberMapUid(uid) {
-      const next = [uid, ...readMapUidHistory().filter(u => u !== uid)];
-      writeMapUidHistory(next);
-      renderMapUidHistory();
-    }
-
-    function renderMapUidHistory() {
-      const dl = document.getElementById('map-uid-history');
-      const uids = readMapUidHistory();
-      dl.innerHTML = uids.map(u => `<option value="${escapeHtml(u)}"></option>`).join('');
-      const input = document.getElementById('map-uid');
-      if (!input.value && uids[0]) input.value = uids[0];
-    }
-
+    /* ---- Map load ---- */
     async function loadMap() {
       const uid = document.getElementById('map-uid').value.trim();
       document.getElementById('map-err').textContent = '';
@@ -365,155 +670,360 @@
       try {
         const data = await api('/api/mod/map/' + encodeURIComponent(uid));
         currentUid = uid;
-        rememberMapUid(uid);
+        mapData = data;
+        rememberMapUid(uid, data.meta || {});
         canModerate = data.can_moderate;
         canManageDelegates = data.is_author || data.is_super_mod;
         const m = data.meta;
         document.getElementById('map-info').innerHTML =
           `<span class="tag">${escapeHtml(m.map_name || 'unnamed')}</span>` +
-          ` author <code>${m.author_id}</code>` +
+          ` author <code class="mono">${escapeHtml(m.author_id)}</code>` +
           (data.is_author ? ' <span class="tag ok">Map Author</span>' : '') +
           (data.is_delegate ? ' <span class="tag ok">Delegate</span>' : '') +
+          (data.is_super_mod ? ' <span class="tag ok">Super-mod</span>' : '') +
           (data.can_moderate ? '' : ' <span class="tag warn">No mod rights</span>');
-        document.getElementById('ban-card').classList.toggle('hidden', !canModerate);
-        document.getElementById('delegate-card').classList.toggle('hidden', !canModerate);
+        document.getElementById('map-workspace').classList.toggle('hidden', !canModerate);
+        document.getElementById('map-panel-docs').classList.toggle('hidden', canModerate);
+        document.getElementById('delegate-manage').classList.toggle('hidden', !canManageDelegates);
+        renderOverview();
         if (canModerate) {
           await refreshBans();
           await refreshDelegates();
         }
+        setMapSub('overview');
       } catch (e) {
         document.getElementById('map-err').textContent = e.message;
-        document.getElementById('ban-card').classList.add('hidden');
-        document.getElementById('delegate-card').classList.add('hidden');
+        document.getElementById('map-workspace').classList.add('hidden');
+        document.getElementById('map-panel-docs').classList.remove('hidden');
       }
     }
 
+    function renderOverview() {
+      if (!mapData) return;
+      const m = mapData.meta;
+      document.getElementById('overview-body').innerHTML = `
+        <div class="entry">
+          <div class="title">${escapeHtml(m.map_name || 'unnamed')}</div>
+          <div class="meta mono">UID ${escapeHtml(m.map_uid)}</div>
+          <div class="meta mono">Author ${escapeHtml(m.author_id)}</div>
+          <div class="meta">Fetched ${escapeHtml(m.fetched_at)} · Updated ${escapeHtml(m.updated_at)}</div>
+          <div style="margin-top:0.5rem">
+            ${mapData.is_author ? '<span class="tag ok">Map Author</span>' : ''}
+            ${mapData.is_delegate ? '<span class="tag ok">Delegate</span>' : ''}
+            ${mapData.is_super_mod ? '<span class="tag ok">Super-mod</span>' : ''}
+            ${mapData.can_moderate ? '' : '<span class="tag warn">View only</span>'}
+          </div>
+        </div>`;
+    }
+
     async function refreshBans() {
-      const bans = await api('/api/mod/map/' + encodeURIComponent(currentUid) + '/bans');
+      if (!currentUid) return;
       const el = document.getElementById('ban-list');
-      if (!bans.length) { el.innerHTML = '<p class="sub">No active Map Bans.</p>'; return; }
-      el.innerHTML = bans.map(b => `<div class="entry">
-        <div class="entry-grid">
-          <div class="k">User</div><div><code class="wsid">${b.user_id}</code></div>
-          <div class="k">Public</div><div>${escapeHtml(b.public_message)}</div>
-          <div class="k">Private</div><div>${escapeHtml(b.private_reason)}</div>
-          <div class="k">Expires</div><div class="expires-lines">${formatExpires(b.expires_at)}</div>
-        </div>
-        <div class="entry-actions">
-          <button type="button" onclick="liftBan('${b.user_id}', true)">Unban · keep unofficial</button>
-          <button type="button" onclick="liftBan('${b.user_id}', false)">Unban · clear unofficial</button>
-        </div>
-      </div>`).join('');
+      try {
+        const bans = await api('/api/mod/map/' + encodeURIComponent(currentUid) + '/bans');
+        if (!bans.length) { el.innerHTML = '<div class="empty">No active bans.</div>'; return; }
+        el.innerHTML = bans.map(b => `
+          <div class="entry">
+            <div class="title mono">${escapeHtml(b.user_id)}</div>
+            <div class="meta">Public: ${escapeHtml(b.public_message)}</div>
+            <div class="meta">Private: ${escapeHtml(b.private_reason)}</div>
+            <div class="meta">Expires: ${formatExpires(b.expires_at)}</div>
+            <div class="actions">
+              <button type="button" class="ghost" onclick='liftBan(${JSON.stringify(b.user_id)}, false)'>Lift + clear unofficial</button>
+              <button type="button" class="ghost" onclick='liftBan(${JSON.stringify(b.user_id)}, true)'>Lift, keep unofficial</button>
+            </div>
+          </div>`).join('');
+      } catch (e) {
+        el.innerHTML = `<div class="err">${escapeHtml(e.message)}</div>`;
+      }
     }
 
     async function createBan() {
-      const msg = document.getElementById('ban-msg');
-      msg.textContent = '';
-      msg.className = '';
+      document.getElementById('ban-err').textContent = '';
+      const body = {
+        user_id: document.getElementById('ban-user').value.trim() || null,
+        display_name: document.getElementById('ban-name').value.trim() || null,
+        private_reason: document.getElementById('ban-private').value,
+        public_message: document.getElementById('ban-public').value,
+        expires_at: expiresToIso(),
+      };
       try {
-        const expiresRaw = document.getElementById('ban-expires').value.trim();
-        let expires_at = null;
-        if (expiresRaw) {
-          const d = new Date(expiresRaw);
-          if (Number.isNaN(d.getTime())) throw new Error('invalid expires_at');
-          expires_at = d.toISOString();
-        }
-        const body = {
-          display_name: document.getElementById('ban-name').value.trim() || null,
-          user_id: document.getElementById('ban-wsid').value.trim() || null,
-          private_reason: document.getElementById('ban-private').value,
-          public_message: document.getElementById('ban-public').value,
-          expires_at,
-        };
         await api('/api/mod/map/' + encodeURIComponent(currentUid) + '/bans', {
           method: 'POST', body: JSON.stringify(body),
         });
-        msg.textContent = 'Map Ban applied.';
-        msg.className = 'okmsg';
+        document.getElementById('ban-user').value = '';
+        document.getElementById('ban-name').value = '';
+        document.getElementById('ban-private').value = '';
+        document.getElementById('ban-public').value = '';
+        document.getElementById('ban-expires').value = '';
         await refreshBans();
       } catch (e) {
-        msg.textContent = e.message;
-        msg.className = 'err';
+        document.getElementById('ban-err').textContent = e.message;
       }
     }
 
     async function liftBan(userId, keep) {
-      await api('/api/mod/map/' + encodeURIComponent(currentUid) + '/bans/' + userId + '/lift', {
-        method: 'POST', body: JSON.stringify({ keep_unofficial: keep }),
-      });
-      await refreshBans();
+      try {
+        await api('/api/mod/map/' + encodeURIComponent(currentUid) + '/bans/' + encodeURIComponent(userId) + '/lift', {
+          method: 'POST', body: JSON.stringify({ keep_unofficial: keep }),
+        });
+        await refreshBans();
+      } catch (e) {
+        document.getElementById('ban-err').textContent = e.message;
+      }
     }
 
     async function refreshDelegates() {
-      const dels = await api('/api/mod/map/' + encodeURIComponent(currentUid) + '/delegates');
+      if (!currentUid) return;
       const el = document.getElementById('delegate-list');
-      if (!dels.length) { el.innerHTML = '<p class="sub">No Delegates.</p>'; return; }
-      el.innerHTML = dels.map(d => `<div class="entry">
-        <div class="entry-grid">
-          <div class="k">Name</div><div>${escapeHtml(d.display_name || '')}</div>
-          <div class="k">WSID</div><div><code class="wsid">${d.user_id}</code></div>
-        </div>
-        ${canManageDelegates ? `<div class="entry-actions">
-          <button type="button" class="danger" onclick="removeDelegate('${d.user_id}')">Remove</button>
-        </div>` : ''}
-      </div>`).join('');
+      try {
+        const dels = await api('/api/mod/map/' + encodeURIComponent(currentUid) + '/delegates');
+        if (!dels.length) { el.innerHTML = '<div class="empty">No delegates.</div>'; return; }
+        el.innerHTML = dels.map(d => `
+          <div class="entry">
+            <div class="title">${escapeHtml(d.display_name || 'unknown')} <span class="mono">${escapeHtml(d.user_id)}</span></div>
+            <div class="meta">Granted by <span class="mono">${escapeHtml(d.granted_by)}</span></div>
+            <div class="actions">
+              ${canManageDelegates ? `<button type="button" class="danger" onclick='removeDelegate(${JSON.stringify(d.user_id)})'>Remove</button>` : ''}
+            </div>
+          </div>`).join('');
+      } catch (e) {
+        el.innerHTML = `<div class="err">${escapeHtml(e.message)}</div>`;
+      }
     }
 
     async function addDelegate() {
-      const msg = document.getElementById('del-msg');
-      msg.textContent = '';
+      document.getElementById('del-err').textContent = '';
+      const body = {
+        user_id: document.getElementById('del-user').value.trim() || null,
+        display_name: document.getElementById('del-name').value.trim() || null,
+      };
       try {
         await api('/api/mod/map/' + encodeURIComponent(currentUid) + '/delegates', {
-          method: 'POST',
-          body: JSON.stringify({
-            display_name: document.getElementById('del-name').value.trim() || null,
-            user_id: document.getElementById('del-wsid').value.trim() || null,
-          }),
+          method: 'POST', body: JSON.stringify(body),
         });
-        msg.textContent = 'Delegate added.';
-        msg.className = 'okmsg';
+        document.getElementById('del-user').value = '';
+        document.getElementById('del-name').value = '';
         await refreshDelegates();
       } catch (e) {
-        msg.textContent = e.message;
-        msg.className = 'err';
+        document.getElementById('del-err').textContent = e.message;
       }
     }
 
     async function removeDelegate(userId) {
-      await api('/api/mod/map/' + encodeURIComponent(currentUid) + '/delegates/' + userId, { method: 'DELETE' });
-      await refreshDelegates();
-    }
-
-    function escapeHtml(s) {
-      return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-    }
-
-    function localTzLabel() {
       try {
-        const tz = Intl.DateTimeFormat().resolvedOptions().timeZone || 'local';
-        const parts = new Intl.DateTimeFormat('en-AU', { timeZoneName: 'short' }).formatToParts(new Date());
-        const short = parts.find(p => p.type === 'timeZoneName')?.value || '';
-        return short ? `${tz} · ${short}` : tz;
-      } catch (_) {
-        return 'local time';
+        await api('/api/mod/map/' + encodeURIComponent(currentUid) + '/delegates/' + encodeURIComponent(userId), {
+          method: 'DELETE',
+        });
+        await refreshDelegates();
+      } catch (e) {
+        document.getElementById('del-err').textContent = e.message;
       }
     }
 
-    function formatExpires(iso) {
-      if (!iso) return '—';
-      const d = new Date(iso);
-      if (Number.isNaN(d.getTime())) return escapeHtml(String(iso));
-      const local = d.toLocaleString('en-AU', {
-        year: 'numeric', month: 'short', day: 'numeric',
-        hour: '2-digit', minute: '2-digit', timeZoneName: 'short',
-      });
-      const utc = d.toISOString().replace('T', ' ').replace(/\.\d{3}Z$/, ' UTC');
-      return `<span>${escapeHtml(local)}</span><span>${escapeHtml(utc)}</span>`;
+    /* ---- SuperMod ---- */
+    async function loadSuperMaps() {
+      const el = document.getElementById('super-maps');
+      el.textContent = 'Loading…';
+      try {
+        const q = document.getElementById('super-map-q').value.trim();
+        const maps = await api('/api/mod/super/maps?q=' + encodeURIComponent(q) + '&limit=100');
+        if (!maps.length) { el.innerHTML = '<div class="empty">No maps matched.</div>'; return; }
+        el.innerHTML = maps.map(m => `
+          <div class="entry">
+            <div class="title">${escapeHtml(m.map_name || 'unnamed')}</div>
+            <div class="meta mono">${escapeHtml(m.map_uid)}</div>
+            <div class="meta mono">author ${escapeHtml(m.author_id)}</div>
+            <div class="actions"><button type="button" class="primary" onclick='openMap(${JSON.stringify(m.map_uid)})'>Open</button></div>
+          </div>`).join('');
+      } catch (e) {
+        el.innerHTML = `<div class="err">${escapeHtml(e.message)}</div>`;
+      }
+    }
+
+    async function loadSuperUsers() {
+      const el = document.getElementById('super-users');
+      const q = document.getElementById('super-user-q').value.trim();
+      if (!q) { el.innerHTML = '<div class="empty">Enter a name or WSID.</div>'; return; }
+      el.textContent = 'Loading…';
+      try {
+        const users = await api('/api/mod/super/users?q=' + encodeURIComponent(q));
+        if (!users.length) { el.innerHTML = '<div class="empty">No users found.</div>'; return; }
+        el.innerHTML = users.map(u => `
+          <div class="entry">
+            <div class="title">${escapeHtml(u.display_name)} ${u.is_super_mod ? '<span class="tag ok">Super-mod</span>' : ''}</div>
+            <div class="meta mono">${escapeHtml(u.user_id)}</div>
+            <div class="meta">Authored maps: ${u.authored_maps} · Active bans: ${u.active_bans} · Delegate seats: ${u.delegate_seats}</div>
+          </div>`).join('');
+      } catch (e) {
+        el.innerHTML = `<div class="err">${escapeHtml(e.message)}</div>`;
+      }
+    }
+
+    async function loadSuperAdmins() {
+      const aEl = document.getElementById('super-authors');
+      const dEl = document.getElementById('super-delegates');
+      aEl.textContent = 'Loading…';
+      dEl.textContent = 'Loading…';
+      try {
+        const data = await api('/api/mod/super/map-admins');
+        aEl.innerHTML = data.authors?.length
+          ? data.authors.map(a => `
+            <div class="entry">
+              <div class="title">${escapeHtml(a.display_name || 'unknown')}</div>
+              <div class="meta mono">${escapeHtml(a.author_id)}</div>
+              <div class="meta">${a.map_count} map(s)</div>
+            </div>`).join('')
+          : '<div class="empty">No authors in cache.</div>';
+        dEl.innerHTML = data.delegates?.length
+          ? data.delegates.map(d => `
+            <div class="entry">
+              <div class="title">${escapeHtml(d.display_name || 'unknown')} on ${escapeHtml(d.map_name || d.map_uid)}</div>
+              <div class="meta mono">${escapeHtml(d.user_id)} · map ${escapeHtml(d.map_uid)}</div>
+              <div class="meta">Granted by ${escapeHtml(d.granted_by_name || d.granted_by)}</div>
+              <div class="actions"><button type="button" class="ghost" onclick='openMap(${JSON.stringify(d.map_uid)})'>Open map</button></div>
+            </div>`).join('')
+          : '<div class="empty">No delegates.</div>';
+      } catch (e) {
+        aEl.innerHTML = `<div class="err">${escapeHtml(e.message)}</div>`;
+        dEl.innerHTML = '';
+      }
+    }
+
+    async function loadSuperBans() {
+      const el = document.getElementById('super-bans');
+      el.textContent = 'Loading…';
+      try {
+        const bans = await api('/api/mod/super/bans?limit=200');
+        if (!bans.length) { el.innerHTML = '<div class="empty">No active bans.</div>'; return; }
+        el.innerHTML = bans.map(b => `
+          <div class="entry">
+            <div class="title">${escapeHtml(b.display_name || b.user_id)} on ${escapeHtml(b.map_name || b.map_uid)}</div>
+            <div class="meta mono">${escapeHtml(b.user_id)}</div>
+            <div class="meta">Public: ${escapeHtml(b.public_message)}</div>
+            <div class="meta">By ${escapeHtml(b.created_by_name || b.created_by)} · Expires ${formatExpires(b.expires_at)}</div>
+            <div class="actions"><button type="button" class="primary" onclick='openMap(${JSON.stringify(b.map_uid)})'>Open map</button></div>
+          </div>`).join('');
+      } catch (e) {
+        el.innerHTML = `<div class="err">${escapeHtml(e.message)}</div>`;
+      }
+    }
+
+    async function loadSuperAudit() {
+      const el = document.getElementById('super-audit');
+      el.textContent = 'Loading…';
+      try {
+        const events = await api('/api/mod/super/audit?limit=200');
+        if (!events.length) { el.innerHTML = '<div class="empty">No audit events yet.</div>'; return; }
+        el.innerHTML = events.map(ev => `
+          <div class="entry">
+            <div class="title"><span class="tag">${escapeHtml(ev.action)}</span> ${escapeHtml(ev.actor_name || ev.actor_id)}</div>
+            <div class="meta">${escapeHtml(ev.at)}${ev.map_uid ? ` · map <span class="mono">${escapeHtml(ev.map_uid)}</span>` : ''}${ev.target_user_id ? ` · target ${escapeHtml(ev.target_name || ev.target_user_id)}` : ''}</div>
+            <div class="meta mono">${escapeHtml(JSON.stringify(ev.detail || {}))}</div>
+          </div>`).join('');
+      } catch (e) {
+        el.innerHTML = `<div class="err">${escapeHtml(e.message)}</div>`;
+      }
+    }
+
+    async function loadSuperMods() {
+      const el = document.getElementById('super-mods-list');
+      el.textContent = 'Loading…';
+      try {
+        const mods = await api('/api/mod/super/super-mods');
+        if (!mods.length) { el.innerHTML = '<div class="empty">None</div>'; return; }
+        el.innerHTML = mods.map(m => `
+          <div class="entry">
+            <div class="title">${escapeHtml(m.display_name)} <span class="mono">${escapeHtml(m.user_id)}</span></div>
+            <div class="meta">Since ${escapeHtml(m.created_at)}</div>
+            <div class="actions">
+              <button type="button" class="danger" onclick='removeSuperMod(${JSON.stringify(m.user_id)})'>Remove</button>
+            </div>
+          </div>`).join('');
+      } catch (e) {
+        el.innerHTML = `<div class="err">${escapeHtml(e.message)}</div>`;
+      }
+    }
+
+    async function addSuperMod() {
+      document.getElementById('sm-err').textContent = '';
+      const body = {
+        user_id: document.getElementById('sm-user').value.trim() || null,
+        display_name: document.getElementById('sm-name').value.trim() || null,
+      };
+      try {
+        await api('/api/mod/super/super-mods', { method: 'POST', body: JSON.stringify(body) });
+        document.getElementById('sm-user').value = '';
+        document.getElementById('sm-name').value = '';
+        await loadSuperMods();
+      } catch (e) {
+        document.getElementById('sm-err').textContent = e.message;
+      }
+    }
+
+    async function removeSuperMod(userId) {
+      document.getElementById('sm-err').textContent = '';
+      try {
+        await api('/api/mod/super/super-mods/' + encodeURIComponent(userId), { method: 'DELETE' });
+        await loadSuperMods();
+      } catch (e) {
+        document.getElementById('sm-err').textContent = e.message;
+      }
     }
 
     document.getElementById('ban-expires-tz').textContent = localTzLabel();
     renderMapUidHistory();
+
+    // Visual review fixture: /admin?vraf=1 mocks API responses (not for production use).
+    if (new URLSearchParams(location.search).has('vraf')) {
+      const mockMeta = {
+        map_uid: 'VrafDemoMapUidXXXXXXXXXXXX',
+        author_id: '0a2d1bc0-4aaa-4374-b2db-3d561bdab1c9',
+        map_name: 'Deep Demo Climb',
+        thumbnail_url: null,
+        fetched_at: '2026-07-27T00:00:00Z',
+        updated_at: '2026-07-27T00:00:00Z',
+      };
+      api = async (path, opts = {}) => {
+        if (path === '/api/mod/me') {
+          return { wsid: mockMeta.author_id, display_name: 'XertroV', is_super_mod: true };
+        }
+        if (path === '/api/mod/my-maps') {
+          return {
+            authored: [mockMeta],
+            delegated: [{ ...mockMeta, map_uid: 'DelegatedMapUidYYYYYYYYYYYY', map_name: 'Side Peak', granted_by: mockMeta.author_id, created_at: '2026-07-01T00:00:00Z' }],
+          };
+        }
+        if (path.startsWith('/api/mod/map/') && path.split('/').length === 5) {
+          return { meta: mockMeta, can_moderate: true, is_author: true, is_delegate: false, is_super_mod: true };
+        }
+        if (path.endsWith('/bans') && (!opts.method || opts.method === 'GET')) {
+          return [{
+            map_uid: mockMeta.map_uid, user_id: '11111111-1111-1111-1111-111111111111',
+            private_reason: 'griefing', public_message: 'Banned for griefing',
+            created_by: mockMeta.author_id, created_at: '2026-07-20T12:00:00Z',
+            expires_at: null, lifted_at: null, lifted_by: null,
+          }];
+        }
+        if (path.endsWith('/delegates') && (!opts.method || opts.method === 'GET')) {
+          return [{ map_uid: mockMeta.map_uid, user_id: '22222222-2222-2222-2222-222222222222', granted_by: mockMeta.author_id, created_at: '2026-07-10T00:00:00Z', display_name: 'Helper' }];
+        }
+        if (path.startsWith('/api/mod/super/maps')) return [mockMeta];
+        if (path.startsWith('/api/mod/super/users')) return [{ user_id: mockMeta.author_id, display_name: 'XertroV', is_super_mod: true, authored_maps: 2, active_bans: 0, delegate_seats: 0 }];
+        if (path.startsWith('/api/mod/super/map-admins')) return { authors: [{ author_id: mockMeta.author_id, display_name: 'XertroV', map_count: 2 }], delegates: [] };
+        if (path.startsWith('/api/mod/super/bans')) return [];
+        if (path.startsWith('/api/mod/super/audit')) return [{ id: 1, at: '2026-07-26T18:00:00Z', actor_id: mockMeta.author_id, actor_name: 'XertroV', action: 'ban.create', map_uid: mockMeta.map_uid, target_user_id: '11111111-1111-1111-1111-111111111111', target_name: 'Griefer', detail: {} }];
+        if (path.startsWith('/api/mod/super/super-mods')) return [{ user_id: mockMeta.author_id, display_name: 'XertroV', granted_by: null, created_at: '2026-01-01T00:00:00Z' }];
+        if (opts.method && opts.method !== 'GET') return { ok: true };
+        return realApi(path, opts);
+      };
+      localStorage.setItem(MAP_UID_HISTORY_KEY, JSON.stringify([
+        { uid: mockMeta.map_uid, map_name: mockMeta.map_name, author_id: mockMeta.author_id, updated_at: Date.now() },
+      ]));
+    }
+
     refreshMe();
+    window.addEventListener('hashchange', applyHash);
   </script>
 </body>
 </html>
