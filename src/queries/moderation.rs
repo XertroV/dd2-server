@@ -91,6 +91,16 @@ pub async fn is_super_mod(pool: &Pool<Postgres>, user_id: &Uuid) -> Result<bool,
     Ok(r.is_some())
 }
 
+pub async fn get_user_display_name(pool: &Pool<Postgres>, user_id: &Uuid) -> Result<Option<String>, sqlx::Error> {
+    let r = query!(
+        r#"SELECT display_name FROM users WHERE web_services_user_id = $1"#,
+        user_id
+    )
+    .fetch_optional(pool)
+    .await?;
+    Ok(r.map(|row| row.display_name))
+}
+
 pub async fn is_map_delegate(pool: &Pool<Postgres>, map_uid: &str, user_id: &Uuid) -> Result<bool, sqlx::Error> {
     let r = query!(
         r#"SELECT 1 AS one FROM map_delegates WHERE map_uid = $1 AND user_id = $2"#,

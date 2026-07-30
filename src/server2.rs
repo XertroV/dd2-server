@@ -9,7 +9,7 @@ use num_traits::ToPrimitive;
 use op_auth::check_token;
 use player::{parse_u64_str, LoginSession};
 use queries::{
-    context_mark_succeeded, create_session, custom_maps::get_map_nb_playing_live, get_global_lb, get_global_overview, get_user_in_lb,
+    context_mark_succeeded, create_session, get_global_lb, get_global_overview, get_user_in_lb,
     get_user_stats, insert_context_packed, insert_finish, insert_respawn, insert_start_fall, register_or_login, resume_session,
     update_fall_with_end, update_server_stats, update_user_color, update_users_stats, user_settings, PBUpdateRes,
 };
@@ -40,12 +40,12 @@ use tokio_graceful_shutdown::{FutureExt, SubsystemBuilder, SubsystemHandle, Topl
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use uuid::Uuid;
 
-use crate::{
+    use crate::{
     cache_util::AsyncCache,
     consts::DD2_MAP_UID,
     op_auth::init_op_config,
     player::{check_flags_sf_mi, ToPlayer},
-    queries::{custom_map_aux_specs, get_server_info, update_user_pb_height},
+    queries::{custom_map_aux_specs, custom_maps::get_map_overview_player_counts, get_server_info, update_user_pb_height},
     router::{write_response, LeaderboardEntry},
 };
 
@@ -1114,40 +1114,7 @@ impl XPlayer {
         map_uid: &str,
         user_id: &Uuid,
     ) -> Result<Option<LeaderboardEntry2>, api_error::Error> {
-        // Include the requesting user even if Map-Banned so they still see their Standing;
-        // public LB queries exclude Map Bans. Shadowbans remain filtered.
-        let resp = query!(
-            r#"--sql
-            WITH lb AS (
-                SELECT m.user_id, u.display_name, c.color, m.pos, m.race_time, rank() OVER (ORDER BY m.height DESC) AS rank, m.updated_at
-                FROM map_leaderboard m
-                LEFT JOIN users u ON u.web_services_user_id = m.user_id
-                LEFT JOIN colors c ON c.user_id = m.user_id
-                LEFT JOIN shadow_bans AS sb ON m.user_id = sb.user_id
-                LEFT JOIN map_bans mb ON m.user_id = mb.user_id AND mb.map_uid = m.map_uid
-                    AND mb.lifted_at IS NULL
-                    AND (mb.expires_at IS NULL OR mb.expires_at > NOW())
-                WHERE m.map_uid = $1 AND sb.user_id IS NULL
-                  AND (mb.user_id IS NULL OR m.user_id = $2)
-            )
-            SELECT * FROM lb WHERE user_id = $2
-        "#,
-            map_uid,
-            &user_id
-        )
-        .fetch_optional(pool)
-        .await?
-        .map(|r| LeaderboardEntry2 {
-            rank: r.rank.unwrap_or_default() as u32,
-            wsid: r.user_id.to_string(),
-            pos: [r.pos[0], r.pos[1], r.pos[2]],
-            ts: r.updated_at.and_utc().timestamp() as u32,
-            name: r.display_name,
-            update_count: 0,
-            color: [r.color[0], r.color[1], r.color[2]],
-            race_time: r.race_time as i64,
-        });
-        Ok(resp)
+        Ok(queries::get_map_rank_entry(pool, map_uid, user_id).await?)
     }
 
     pub async fn get_map_rank(
@@ -1173,27 +1140,12 @@ impl XPlayer {
         queue_tx: &UnboundedSender<Response>,
         map_uid: String,
     ) -> Result<(), api_error::Error> {
-        let nb_players_on_lb: u32 = query!(
-            r#"--sql
-            SELECT COUNT(*) FROM map_leaderboard m
-            LEFT JOIN shadow_bans sb ON m.user_id = sb.user_id
-            LEFT JOIN map_bans mb ON m.user_id = mb.user_id AND mb.map_uid = m.map_uid
-                AND mb.lifted_at IS NULL
-                AND (mb.expires_at IS NULL OR mb.expires_at > NOW())
-            WHERE m.map_uid = $1 AND sb.user_id IS NULL AND mb.user_id IS NULL
-        "#,
-            &map_uid
-        )
-        .fetch_one(pool)
-        .await?
-        .count
-        .unwrap_or(0) as u32;
-        let nb_playing_now = get_map_nb_playing_live(pool, &map_uid).await? as u32;
+        let (nb_players_on_lb, nb_playing_now) = get_map_overview_player_counts(pool, &map_uid).await?;
 
         queue_tx.send(Response::MapOverview {
             uid: map_uid,
-            nb_players_on_lb,
-            nb_playing_now,
+            nb_players_on_lb: nb_players_on_lb as u32,
+            nb_playing_now: nb_playing_now as u32,
         })?;
         Ok(())
     }

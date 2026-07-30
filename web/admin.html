@@ -62,13 +62,13 @@
     }
     .tabs {
       display: flex; gap: 0.25rem; border-bottom: 1px solid var(--border);
-      margin-bottom: 1.25rem; overflow-x: auto;
+      margin-bottom: 1.25rem; overflow: hidden;
     }
     .tabs button {
       appearance: none; border: 0; background: transparent; color: var(--muted-fg);
       font: inherit; font-size: 13px; font-weight: 500; padding: 0.65rem 0.85rem;
       cursor: pointer; border-bottom: 2px solid transparent; margin-bottom: -1px;
-      white-space: nowrap; border-radius: 0;
+      white-space: nowrap; border-radius: 0; flex: 0 0 auto;
     }
     .tabs button:hover { color: var(--foreground); }
     .tabs button.active { color: var(--foreground); border-bottom-color: var(--foreground); }
@@ -130,9 +130,16 @@
     button:disabled { opacity: 0.5; cursor: not-allowed; }
     .tag {
       display: inline-flex; align-items: center; gap: 0.25rem;
-      font-size: 11px; font-weight: 500; padding: 0.15rem 0.45rem;
-      border-radius: 999px; border: 1px solid var(--border);
+      font-size: 11px; font-weight: 500; padding: 0.2rem 0.6rem;
+      border-radius: 2px; border: 1px solid var(--border);
       background: var(--muted); color: var(--muted-fg); vertical-align: middle;
+      transform: skewX(-15deg);
+      margin-right: 0.15rem;
+    }
+    .tag-inner {
+      display: inline-block;
+      transform: skewX(15deg);
+      white-space: nowrap;
     }
     .tag.ok { background: var(--ok); color: var(--ok-fg); border-color: #166534; }
     .tag.warn { background: var(--warn); color: var(--warn-fg); border-color: #a16207; }
@@ -185,7 +192,7 @@
           <a class="btn primary" href="/api/mod/oauth/start">Sign in with Trackmania</a>
         </div>
         <div id="auth-logged-in" class="hidden">
-          <div><strong id="me-name">—</strong> <span id="me-role" class="tag">—</span></div>
+          <div><strong id="me-name">—</strong> <span id="me-role" class="tag"><span class="tag-inner">—</span></span></div>
           <div class="wsid" id="me-wsid" title=""></div>
           <button type="button" class="ghost" onclick="logout()">Sign out</button>
         </div>
@@ -444,6 +451,30 @@
       }[c]));
     }
 
+    function tagHtml(text, cls = '') {
+      return `<span class="tag${cls ? ' ' + cls : ''}"><span class="tag-inner">${escapeHtml(text)}</span></span>`;
+    }
+
+    /** Name before WSID when known. */
+    function playerHtml(name, id) {
+      const idStr = String(id ?? '');
+      const n = (name && String(name).trim() && String(name).trim() !== 'unknown') ? String(name).trim() : '';
+      if (n) {
+        return `<strong>${escapeHtml(n)}</strong> <code class="mono">${escapeHtml(idStr)}</code>`;
+      }
+      return `<code class="mono">${escapeHtml(idStr)}</code>`;
+    }
+
+    /** Viewer relationship to the open Map — not the author's roles. */
+    function yourAccessHtml(data) {
+      const bits = [];
+      if (data.is_author) bits.push(tagHtml('You · Author', 'ok'));
+      if (data.is_delegate) bits.push(tagHtml('You · Delegate', 'ok'));
+      if (data.is_super_mod) bits.push(tagHtml('You · Super-mod', 'ok'));
+      if (!data.can_moderate) bits.push(tagHtml('No mod rights', 'warn'));
+      return bits.join(' ');
+    }
+
     function localTzLabel() {
       try {
         const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
@@ -618,8 +649,9 @@
         const wsidEl = document.getElementById('me-wsid');
         wsidEl.textContent = me.wsid;
         wsidEl.title = me.wsid;
-        document.getElementById('me-role').textContent = me.is_super_mod ? 'Super-mod' : 'Player';
-        document.getElementById('me-role').className = 'tag' + (me.is_super_mod ? ' ok' : '');
+        document.getElementById('me-role').outerHTML = me.is_super_mod
+          ? `<span id="me-role" class="tag ok"><span class="tag-inner">Super-mod</span></span>`
+          : `<span id="me-role" class="tag"><span class="tag-inner">Player</span></span>`;
         document.getElementById('top-tabs').classList.remove('hidden');
         document.getElementById('tab-super').classList.toggle('hidden', !me.is_super_mod);
         applyHash();
@@ -642,7 +674,7 @@
       const name = m.map_name || 'unnamed';
       const uidJs = JSON.stringify(m.map_uid);
       return `<div class="entry">
-        <div class="title">${escapeHtml(name)} <span class="tag">${escapeHtml(role)}</span></div>
+        <div class="title">${escapeHtml(name)} ${tagHtml(role)}</div>
         <div class="meta mono">${escapeHtml(m.map_uid)}</div>
         <div class="actions">
           <button type="button" class="primary" onclick='openMap(${uidJs})'>Open</button>
@@ -694,13 +726,11 @@
         canModerate = data.can_moderate;
         canManageDelegates = data.is_author || data.is_super_mod;
         const m = data.meta;
+        const authorName = data.author_display_name || null;
         document.getElementById('map-info').innerHTML =
-          `<span class="tag">${escapeHtml(m.map_name || 'unnamed')}</span>` +
-          ` author <code class="mono">${escapeHtml(m.author_id)}</code>` +
-          (data.is_author ? ' <span class="tag ok">Map Author</span>' : '') +
-          (data.is_delegate ? ' <span class="tag ok">Delegate</span>' : '') +
-          (data.is_super_mod ? ' <span class="tag ok">Super-mod</span>' : '') +
-          (data.can_moderate ? '' : ' <span class="tag warn">No mod rights</span>');
+          `${tagHtml(m.map_name || 'unnamed')}` +
+          ` author ${playerHtml(authorName, m.author_id)}` +
+          `<div style="margin-top:0.45rem">${yourAccessHtml(data)}</div>`;
         document.getElementById('map-workspace').classList.toggle('hidden', !canModerate);
         document.getElementById('map-panel-docs').classList.toggle('hidden', canModerate);
         document.getElementById('delegate-manage').classList.toggle('hidden', !canManageDelegates);
@@ -720,17 +750,16 @@
     function renderOverview() {
       if (!mapData) return;
       const m = mapData.meta;
+      const authorName = mapData.author_display_name || null;
       document.getElementById('overview-body').innerHTML = `
         <div class="entry">
           <div class="title">${escapeHtml(m.map_name || 'unnamed')}</div>
           <div class="meta mono">UID ${escapeHtml(m.map_uid)}</div>
-          <div class="meta mono">Author ${escapeHtml(m.author_id)}</div>
+          <div class="meta">Author ${playerHtml(authorName, m.author_id)}</div>
           <div class="meta">Fetched ${escapeHtml(m.fetched_at)} · Updated ${escapeHtml(m.updated_at)}</div>
           <div style="margin-top:0.5rem">
-            ${mapData.is_author ? '<span class="tag ok">Map Author</span>' : ''}
-            ${mapData.is_delegate ? '<span class="tag ok">Delegate</span>' : ''}
-            ${mapData.is_super_mod ? '<span class="tag ok">Super-mod</span>' : ''}
-            ${mapData.can_moderate ? '' : '<span class="tag warn">View only</span>'}
+            <span class="hint" style="margin-right:0.35rem">Your access</span>
+            ${yourAccessHtml(mapData) || tagHtml('None')}
           </div>
         </div>`;
     }
@@ -743,7 +772,7 @@
         if (!bans.length) { el.innerHTML = '<div class="empty">No active bans.</div>'; return; }
         el.innerHTML = bans.map(b => `
           <div class="entry">
-            <div class="title mono">${escapeHtml(b.user_id)}</div>
+            <div class="title">${playerHtml(b.display_name, b.user_id)}</div>
             <div class="meta">Public: ${escapeHtml(b.public_message)}</div>
             <div class="meta">Private: ${escapeHtml(b.private_reason)}</div>
             <div class="meta">Expires: ${formatExpires(b.expires_at)}</div>
@@ -800,7 +829,7 @@
         if (!dels.length) { el.innerHTML = '<div class="empty">No delegates.</div>'; return; }
         el.innerHTML = dels.map(d => `
           <div class="entry">
-            <div class="title">${escapeHtml(d.display_name || 'unknown')} <span class="mono">${escapeHtml(d.user_id)}</span></div>
+            <div class="title">${playerHtml(d.display_name, d.user_id)}</div>
             <div class="meta">Granted by <span class="mono">${escapeHtml(d.granted_by)}</span></div>
             <div class="actions">
               ${canManageDelegates ? `<button type="button" class="danger" onclick='removeDelegate(${JSON.stringify(d.user_id)})'>Remove</button>` : ''}
@@ -852,7 +881,7 @@
           <div class="entry">
             <div class="title">${escapeHtml(m.map_name || 'unnamed')}</div>
             <div class="meta mono">${escapeHtml(m.map_uid)}</div>
-            <div class="meta mono">author ${escapeHtml(m.author_id)}</div>
+            <div class="meta">author ${playerHtml(null, m.author_id)}</div>
             <div class="actions"><button type="button" class="primary" onclick='openMap(${JSON.stringify(m.map_uid)})'>Open</button></div>
           </div>`).join('');
       } catch (e) {
@@ -870,7 +899,7 @@
         if (!users.length) { el.innerHTML = '<div class="empty">No users found.</div>'; return; }
         el.innerHTML = users.map(u => `
           <div class="entry">
-            <div class="title">${escapeHtml(u.display_name)} ${u.is_super_mod ? '<span class="tag ok">Super-mod</span>' : ''}</div>
+            <div class="title">${escapeHtml(u.display_name)} ${u.is_super_mod ? tagHtml('Super-mod', 'ok') : ''}</div>
             <div class="meta mono">${escapeHtml(u.user_id)}</div>
             <div class="meta">Authored maps: ${u.authored_maps} · Active bans: ${u.active_bans} · Delegate seats: ${u.delegate_seats}</div>
           </div>`).join('');
@@ -889,16 +918,15 @@
         aEl.innerHTML = data.authors?.length
           ? data.authors.map(a => `
             <div class="entry">
-              <div class="title">${escapeHtml(a.display_name || 'unknown')}</div>
-              <div class="meta mono">${escapeHtml(a.author_id)}</div>
+              <div class="title">${playerHtml(a.display_name, a.author_id)}</div>
               <div class="meta">${a.map_count} map(s)</div>
             </div>`).join('')
           : '<div class="empty">No authors in cache.</div>';
         dEl.innerHTML = data.delegates?.length
           ? data.delegates.map(d => `
             <div class="entry">
-              <div class="title">${escapeHtml(d.display_name || 'unknown')} on ${escapeHtml(d.map_name || d.map_uid)}</div>
-              <div class="meta mono">${escapeHtml(d.user_id)} · map ${escapeHtml(d.map_uid)}</div>
+              <div class="title">${playerHtml(d.display_name, d.user_id)} on ${escapeHtml(d.map_name || d.map_uid)}</div>
+              <div class="meta mono">map ${escapeHtml(d.map_uid)}</div>
               <div class="meta">Granted by ${escapeHtml(d.granted_by_name || d.granted_by)}</div>
               <div class="actions"><button type="button" class="ghost" onclick='openMap(${JSON.stringify(d.map_uid)})'>Open map</button></div>
             </div>`).join('')
@@ -917,8 +945,7 @@
         if (!bans.length) { el.innerHTML = '<div class="empty">No active bans.</div>'; return; }
         el.innerHTML = bans.map(b => `
           <div class="entry">
-            <div class="title">${escapeHtml(b.display_name || b.user_id)} on ${escapeHtml(b.map_name || b.map_uid)}</div>
-            <div class="meta mono">${escapeHtml(b.user_id)}</div>
+            <div class="title">${playerHtml(b.display_name, b.user_id)} on ${escapeHtml(b.map_name || b.map_uid)}</div>
             <div class="meta">Public: ${escapeHtml(b.public_message)}</div>
             <div class="meta">By ${escapeHtml(b.created_by_name || b.created_by)} · Expires ${formatExpires(b.expires_at)}</div>
             <div class="actions"><button type="button" class="primary" onclick='openMap(${JSON.stringify(b.map_uid)})'>Open map</button></div>
@@ -936,8 +963,8 @@
         if (!events.length) { el.innerHTML = '<div class="empty">No audit events yet.</div>'; return; }
         el.innerHTML = events.map(ev => `
           <div class="entry">
-            <div class="title"><span class="tag">${escapeHtml(ev.action)}</span> ${escapeHtml(ev.actor_name || ev.actor_id)}</div>
-            <div class="meta">${escapeHtml(ev.at)}${ev.map_uid ? ` · map <span class="mono">${escapeHtml(ev.map_uid)}</span>` : ''}${ev.target_user_id ? ` · target ${escapeHtml(ev.target_name || ev.target_user_id)}` : ''}</div>
+            <div class="title">${tagHtml(ev.action)} ${playerHtml(ev.actor_name, ev.actor_id)}</div>
+            <div class="meta">${escapeHtml(ev.at)}${ev.map_uid ? ` · map <span class="mono">${escapeHtml(ev.map_uid)}</span>` : ''}${ev.target_user_id ? ` · target ${playerHtml(ev.target_name, ev.target_user_id)}` : ''}</div>
             <div class="meta mono">${escapeHtml(JSON.stringify(ev.detail || {}))}</div>
           </div>`).join('');
       } catch (e) {
@@ -953,7 +980,7 @@
         if (!mods.length) { el.innerHTML = '<div class="empty">None</div>'; return; }
         el.innerHTML = mods.map(m => `
           <div class="entry">
-            <div class="title">${escapeHtml(m.display_name)} <span class="mono">${escapeHtml(m.user_id)}</span></div>
+            <div class="title">${playerHtml(m.display_name, m.user_id)}</div>
             <div class="meta">Since ${escapeHtml(m.created_at)}</div>
             <div class="actions">
               <button type="button" class="danger" onclick='removeSuperMod(${JSON.stringify(m.user_id)})'>Remove</button>
@@ -1014,7 +1041,14 @@
           };
         }
         if (path.startsWith('/api/mod/map/') && path.split('/').length === 5) {
-          return { meta: mockMeta, can_moderate: true, is_author: true, is_delegate: false, is_super_mod: true };
+          return {
+            meta: mockMeta,
+            author_display_name: 'XertroV',
+            can_moderate: true,
+            is_author: true,
+            is_delegate: false,
+            is_super_mod: true,
+          };
         }
         if (path.endsWith('/bans') && (!opts.method || opts.method === 'GET')) {
           return [{

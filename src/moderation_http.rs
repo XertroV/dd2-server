@@ -409,6 +409,7 @@ async fn handle_me(state: ModerationState, cookie: Option<String>) -> Result<imp
 #[derive(Serialize)]
 struct MapResp {
     meta: moderation::MapMeta,
+    author_display_name: Option<String>,
     can_moderate: bool,
     is_author: bool,
     is_delegate: bool,
@@ -423,6 +424,9 @@ async fn handle_get_map(map_uid: String, state: ModerationState, cookie: Option<
         Ok(m) => m,
         Err(e) => return json_err(StatusCode::BAD_GATEWAY, e),
     };
+    let author_display_name = moderation::get_user_display_name(state.pool.as_ref(), &meta.author_id)
+        .await
+        .unwrap_or(None);
     let is_sm = moderation::is_super_mod(state.pool.as_ref(), &user_id).await.unwrap_or(false);
     let is_author = moderation::is_map_author(state.pool.as_ref(), &map_uid, &user_id)
         .await
@@ -433,6 +437,7 @@ async fn handle_get_map(map_uid: String, state: ModerationState, cookie: Option<
     let can_moderate = is_sm || is_author || is_delegate;
     json_ok(&MapResp {
         meta,
+        author_display_name,
         can_moderate,
         is_author,
         is_delegate,

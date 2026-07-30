@@ -47,6 +47,13 @@ pub async fn get_map_nb_playing_live(pool: &Pool<Postgres>, map_uid: &str) -> Re
     Ok(nb_playing_now)
 }
 
+/// Shared MapOverview counts: public LB size + live players (Map Ban + Shadowban filtered).
+pub async fn get_map_overview_player_counts(pool: &Pool<Postgres>, map_uid: &str) -> Result<(i64, i64), sqlx::Error> {
+    let nb_players_on_lb = get_map_leaderboard_len(pool, map_uid).await?;
+    let nb_playing_now = get_map_nb_playing_live(pool, map_uid).await?;
+    Ok((nb_players_on_lb, nb_playing_now))
+}
+
 pub async fn get_map_leaderboard_len(pool: &Pool<Postgres>, map_uid: &str) -> Result<i64, sqlx::Error> {
     if map_uid.len() > 30 {
         return Err(sqlx::Error::RowNotFound);
@@ -116,6 +123,46 @@ pub async fn get_map_leaderboard(
         })
         .collect();
     Ok(entries)
+}
+
+/// Standing for MapRank: includes the subject even when Map-Banned.
+/// Public LB/live queries exclude Map Bans; Shadowbans remain filtered.
+pub async fn get_map_rank_entry(
+    pool: &Pool<Postgres>,
+    map_uid: &str,
+    user_id: &Uuid,
+) -> Result<Option<LeaderboardEntry2>, sqlx::Error> {
+    let resp = query!(
+        r#"--sql
+        WITH lb AS (
+            SELECT m.user_id, u.display_name, c.color, m.pos, m.race_time, rank() OVER (ORDER BY m.height DESC) AS rank, m.updated_at
+            FROM map_leaderboard m
+            LEFT JOIN users u ON u.web_services_user_id = m.user_id
+            LEFT JOIN colors c ON c.user_id = m.user_id
+            LEFT JOIN shadow_bans AS sb ON m.user_id = sb.user_id
+            LEFT JOIN map_bans mb ON m.user_id = mb.user_id AND mb.map_uid = m.map_uid
+                AND mb.lifted_at IS NULL
+                AND (mb.expires_at IS NULL OR mb.expires_at > NOW())
+            WHERE m.map_uid = $1 AND sb.user_id IS NULL
+              AND (mb.user_id IS NULL OR m.user_id = $2)
+        )
+        SELECT * FROM lb WHERE user_id = $2
+    "#,
+        map_uid,
+        user_id
+    )
+    .fetch_optional(pool)
+    .await?;
+    Ok(resp.map(|r| LeaderboardEntry2 {
+        rank: r.rank.unwrap_or_default() as u32,
+        wsid: r.user_id.to_string(),
+        pos: [r.pos[0], r.pos[1], r.pos[2]],
+        ts: r.updated_at.and_utc().timestamp() as u32,
+        name: r.display_name,
+        update_count: 0,
+        color: [r.color[0], r.color[1], r.color[2]],
+        race_time: r.race_time as i64,
+    }))
 }
 
 /// Upsert a player's current live position for a map (custom-map live heights path).
@@ -419,6 +466,16 @@ mod tests {
             .expect("top live heights")
             .is_empty());
         assert_eq!(get_map_nb_playing_live(&pool, map_uid).await.expect("live count"), 0);
+        let (overview_lb, overview_live) = get_map_overview_player_counts(&pool, map_uid)
+            .await
+            .expect("overview counts");
+        assert_eq!(overview_lb, 0);
+        assert_eq!(overview_live, 0);
+        assert_eq!(
+            overview_lb,
+            get_map_leaderboard_len(&pool, map_uid).await.expect("leaderboard count"),
+            "overview LB count must share get_map_leaderboard_len"
+        );
 
         upsert_map_curr_height(&pool, map_uid, &target, [1.0, 101.0, 2.0], 1100)
             .await
@@ -433,6 +490,80 @@ mod tests {
         .expect("read retained live row");
         assert_eq!(row.height, 101.0);
         assert_eq!(row.update_count, 1);
+
+        cleanup_user(&pool, &target).await;
+        cleanup_user(&pool, &actor).await;
+    }
+
+    /// MapRank seam: Map-Banned Standing stays visible and carries `banned` + public message only.
+    #[tokio::test]
+    async fn map_rank_includes_banned_player_with_public_ban_flag() {
+        let _guard = test_lock();
+        let pool = test_pool().await;
+        let actor = seed_user(&pool, "map-rank-ban-actor").await;
+        let target = seed_user(&pool, "map-rank-ban-target").await;
+        let map_uid = format!("MapRankBan{}", Uuid::new_v4().simple());
+        let map_uid = &map_uid[..27];
+
+        query!(
+            r#"
+            INSERT INTO map_leaderboard (map_uid, user_id, height, pos, race_time)
+            VALUES ($1, $2, $3, $4, $5)
+            "#,
+            map_uid,
+            target,
+            42.0,
+            &[1.0_f64, 42.0, 2.0] as &[f64],
+            500
+        )
+        .execute(&pool)
+        .await
+        .expect("seed leaderboard");
+
+        crate::queries::moderation::apply_map_ban(
+            &pool,
+            map_uid,
+            &target,
+            &actor,
+            "secret-mod-note",
+            "you are banned from this map LB",
+            None,
+        )
+        .await
+        .expect("apply Map Ban");
+
+        let standing = get_map_rank_entry(&pool, map_uid, &target)
+            .await
+            .expect("map rank entry")
+            .expect("Standing must remain visible on MapRank");
+        assert_eq!(standing.wsid, target.to_string());
+        assert!((standing.pos[1] - 42.0).abs() < 1e-6);
+
+        let status = crate::queries::moderation::get_ban_status(&pool, map_uid, &target)
+            .await
+            .expect("ban status");
+        assert!(status.banned);
+        assert_eq!(
+            status.public_message.as_deref(),
+            Some("you are banned from this map LB")
+        );
+        assert!(status.unofficial);
+
+        let status_json = serde_json::to_value(&status).expect("serialize MapBanStatus");
+        assert!(status_json.get("private_reason").is_none());
+        assert_eq!(status_json["banned"], true);
+
+        assert!(
+            crate::queries::moderation::lift_map_ban(&pool, map_uid, &target, &actor, false)
+                .await
+                .expect("lift"),
+            "lift for S2"
+        );
+        let after = crate::queries::moderation::get_ban_status(&pool, map_uid, &target)
+            .await
+            .expect("status after lift");
+        assert!(!after.banned);
+        assert!(after.public_message.is_none());
 
         cleanup_user(&pool, &target).await;
         cleanup_user(&pool, &actor).await;
