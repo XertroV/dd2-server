@@ -162,6 +162,12 @@ pub enum Request {
         uid: String,
         slug: String,
         spec_id: i64,
+        /// Player position in metres.
+        x: f32,
+        y: f32,
+        z: f32,
+        /// `zone` or `grant`.
+        source: String,
     } = 83,
 
     GetMyStats {} = 128,
@@ -867,4 +873,37 @@ pub struct Donation {
 
 pub async fn write_response(stream: &mut OwnedWriteHalf, resp: Response) -> io::Result<()> {
     resp.write_to_socket(stream).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn report_collectible_collect_requires_pos_and_source() {
+        let json = r#"{"ReportCollectibleCollect":{"uid":"abcdefghijklmnopqrstuvwxyza","slug":"coin-1","spec_id":42,"x":1.5,"y":2.25,"z":-3.0,"source":"zone"}}"#;
+        let req: Request = serde_json::from_str(json).expect("new 83 payload");
+        match req {
+            Request::ReportCollectibleCollect {
+                uid,
+                slug,
+                spec_id,
+                x,
+                y,
+                z,
+                source,
+            } => {
+                assert_eq!(uid, "abcdefghijklmnopqrstuvwxyza");
+                assert_eq!(slug, "coin-1");
+                assert_eq!(spec_id, 42);
+                assert_eq!(x, 1.5);
+                assert_eq!(y, 2.25);
+                assert_eq!(z, -3.0);
+                assert_eq!(source, "zone");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        let old = r#"{"ReportCollectibleCollect":{"uid":"abcdefghijklmnopqrstuvwxyza","slug":"coin-1","spec_id":42}}"#;
+        assert!(serde_json::from_str::<Request>(old).is_err());
+    }
 }

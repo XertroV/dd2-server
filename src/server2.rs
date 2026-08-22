@@ -599,9 +599,15 @@ impl XPlayer {
                 Request::ReportCollectibleUnlock { uid, slug, spec_id } => {
                     XPlayer::report_collectible_unlock(&pool, user_id, uid, slug, spec_id).await
                 }
-                Request::ReportCollectibleCollect { uid, slug, spec_id } => {
-                    XPlayer::report_collectible_collect(&pool, user_id, uid, slug, spec_id).await
-                }
+                Request::ReportCollectibleCollect {
+                    uid,
+                    slug,
+                    spec_id,
+                    x,
+                    y,
+                    z,
+                    source,
+                } => XPlayer::report_collectible_collect(&pool, user_id, uid, slug, spec_id, x, y, z, source).await,
 
                 // get requests
                 Request::GetMyStats {} => XPlayer::get_stats(&pool, user_id, &queue_tx).await,
@@ -1690,11 +1696,15 @@ impl XPlayer {
         map_uid: String,
         slug: String,
         spec_id: i64,
+        x: f32,
+        y: f32,
+        z: f32,
+        source: String,
     ) -> Result<(), api_error::Error> {
         if map_uid.len() != 27 || spec_id <= 0 || slug.is_empty() {
             return Ok(());
         }
-        queries::collectibles::report_collect(pool, user_id, &map_uid, &slug, spec_id).await?;
+        queries::collectibles::report_collect(pool, user_id, &map_uid, &slug, spec_id, x, y, z, &source).await?;
         Ok(())
     }
 

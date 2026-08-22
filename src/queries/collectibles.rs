@@ -253,6 +253,51 @@ async fn bind_one(pool: &Pool<Postgres>, map_uid: &str, spec_id: i64, slug: &str
     Ok(())
 }
 
+fn collect_log_source(raw: &str) -> &'static str {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "grant" => "grant",
+        _ => "zone",
+    }
+}
+
+/// First accepted collect only. Progress upsert must run after this so a prior
+/// `collected_at` still suppresses the log (including pre-migration collects).
+async fn insert_first_collect_log(
+    pool: &Pool<Postgres>,
+    user_id: &Uuid,
+    map_uid: &str,
+    slug: &str,
+    pos_x: Option<f64>,
+    pos_y: Option<f64>,
+    pos_z: Option<f64>,
+    source: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query!(
+        r#"--sql
+        INSERT INTO collectible_collect_log (user_id, map_uid, slug, collectible_key, collected_at, pos_x, pos_y, pos_z, source)
+        SELECT $1, $2, $3, substring(md5($4 || ':c:' || $3) from 1 for 16), now(), $5, $6, $7, $8
+        WHERE NOT EXISTS (
+            SELECT 1 FROM collectible_progress
+            WHERE user_id = $1
+              AND collectible_key = substring(md5($4 || ':c:' || $3) from 1 for 16)
+              AND collected_at IS NOT NULL
+        )
+        ON CONFLICT (user_id, collectible_key) DO NOTHING
+        "#,
+        user_id,
+        map_uid,
+        slug,
+        map_uid,
+        pos_x,
+        pos_y,
+        pos_z,
+        source
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 /// Sticky unlock. Grant pickup also collects. Unknown slug: silent drop.
 pub async fn report_unlock(
     pool: &Pool<Postgres>,
@@ -267,6 +312,9 @@ pub async fn report_unlock(
     };
     bind_one(pool, map_uid, spec_id, slug).await?;
     let grant = row.pickup == "grant";
+    if grant {
+        insert_first_collect_log(pool, user_id, map_uid, slug, None, None, None, "grant").await?;
+    }
     sqlx::query!(
         r#"--sql
         INSERT INTO collectible_progress (user_id, collectible_key, map_uid, slug, unlocked_at, collected_at)
@@ -286,18 +334,34 @@ pub async fn report_unlock(
 }
 
 /// Sticky collect; also unlocks if not already (ungated zone pickup). Unknown slug: silent drop.
+/// First collect appends a log row; repeats do not.
 pub async fn report_collect(
     pool: &Pool<Postgres>,
     user_id: &Uuid,
     map_uid: &str,
     slug: &str,
     spec_id: i64,
+    x: f32,
+    y: f32,
+    z: f32,
+    source: &str,
 ) -> Result<(), sqlx::Error> {
     ensure_catalog(pool, spec_id).await?;
     if catalog_row(pool, spec_id, slug).await?.is_none() {
         return Ok(());
     }
     bind_one(pool, map_uid, spec_id, slug).await?;
+    insert_first_collect_log(
+        pool,
+        user_id,
+        map_uid,
+        slug,
+        Some(x as f64),
+        Some(y as f64),
+        Some(z as f64),
+        collect_log_source(source),
+    )
+    .await?;
     sqlx::query!(
         r#"--sql
         INSERT INTO collectible_progress (user_id, collectible_key, map_uid, slug, unlocked_at, collected_at)
@@ -431,5 +495,202 @@ mod tests {
         let spec = json!({"collectibles":[{"name":"x","slug":"x-1"}]});
         let c = parse_catalog_collectibles(&spec);
         assert_eq!(c[0].pickup, "zone");
+    }
+
+    #[test]
+    fn collect_source_defaults_unknown_to_zone() {
+        assert_eq!(collect_log_source("zone"), "zone");
+        assert_eq!(collect_log_source("GRANT"), "grant");
+        assert_eq!(collect_log_source("  Grant "), "grant");
+        assert_eq!(collect_log_source(""), "zone");
+        assert_eq!(collect_log_source("nope"), "zone");
+    }
+}
+
+#[cfg(test)]
+mod db_tests {
+    use super::*;
+    use serde_json::json;
+    use sqlx::postgres::PgPoolOptions;
+
+    async fn test_pool() -> Pool<Postgres> {
+        dotenv::dotenv().ok();
+        let url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set for collectible tests");
+        PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&url)
+            .await
+            .expect("connect to DATABASE_URL")
+    }
+
+    async fn seed_user(pool: &Pool<Postgres>, name: &str) -> Uuid {
+        let user_id = Uuid::now_v7();
+        sqlx::query!(
+            "INSERT INTO users (web_services_user_id, display_name) VALUES ($1, $2)",
+            user_id,
+            name
+        )
+        .execute(pool)
+        .await
+        .expect("insert user");
+        user_id
+    }
+
+    async fn seed_spec(pool: &Pool<Postgres>, user_id: &Uuid) -> (i64, String) {
+        let name_id = Uuid::new_v4().simple().to_string();
+        let spec = json!({"collectibles":[
+            {"name":"Coin","slug":"coin-1","pickup":"zone"},
+            {"name":"Gift","slug":"gift-1","pickup":"grant"}
+        ]});
+        let spec_id = crate::queries::custom_map_aux_specs::upsert_spec(pool, user_id, &name_id, &spec)
+            .await
+            .expect("upsert spec");
+        replace_catalog(pool, spec_id, user_id, &name_id, &spec)
+            .await
+            .expect("replace catalog");
+        (spec_id, name_id)
+    }
+
+    fn test_map_uid() -> String {
+        let raw = format!("CLog{}", Uuid::new_v4().simple());
+        raw.chars().take(27).collect()
+    }
+
+    async fn cleanup(pool: &Pool<Postgres>, user_id: &Uuid) {
+        let _ = sqlx::query!("DELETE FROM users WHERE web_services_user_id = $1", user_id)
+            .execute(pool)
+            .await;
+    }
+
+    async fn log_count(pool: &Pool<Postgres>, user_id: &Uuid) -> i64 {
+        sqlx::query!(
+            "SELECT COUNT(*) AS n FROM collectible_collect_log WHERE user_id = $1",
+            user_id
+        )
+        .fetch_one(pool)
+        .await
+        .expect("count log")
+        .n
+        .unwrap_or(0)
+    }
+
+    #[tokio::test]
+    async fn first_zone_collect_logs_once_repeat_does_not() {
+        let pool = test_pool().await;
+        let user_id = seed_user(&pool, "clog-zone").await;
+        let (spec_id, _) = seed_spec(&pool, &user_id).await;
+        let map_uid = test_map_uid();
+
+        report_collect(&pool, &user_id, &map_uid, "coin-1", spec_id, 1.25, 40.5, -3.0, "zone")
+            .await
+            .expect("first collect");
+        report_collect(&pool, &user_id, &map_uid, "coin-1", spec_id, 9.0, 9.0, 9.0, "zone")
+            .await
+            .expect("repeat collect");
+
+        assert_eq!(log_count(&pool, &user_id).await, 1);
+        let row = sqlx::query!(
+            r#"SELECT source, pos_x, pos_y, pos_z, slug FROM collectible_collect_log WHERE user_id = $1"#,
+            user_id
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("log row");
+        assert_eq!(row.source, "zone");
+        assert_eq!(row.slug, "coin-1");
+        assert!((row.pos_x.unwrap() - 1.25).abs() < 1e-9);
+        assert!((row.pos_y.unwrap() - 40.5).abs() < 1e-9);
+        assert!((row.pos_z.unwrap() - -3.0).abs() < 1e-9);
+
+        let progress = sqlx::query!(
+            r#"SELECT collected_at FROM collectible_progress WHERE user_id = $1 AND slug = 'coin-1'"#,
+            user_id
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("progress");
+        assert!(progress.collected_at.is_some());
+
+        cleanup(&pool, &user_id).await;
+    }
+
+    #[tokio::test]
+    async fn grant_via_unlock_logs_once_with_null_pos() {
+        let pool = test_pool().await;
+        let user_id = seed_user(&pool, "clog-grant").await;
+        let (spec_id, _) = seed_spec(&pool, &user_id).await;
+        let map_uid = test_map_uid();
+
+        report_unlock(&pool, &user_id, &map_uid, "gift-1", spec_id)
+            .await
+            .expect("grant unlock");
+        report_unlock(&pool, &user_id, &map_uid, "gift-1", spec_id)
+            .await
+            .expect("repeat grant");
+        report_collect(&pool, &user_id, &map_uid, "gift-1", spec_id, 1.0, 2.0, 3.0, "zone")
+            .await
+            .expect("later 83 must not log again");
+
+        assert_eq!(log_count(&pool, &user_id).await, 1);
+        let row = sqlx::query!(
+            r#"SELECT source, pos_x, pos_y, pos_z FROM collectible_collect_log WHERE user_id = $1"#,
+            user_id
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("log row");
+        assert_eq!(row.source, "grant");
+        assert!(row.pos_x.is_none() && row.pos_y.is_none() && row.pos_z.is_none());
+
+        cleanup(&pool, &user_id).await;
+    }
+
+    #[tokio::test]
+    async fn unknown_slug_is_silent_and_does_not_log() {
+        let pool = test_pool().await;
+        let user_id = seed_user(&pool, "clog-unknown").await;
+        let (spec_id, _) = seed_spec(&pool, &user_id).await;
+        let map_uid = test_map_uid();
+
+        report_collect(&pool, &user_id, &map_uid, "no-such", spec_id, 0.0, 0.0, 0.0, "zone")
+            .await
+            .expect("unknown collect");
+        report_unlock(&pool, &user_id, &map_uid, "no-such", spec_id)
+            .await
+            .expect("unknown unlock");
+
+        assert_eq!(log_count(&pool, &user_id).await, 0);
+        let n = sqlx::query!(
+            "SELECT COUNT(*) AS n FROM collectible_progress WHERE user_id = $1",
+            user_id
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("count progress")
+        .n
+        .unwrap_or(0);
+        assert_eq!(n, 0);
+
+        cleanup(&pool, &user_id).await;
+    }
+
+    #[tokio::test]
+    async fn zone_unlock_does_not_log_until_collect() {
+        let pool = test_pool().await;
+        let user_id = seed_user(&pool, "clog-unlock-only").await;
+        let (spec_id, _) = seed_spec(&pool, &user_id).await;
+        let map_uid = test_map_uid();
+
+        report_unlock(&pool, &user_id, &map_uid, "coin-1", spec_id)
+            .await
+            .expect("zone unlock");
+        assert_eq!(log_count(&pool, &user_id).await, 0);
+
+        report_collect(&pool, &user_id, &map_uid, "coin-1", spec_id, 4.0, 5.0, 6.0, "zone")
+            .await
+            .expect("collect after unlock");
+        assert_eq!(log_count(&pool, &user_id).await, 1);
+
+        cleanup(&pool, &user_id).await;
     }
 }
