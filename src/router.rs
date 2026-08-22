@@ -153,6 +153,16 @@ pub enum Request {
         uid: String,
         spec_id: i64,
     } = 81,
+    ReportCollectibleUnlock {
+        uid: String,
+        slug: String,
+        spec_id: i64,
+    } = 82,
+    ReportCollectibleCollect {
+        uid: String,
+        slug: String,
+        spec_id: i64,
+    } = 83,
 
     GetMyStats {} = 128,
     GetGlobalLB {
@@ -222,6 +232,12 @@ pub enum Request {
     GetMinigameList {
         uid: String,
     } = 210,
+    GetCollectibleList {
+        uid: String,
+    } = 211,
+    GetCollectibleMine {
+        uid: String,
+    } = 212,
 
     GetSecretAssets {} = 254,
 
@@ -255,6 +271,8 @@ impl Request {
             Request::ReportMapStats { .. } => 68,
             Request::ReportMinigameAttempt { .. } => 80,
             Request::ReportMinigameMap { .. } => 81,
+            Request::ReportCollectibleUnlock { .. } => 82,
+            Request::ReportCollectibleCollect { .. } => 83,
             // get
             Request::GetMyStats { .. } => 128,
             Request::GetGlobalLB { .. } => 129,
@@ -282,6 +300,8 @@ impl Request {
             Request::GetMinigameLB { .. } => 208,
             Request::GetMinigameMyRank { .. } => 209,
             Request::GetMinigameList { .. } => 210,
+            Request::GetCollectibleList { .. } => 211,
+            Request::GetCollectibleMine { .. } => 212,
             //
             Request::GetSecretAssets { .. } => 254,
             // debug
@@ -315,6 +335,8 @@ impl Request {
             Request::ReportMapStats { .. } => "ReportMapStats",
             Request::ReportMinigameAttempt { .. } => "ReportMinigameAttempt",
             Request::ReportMinigameMap { .. } => "ReportMinigameMap",
+            Request::ReportCollectibleUnlock { .. } => "ReportCollectibleUnlock",
+            Request::ReportCollectibleCollect { .. } => "ReportCollectibleCollect",
             // get
             Request::GetMyStats { .. } => "GetMyStats",
             Request::GetGlobalLB { .. } => "GetGlobalLB",
@@ -341,6 +363,8 @@ impl Request {
             Request::GetMinigameLB { .. } => "GetMinigameLB",
             Request::GetMinigameMyRank { .. } => "GetMinigameMyRank",
             Request::GetMinigameList { .. } => "GetMinigameList",
+            Request::GetCollectibleList { .. } => "GetCollectibleList",
+            Request::GetCollectibleMine { .. } => "GetCollectibleMine",
 
             Request::GetSecretAssets { .. } => "GetSecretAssets",
             // debug
@@ -591,6 +615,14 @@ pub enum Response {
         uid: String,
         games: Vec<MinigameListGame>,
     },
+    CollectibleList {
+        uid: String,
+        items: Vec<CollectibleListItem>,
+    },
+    CollectibleMine {
+        uid: String,
+        items: Vec<CollectibleMineItem>,
+    },
     // near end
     TaskResponse {
         id: u32,
@@ -646,6 +678,8 @@ impl Response {
             Response::MinigameLB { .. } => 208,
             Response::MinigameRank { .. } => 209,
             Response::MinigameList { .. } => 210,
+            Response::CollectibleList { .. } => 211,
+            Response::CollectibleMine { .. } => 212,
 
             Response::TaskResponseJson { .. } => 252,
             Response::TaskResponse { .. } => 253,
@@ -683,6 +717,8 @@ impl Response {
             Response::MinigameLB { .. } => "MinigameLB",
             Response::MinigameRank { .. } => "MinigameRank",
             Response::MinigameList { .. } => "MinigameList",
+            Response::CollectibleList { .. } => "CollectibleList",
+            Response::CollectibleMine { .. } => "CollectibleMine",
             //
             Response::TaskResponseJson { .. } => "TaskResponseJson",
             Response::TaskResponse { .. } => "TaskResponse",
@@ -774,6 +810,28 @@ pub struct MinigameListGame {
     pub kind: String,
     pub name: String,
     pub key: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CollectibleListItem {
+    pub slug: String,
+    pub name: String,
+    pub pickup: String,
+    pub gated_by: Option<String>,
+    pub unlock_score: Option<i64>,
+    pub key: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CollectibleMineItem {
+    pub slug: String,
+    pub name: String,
+    pub pickup: String,
+    pub gated_by: Option<String>,
+    pub unlock_score: Option<i64>,
+    pub key: String,
+    pub unlocked_at: Option<u32>,
+    pub collected_at: Option<u32>,
 }
 
 impl PartialEq for LeaderboardEntry2 {

@@ -140,6 +140,7 @@ pub async fn run_http_server(
             "/map/<uid>/minigame/<slug>/leaderboard",
             "/map/<uid>/minigame/<slug>/leaderboard/len",
             "/map/<uid>/minigame/<slug>/leaderboard/<page>",
+            "/map/<uid>/collectibles",
             "/admin",
             "/api/mod/oauth/start",
             "/api/mod/oauth/callback",
@@ -314,6 +315,14 @@ pub async fn run_http_server(
         });
     let req_pool = pool.clone();
 
+    let get_map_uid_collectibles = warp::path!("map" / String / "collectibles")
+        .and(warp::path::end())
+        .map(move |uid| (uid, req_pool.clone()))
+        .and_then(
+            |(uid, pool): (String, Arc<Pool<Postgres>>)| async move { api::handle_get_map_uid_collectibles(pool.as_ref(), uid).await },
+        );
+    let req_pool = pool.clone();
+
     let mod_state = ModerationState {
         pool: req_pool,
         nadeo: NadeoLiveClient::from_env(),
@@ -364,6 +373,7 @@ pub async fn run_http_server(
         .or(get_map_uid_minigame_lb)
         .or(get_map_uid_minigame_lb_len)
         .or(get_map_uid_minigame_lb_page)
+        .or(get_map_uid_collectibles)
         .or(mod_routes)
         .with(warp::log("dips++"));
 

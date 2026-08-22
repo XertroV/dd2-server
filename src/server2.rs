@@ -596,6 +596,12 @@ impl XPlayer {
                     status,
                 } => XPlayer::report_minigame_attempt(&pool, user_id, uid, slug, spec_id, elapsed_ms, status).await,
                 Request::ReportMinigameMap { uid, spec_id } => XPlayer::report_minigame_map(&pool, uid, spec_id).await,
+                Request::ReportCollectibleUnlock { uid, slug, spec_id } => {
+                    XPlayer::report_collectible_unlock(&pool, user_id, uid, slug, spec_id).await
+                }
+                Request::ReportCollectibleCollect { uid, slug, spec_id } => {
+                    XPlayer::report_collectible_collect(&pool, user_id, uid, slug, spec_id).await
+                }
 
                 // get requests
                 Request::GetMyStats {} => XPlayer::get_stats(&pool, user_id, &queue_tx).await,
@@ -647,6 +653,10 @@ impl XPlayer {
                     XPlayer::get_minigame_my_rank(&pool, uid, slug, user_id, &queue_tx).await
                 }
                 Request::GetMinigameList { uid } => XPlayer::send_minigame_list(&pool, &queue_tx, uid).await,
+                Request::GetCollectibleList { uid } => XPlayer::send_collectible_list(&pool, &queue_tx, uid).await,
+                Request::GetCollectibleMine { uid } => {
+                    XPlayer::send_collectible_mine(&pool, &queue_tx, uid, user_id).await
+                }
 
                 Request::GetSecretAssets {} => XPlayer::get_secret_assets(&pool, user_id, &queue_tx).await,
                 // debug
@@ -1589,6 +1599,7 @@ impl XPlayer {
         }
         let spec_id = queries::custom_map_aux_specs::upsert_spec(pool, user_id, name_id, spec).await?;
         queries::minigames::replace_catalog(pool, spec_id, user_id, name_id, spec).await?;
+        queries::collectibles::replace_catalog(pool, spec_id, user_id, name_id, spec).await?;
         queue_tx.send(Response::TaskResponse {
             id: request_id,
             success: true,
@@ -1612,6 +1623,7 @@ impl XPlayer {
         }
         queries::custom_map_aux_specs::delete_spec(pool, user_id, name_id).await?;
         queries::minigames::delete_catalog(pool, user_id, name_id).await?;
+        queries::collectibles::delete_catalog(pool, user_id, name_id).await?;
         queue_tx.send(Response::TaskResponse {
             id: request_id,
             success: true,
@@ -1654,6 +1666,35 @@ impl XPlayer {
             return Ok(());
         }
         let _ = queries::minigames::bind_map_from_catalog(pool, &map_uid, spec_id).await?;
+        let _ = queries::collectibles::bind_map_from_catalog(pool, &map_uid, spec_id).await?;
+        Ok(())
+    }
+
+    pub async fn report_collectible_unlock(
+        pool: &Pool<Postgres>,
+        user_id: &Uuid,
+        map_uid: String,
+        slug: String,
+        spec_id: i64,
+    ) -> Result<(), api_error::Error> {
+        if map_uid.len() != 27 || spec_id <= 0 || slug.is_empty() {
+            return Ok(());
+        }
+        queries::collectibles::report_unlock(pool, user_id, &map_uid, &slug, spec_id).await?;
+        Ok(())
+    }
+
+    pub async fn report_collectible_collect(
+        pool: &Pool<Postgres>,
+        user_id: &Uuid,
+        map_uid: String,
+        slug: String,
+        spec_id: i64,
+    ) -> Result<(), api_error::Error> {
+        if map_uid.len() != 27 || spec_id <= 0 || slug.is_empty() {
+            return Ok(());
+        }
+        queries::collectibles::report_collect(pool, user_id, &map_uid, &slug, spec_id).await?;
         Ok(())
     }
 
@@ -1693,6 +1734,27 @@ impl XPlayer {
     ) -> Result<(), api_error::Error> {
         let games = queries::minigames::get_minigame_list(pool, &map_uid).await?;
         queue_tx.send(Response::MinigameList { uid: map_uid, games })?;
+        Ok(())
+    }
+
+    pub async fn send_collectible_list(
+        pool: &Pool<Postgres>,
+        queue_tx: &UnboundedSender<Response>,
+        map_uid: String,
+    ) -> Result<(), api_error::Error> {
+        let items = queries::collectibles::get_collectible_list(pool, &map_uid).await?;
+        queue_tx.send(Response::CollectibleList { uid: map_uid, items })?;
+        Ok(())
+    }
+
+    pub async fn send_collectible_mine(
+        pool: &Pool<Postgres>,
+        queue_tx: &UnboundedSender<Response>,
+        map_uid: String,
+        user_id: &Uuid,
+    ) -> Result<(), api_error::Error> {
+        let items = queries::collectibles::get_collectible_mine(pool, &map_uid, user_id).await?;
+        queue_tx.send(Response::CollectibleMine { uid: map_uid, items })?;
         Ok(())
     }
 

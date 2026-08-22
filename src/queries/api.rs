@@ -312,3 +312,14 @@ pub async fn handle_get_map_uid_minigame_leaderboard_len(
         }
     }
 }
+
+pub async fn handle_get_map_uid_collectibles(pool: &Pool<Postgres>, map_uid: String) -> Result<impl Reply, warp::Rejection> {
+    let r = super::collectibles::get_collectible_list(pool, &map_uid).await;
+    match r {
+        Ok(items) => Ok(warp::reply::json(&serde_json::json!({ "uid": map_uid, "items": items }))),
+        Err(e) => {
+            eprintln!("Error: {:?}", e);
+            Err(warp::reject::custom(Into::<ApiErrRejection>::into(e)))
+        }
+    }
+}
