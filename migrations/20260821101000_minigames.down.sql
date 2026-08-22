@@ -1,0 +1,9 @@
+DROP INDEX IF EXISTS minigame_attempt_user_key_idx;
+DROP TABLE IF EXISTS minigame_attempt;
+DROP INDEX IF EXISTS minigame_pb_key_score_idx;
+DROP TABLE IF EXISTS minigame_pb;
+DROP INDEX IF EXISTS minigame_on_map_key_idx;
+DROP INDEX IF EXISTS minigame_on_map_uid_idx;
+DROP TABLE IF EXISTS minigame_on_map;
+DROP INDEX IF EXISTS minigame_catalog_user_name_idx;
+DROP TABLE IF EXISTS minigame_catalog;

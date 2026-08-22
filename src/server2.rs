@@ -95,10 +95,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     #[cfg(debug_assertions)]
     {
-        subsys
-            .handle_shutdown_requests(Duration::from_millis(500))
-            .await
-            .map_err(Into::into)
+        let http_serv = http::run_http_server(http_db, "localhost".to_string(), None, false);
+        tokio::select! {
+            r = subsys.handle_shutdown_requests(Duration::from_millis(500)) => r.map_err(Into::into),
+            _ = http_serv => Ok(()),
+        }
     }
     #[cfg(not(debug_assertions))]
     {
@@ -584,6 +585,15 @@ impl XPlayer {
 
                 Request::ReportMapStats { uid, stats } => XPlayer::report_map_stats(&pool, user_id, uid, stats).await,
 
+                Request::ReportMinigameAttempt {
+                    uid,
+                    slug,
+                    spec_id,
+                    elapsed_ms,
+                    status,
+                } => XPlayer::report_minigame_attempt(&pool, user_id, uid, slug, spec_id, elapsed_ms, status).await,
+                Request::ReportMinigameMap { uid, spec_id } => XPlayer::report_minigame_map(&pool, uid, spec_id).await,
+
                 // get requests
                 Request::GetMyStats {} => XPlayer::get_stats(&pool, user_id, &queue_tx).await,
                 Request::GetGlobalLB { start, end } => XPlayer::get_global_lb(&pool, &queue_tx, start as i32, end as i32).await,
@@ -627,6 +637,13 @@ impl XPlayer {
                         Ok(())
                     }
                 }
+                Request::GetMinigameLB { uid, slug, start, end } => {
+                    XPlayer::send_minigame_lb(&pool, &queue_tx, uid, slug, start as i64, end as i64).await
+                }
+                Request::GetMinigameMyRank { uid, slug } => {
+                    XPlayer::get_minigame_my_rank(&pool, uid, slug, user_id, &queue_tx).await
+                }
+                Request::GetMinigameList { uid } => XPlayer::send_minigame_list(&pool, &queue_tx, uid).await,
 
                 Request::GetSecretAssets {} => XPlayer::get_secret_assets(&pool, user_id, &queue_tx).await,
                 // debug
@@ -1597,7 +1614,8 @@ impl XPlayer {
                 return Err(ApiError::StrErr("Spec can no longer be modified".to_string()));
             }
         }
-        queries::custom_map_aux_specs::upsert_spec(pool, user_id, name_id, spec).await?;
+        let spec_id = queries::custom_map_aux_specs::upsert_spec(pool, user_id, name_id, spec).await?;
+        queries::minigames::replace_catalog(pool, spec_id, user_id, name_id, spec).await?;
         queue_tx.send(Response::TaskResponse {
             id: request_id,
             success: true,
@@ -1620,11 +1638,88 @@ impl XPlayer {
             }
         }
         queries::custom_map_aux_specs::delete_spec(pool, user_id, name_id).await?;
+        queries::minigames::delete_catalog(pool, user_id, name_id).await?;
         queue_tx.send(Response::TaskResponse {
             id: request_id,
             success: true,
             error: None,
         })?;
+        Ok(())
+    }
+
+    pub async fn report_minigame_attempt(
+        pool: &Pool<Postgres>,
+        user_id: &Uuid,
+        map_uid: String,
+        slug: String,
+        spec_id: i64,
+        elapsed_ms: i64,
+        status: String,
+    ) -> Result<(), api_error::Error> {
+        if map_uid.len() != 27 {
+            return Ok(());
+        }
+        if spec_id <= 0 {
+            return Ok(());
+        }
+        if status != "finish" && status != "cancel" {
+            return Ok(());
+        }
+        queries::minigames::report_attempt(pool, user_id, &map_uid, &slug, spec_id, elapsed_ms, &status).await?;
+        Ok(())
+    }
+
+    pub async fn report_minigame_map(
+        pool: &Pool<Postgres>,
+        map_uid: String,
+        spec_id: i64,
+    ) -> Result<(), api_error::Error> {
+        if map_uid.len() != 27 {
+            return Ok(());
+        }
+        if spec_id <= 0 {
+            return Ok(());
+        }
+        let _ = queries::minigames::bind_map_from_catalog(pool, &map_uid, spec_id).await?;
+        Ok(())
+    }
+
+    pub async fn send_minigame_lb(
+        pool: &Pool<Postgres>,
+        queue_tx: &UnboundedSender<Response>,
+        map_uid: String,
+        slug: String,
+        start: i64,
+        end: i64,
+    ) -> Result<(), api_error::Error> {
+        let entries = queries::minigames::get_minigame_leaderboard(pool, &map_uid, &slug, start, end).await?;
+        queue_tx.send(Response::MinigameLB {
+            uid: map_uid,
+            slug,
+            entries,
+        })?;
+        Ok(())
+    }
+
+    pub async fn get_minigame_my_rank(
+        pool: &Pool<Postgres>,
+        map_uid: String,
+        slug: String,
+        user_id: &Uuid,
+        queue_tx: &UnboundedSender<Response>,
+    ) -> Result<(), api_error::Error> {
+        let r = queries::minigames::get_minigame_my_rank(pool, &map_uid, &slug, user_id).await?;
+        queue_tx.send(Response::MinigameRank { uid: map_uid, slug, r })?;
+        Ok(())
+    }
+
+    pub async fn send_minigame_list(
+        pool: &Pool<Postgres>,
+        queue_tx: &UnboundedSender<Response>,
+        map_uid: String,
+    ) -> Result<(), api_error::Error> {
+        let games = queries::minigames::get_minigame_list(pool, &map_uid).await?;
+        queue_tx.send(Response::MinigameList { uid: map_uid, games })?;
         Ok(())
     }
 

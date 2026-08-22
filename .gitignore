@@ -13,3 +13,4 @@ survey.md
 backup_*
 .worktrees/
 *.tmp.*
+.playwright-mcp/

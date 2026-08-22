@@ -142,6 +142,17 @@ pub enum Request {
         uid: String,
         stats: JsonValue,
     } = 68,
+    ReportMinigameAttempt {
+        uid: String,
+        slug: String,
+        spec_id: i64,
+        elapsed_ms: i64,
+        status: String,
+    } = 80,
+    ReportMinigameMap {
+        uid: String,
+        spec_id: i64,
+    } = 81,
 
     GetMyStats {} = 128,
     GetGlobalLB {
@@ -198,6 +209,19 @@ pub enum Request {
         uid: String,
         wsid: String,
     } = 196,
+    GetMinigameLB {
+        uid: String,
+        slug: String,
+        start: u32,
+        end: u32,
+    } = 208,
+    GetMinigameMyRank {
+        uid: String,
+        slug: String,
+    } = 209,
+    GetMinigameList {
+        uid: String,
+    } = 210,
 
     GetSecretAssets {} = 254,
 
@@ -229,6 +253,8 @@ impl Request {
             Request::DeleteCustomMapAuxSpec { .. } => 66,
             Request::ListCustomMapAuxSpecs { .. } => 67,
             Request::ReportMapStats { .. } => 68,
+            Request::ReportMinigameAttempt { .. } => 80,
+            Request::ReportMinigameMap { .. } => 81,
             // get
             Request::GetMyStats { .. } => 128,
             Request::GetGlobalLB { .. } => 129,
@@ -253,6 +279,9 @@ impl Request {
             Request::GetMapLive { .. } => 194,
             Request::GetMapMyRank { .. } => 195,
             Request::GetMapRank { .. } => 196,
+            Request::GetMinigameLB { .. } => 208,
+            Request::GetMinigameMyRank { .. } => 209,
+            Request::GetMinigameList { .. } => 210,
             //
             Request::GetSecretAssets { .. } => 254,
             // debug
@@ -284,6 +313,8 @@ impl Request {
             Request::DeleteCustomMapAuxSpec { .. } => "DeleteCustomMapAuxSpec",
             Request::ListCustomMapAuxSpecs { .. } => "ListCustomMapAuxSpecs",
             Request::ReportMapStats { .. } => "ReportMapStats",
+            Request::ReportMinigameAttempt { .. } => "ReportMinigameAttempt",
+            Request::ReportMinigameMap { .. } => "ReportMinigameMap",
             // get
             Request::GetMyStats { .. } => "GetMyStats",
             Request::GetGlobalLB { .. } => "GetGlobalLB",
@@ -307,6 +338,9 @@ impl Request {
             Request::GetMapLive { .. } => "GetMapLive",
             Request::GetMapMyRank { .. } => "GetMapMyRank",
             Request::GetMapRank { .. } => "GetMapRank",
+            Request::GetMinigameLB { .. } => "GetMinigameLB",
+            Request::GetMinigameMyRank { .. } => "GetMinigameMyRank",
+            Request::GetMinigameList { .. } => "GetMinigameList",
 
             Request::GetSecretAssets { .. } => "GetSecretAssets",
             // debug
@@ -537,6 +571,20 @@ pub enum Response {
         uid: String,
         r: Option<LeaderboardEntry2>,
     },
+    MinigameLB {
+        uid: String,
+        slug: String,
+        entries: Vec<MinigameLBEntry>,
+    },
+    MinigameRank {
+        uid: String,
+        slug: String,
+        r: Option<MinigameLBEntry>,
+    },
+    MinigameList {
+        uid: String,
+        games: Vec<MinigameListGame>,
+    },
     // near end
     TaskResponse {
         id: u32,
@@ -589,6 +637,9 @@ impl Response {
             Response::MapLB { .. } => 193,
             Response::MapLivePlayers { .. } => 194,
             Response::MapRank { .. } => 195,
+            Response::MinigameLB { .. } => 208,
+            Response::MinigameRank { .. } => 209,
+            Response::MinigameList { .. } => 210,
 
             Response::TaskResponseJson { .. } => 252,
             Response::TaskResponse { .. } => 253,
@@ -623,6 +674,9 @@ impl Response {
             Response::MapLB { .. } => "MapLB",
             Response::MapLivePlayers { .. } => "MapLivePlayers",
             Response::MapRank { .. } => "MapRank",
+            Response::MinigameLB { .. } => "MinigameLB",
+            Response::MinigameRank { .. } => "MinigameRank",
+            Response::MinigameList { .. } => "MinigameList",
             //
             Response::TaskResponseJson { .. } => "TaskResponseJson",
             Response::TaskResponse { .. } => "TaskResponse",
@@ -697,6 +751,23 @@ pub struct LeaderboardEntry2 {
     pub update_count: i32,
     pub color: [f64; 3],
     pub race_time: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MinigameLBEntry {
+    pub rank: u32,
+    pub wsid: String,
+    pub name: String,
+    pub score: i64,
+    pub ts: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MinigameListGame {
+    pub slug: String,
+    pub kind: String,
+    pub name: String,
+    pub key: String,
 }
 
 impl PartialEq for LeaderboardEntry2 {

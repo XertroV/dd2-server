@@ -131,6 +131,10 @@ pub async fn run_http_server(
             "/map/<uid>/leaderboard/len",
             "/map/<uid>/leaderboard/<page>",
             "/map/<uid>/live_heights",
+            "/map/<uid>/minigames",
+            "/map/<uid>/minigame/<slug>/leaderboard",
+            "/map/<uid>/minigame/<slug>/leaderboard/len",
+            "/map/<uid>/minigame/<slug>/leaderboard/<page>",
         ];
         "Routes: ".to_owned() + &routes.join(", ")
     });
@@ -266,6 +270,37 @@ pub async fn run_http_server(
         );
     let req_pool = pool.clone();
 
+    let get_map_uid_minigames = warp::path!("map" / String / "minigames")
+        .and(warp::path::end())
+        .map(move |uid| (uid, req_pool.clone()))
+        .and_then(
+            |(uid, pool): (String, Arc<Pool<Postgres>>)| async move { api::handle_get_map_uid_minigames(pool.as_ref(), uid).await },
+        );
+    let req_pool = pool.clone();
+
+    let get_map_uid_minigame_lb = warp::path!("map" / String / "minigame" / String / "leaderboard")
+        .and(warp::path::end())
+        .map(move |uid, slug| (uid, slug, req_pool.clone()))
+        .and_then(|(uid, slug, pool): (String, String, Arc<Pool<Postgres>>)| async move {
+            api::handle_get_map_uid_minigame_leaderboard(pool.as_ref(), uid, slug, 0).await
+        });
+    let req_pool = pool.clone();
+
+    let get_map_uid_minigame_lb_len = warp::path!("map" / String / "minigame" / String / "leaderboard" / "len")
+        .and(warp::path::end())
+        .map(move |uid, slug| (uid, slug, req_pool.clone()))
+        .and_then(|(uid, slug, pool): (String, String, Arc<Pool<Postgres>>)| async move {
+            api::handle_get_map_uid_minigame_leaderboard_len(pool.as_ref(), uid, slug).await
+        });
+    let req_pool = pool.clone();
+
+    let get_map_uid_minigame_lb_page = warp::path!("map" / String / "minigame" / String / "leaderboard" / u32)
+        .and(warp::path::end())
+        .map(move |uid, slug, page| (uid, slug, page, req_pool.clone()))
+        .and_then(|(uid, slug, page, pool): (String, String, u32, Arc<Pool<Postgres>>)| async move {
+            api::handle_get_map_uid_minigame_leaderboard(pool.as_ref(), uid, slug, page).await
+        });
+
     // info!("Enabling route: get /mlping_intro");
     // let ping_path = warp::path!("mlping_intro")
     //     .and(warp::path::end())
@@ -305,6 +340,10 @@ pub async fn run_http_server(
         .or(get_map_uid_leaderboard_len)
         .or(get_map_uid_leaderboard_page)
         .or(get_map_uid_live_heights)
+        .or(get_map_uid_minigames)
+        .or(get_map_uid_minigame_lb)
+        .or(get_map_uid_minigame_lb_len)
+        .or(get_map_uid_minigame_lb_page)
         .with(warp::log("dips++"));
 
     info!("Starting HTTP server: {}", soc_addr.to_string());

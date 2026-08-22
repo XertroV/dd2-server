@@ -7,6 +7,7 @@ pub mod players;
 pub mod stats;
 pub mod user_settings;
 pub mod custom_map_aux_specs;
+pub mod minigames;
 
 pub use api::*;
 pub use auth::*;

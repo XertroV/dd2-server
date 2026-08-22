@@ -200,7 +200,7 @@ pub async fn handle_get_custom_map_aux_spec(pool: &Pool<Postgres>, wsid: String,
     };
     let r = super::custom_map_aux_specs::get_spec(pool, &user_id, &name_id).await;
     match r {
-        Ok(Some(r)) => Ok(warp::reply::json(&r.spec)),
+        Ok(Some(r)) => Ok(warp::reply::json(&super::custom_map_aux_specs::spec_json_with_id(r.id, &r.spec))),
         // send 403
         Ok(None) => Err(warp::reject::not_found()),
         Err(e) => {
@@ -249,6 +249,63 @@ pub async fn handle_get_map_uid_live_heights(pool: &Pool<Postgres>, map_uid: Str
     let r = super::custom_maps::get_map_live_heights(pool, &map_uid).await;
     match r {
         Ok(r) => Ok(warp::reply::json(&r)),
+        Err(e) => {
+            eprintln!("Error: {:?}", e);
+            Err(warp::reject::custom(Into::<ApiErrRejection>::into(e)))
+        }
+    }
+}
+
+fn reject_slug(slug: &str) -> Result<(), warp::Rejection> {
+    if slug.contains('/') {
+        return Err(warp::reject::not_found());
+    }
+    Ok(())
+}
+
+pub async fn handle_get_map_uid_minigames(pool: &Pool<Postgres>, map_uid: String) -> Result<impl Reply, warp::Rejection> {
+    let r = super::minigames::get_minigame_list(pool, &map_uid).await;
+    match r {
+        Ok(games) => Ok(warp::reply::json(&serde_json::json!({ "uid": map_uid, "games": games }))),
+        Err(e) => {
+            eprintln!("Error: {:?}", e);
+            Err(warp::reject::custom(Into::<ApiErrRejection>::into(e)))
+        }
+    }
+}
+
+pub async fn handle_get_map_uid_minigame_leaderboard(
+    pool: &Pool<Postgres>,
+    map_uid: String,
+    slug: String,
+    page: u32,
+) -> Result<impl Reply, warp::Rejection> {
+    reject_slug(&slug)?;
+    let r = super::minigames::get_minigame_leaderboard_page(pool, &map_uid, &slug, page).await;
+    match r {
+        Ok(entries) => Ok(warp::reply::json(&serde_json::json!({
+            "uid": map_uid,
+            "slug": slug,
+            "entries": entries
+        }))),
+        Err(e) => {
+            eprintln!("Error: {:?}", e);
+            Err(warp::reject::custom(Into::<ApiErrRejection>::into(e)))
+        }
+    }
+}
+
+pub async fn handle_get_map_uid_minigame_leaderboard_len(
+    pool: &Pool<Postgres>,
+    map_uid: String,
+    slug: String,
+) -> Result<impl Reply, warp::Rejection> {
+    reject_slug(&slug)?;
+    let r = super::minigames::get_minigame_leaderboard_len(pool, &map_uid, &slug).await;
+    match r {
+        Ok(r) => Ok(warp::reply::json(
+            &serde_json::json!({ "len": r, "pages": (r as f64 / 100.0).ceil() as i64 }),
+        )),
         Err(e) => {
             eprintln!("Error: {:?}", e);
             Err(warp::reject::custom(Into::<ApiErrRejection>::into(e)))
