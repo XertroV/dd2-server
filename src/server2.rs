@@ -1704,7 +1704,10 @@ impl XPlayer {
         if map_uid.len() != 27 || spec_id <= 0 || slug.is_empty() {
             return Ok(());
         }
-        queries::collectibles::report_collect(pool, user_id, &map_uid, &slug, spec_id, x, y, z, &source).await?;
+        let Some(source) = queries::collectibles::collect_log_source(&source) else {
+            return Ok(());
+        };
+        queries::collectibles::report_collect(pool, user_id, &map_uid, &slug, spec_id, x, y, z, source).await?;
         Ok(())
     }
 

@@ -253,10 +253,11 @@ async fn bind_one(pool: &Pool<Postgres>, map_uid: &str, spec_id: i64, slug: &str
     Ok(())
 }
 
-fn collect_log_source(raw: &str) -> &'static str {
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "grant" => "grant",
-        _ => "zone",
+/// Exact `zone` or `grant` only. Anything else is a silent drop (no progress, no log).
+pub(crate) fn collect_log_source(raw: &str) -> Option<&str> {
+    match raw {
+        "zone" | "grant" => Some(raw),
+        _ => None,
     }
 }
 
@@ -346,6 +347,9 @@ pub async fn report_collect(
     z: f32,
     source: &str,
 ) -> Result<(), sqlx::Error> {
+    let Some(source) = collect_log_source(source) else {
+        return Ok(());
+    };
     ensure_catalog(pool, spec_id).await?;
     if catalog_row(pool, spec_id, slug).await?.is_none() {
         return Ok(());
@@ -359,7 +363,7 @@ pub async fn report_collect(
         Some(x as f64),
         Some(y as f64),
         Some(z as f64),
-        collect_log_source(source),
+        source,
     )
     .await?;
     sqlx::query!(
@@ -498,12 +502,14 @@ mod tests {
     }
 
     #[test]
-    fn collect_source_defaults_unknown_to_zone() {
-        assert_eq!(collect_log_source("zone"), "zone");
-        assert_eq!(collect_log_source("GRANT"), "grant");
-        assert_eq!(collect_log_source("  Grant "), "grant");
-        assert_eq!(collect_log_source(""), "zone");
-        assert_eq!(collect_log_source("nope"), "zone");
+    fn collect_source_accepts_only_zone_or_grant() {
+        assert_eq!(collect_log_source("zone"), Some("zone"));
+        assert_eq!(collect_log_source("grant"), Some("grant"));
+        assert!(collect_log_source("GRANT").is_none());
+        assert!(collect_log_source("  Grant ").is_none());
+        assert!(collect_log_source("").is_none());
+        assert!(collect_log_source("nope").is_none());
+        assert!(collect_log_source("ZONE").is_none());
     }
 }
 
@@ -690,6 +696,76 @@ mod db_tests {
             .await
             .expect("collect after unlock");
         assert_eq!(log_count(&pool, &user_id).await, 1);
+
+        cleanup(&pool, &user_id).await;
+    }
+
+    #[tokio::test]
+    async fn invalid_source_is_silent_and_does_not_log() {
+        let pool = test_pool().await;
+        let user_id = seed_user(&pool, "clog-bad-source").await;
+        let (spec_id, _) = seed_spec(&pool, &user_id).await;
+        let map_uid = test_map_uid();
+
+        report_collect(&pool, &user_id, &map_uid, "coin-1", spec_id, 1.0, 2.0, 3.0, "nope")
+            .await
+            .expect("garbage source");
+        report_collect(&pool, &user_id, &map_uid, "coin-1", spec_id, 1.0, 2.0, 3.0, "")
+            .await
+            .expect("empty source");
+        report_collect(&pool, &user_id, &map_uid, "coin-1", spec_id, 1.0, 2.0, 3.0, "ZONE")
+            .await
+            .expect("wrong-case source");
+
+        assert_eq!(log_count(&pool, &user_id).await, 0);
+        let n = sqlx::query!(
+            "SELECT COUNT(*) AS n FROM collectible_progress WHERE user_id = $1",
+            user_id
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("count progress")
+        .n
+        .unwrap_or(0);
+        assert_eq!(n, 0);
+
+        cleanup(&pool, &user_id).await;
+    }
+
+    #[tokio::test]
+    async fn pre_migration_collected_progress_does_not_get_a_fake_log() {
+        let pool = test_pool().await;
+        let user_id = seed_user(&pool, "clog-pre-mig").await;
+        let (spec_id, _) = seed_spec(&pool, &user_id).await;
+        let map_uid = test_map_uid();
+
+        sqlx::query!(
+            r#"--sql
+            INSERT INTO collectible_progress (user_id, collectible_key, map_uid, slug, unlocked_at, collected_at)
+            VALUES ($1, substring(md5($2 || ':c:' || $3) from 1 for 16), $2, $3, now(), now())
+            "#,
+            user_id,
+            map_uid,
+            "coin-1"
+        )
+        .execute(&pool)
+        .await
+        .expect("pre-migration progress");
+        assert_eq!(log_count(&pool, &user_id).await, 0);
+
+        report_collect(&pool, &user_id, &map_uid, "coin-1", spec_id, 9.0, 8.0, 7.0, "zone")
+            .await
+            .expect("later 83 must not invent a first-collect log");
+
+        assert_eq!(log_count(&pool, &user_id).await, 0);
+        let progress = sqlx::query!(
+            r#"SELECT collected_at FROM collectible_progress WHERE user_id = $1 AND slug = 'coin-1'"#,
+            user_id
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("progress");
+        assert!(progress.collected_at.is_some());
 
         cleanup(&pool, &user_id).await;
     }
