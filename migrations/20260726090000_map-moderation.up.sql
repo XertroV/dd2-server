@@ -67,9 +67,7 @@ CREATE TABLE web_sessions (
     user_id UUID NOT NULL REFERENCES users (web_services_user_id) ON DELETE CASCADE,
     display_name TEXT NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    expires_at TIMESTAMPTZ NOT NULL,
-    oauth_access_token TEXT,
-    oauth_refresh_token TEXT
+    expires_at TIMESTAMPTZ NOT NULL
 );
 CREATE INDEX web_sessions_user_id_idx ON web_sessions (user_id);
 CREATE INDEX web_sessions_expires_at_idx ON web_sessions (expires_at);

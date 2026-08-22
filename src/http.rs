@@ -20,6 +20,11 @@ use warp::{
 };
 
 use crate::queries::{api, log_ml_ping};
+use crate::{
+    moderation_http::{self, ModerationState},
+    nadeo::NadeoLiveClient,
+    tm_oauth::TmOauthConfig,
+};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -135,6 +140,13 @@ pub async fn run_http_server(
             "/map/<uid>/minigame/<slug>/leaderboard",
             "/map/<uid>/minigame/<slug>/leaderboard/len",
             "/map/<uid>/minigame/<slug>/leaderboard/<page>",
+            "/admin",
+            "/api/mod/oauth/start",
+            "/api/mod/oauth/callback",
+            "/api/mod/me",
+            "/api/mod/map/<uid>",
+            "/api/mod/map/<uid>/bans",
+            "/api/mod/map/<uid>/delegates",
         ];
         "Routes: ".to_owned() + &routes.join(", ")
     });
@@ -300,6 +312,14 @@ pub async fn run_http_server(
         .and_then(|(uid, slug, page, pool): (String, String, u32, Arc<Pool<Postgres>>)| async move {
             api::handle_get_map_uid_minigame_leaderboard(pool.as_ref(), uid, slug, page).await
         });
+    let req_pool = pool.clone();
+
+    let mod_state = ModerationState {
+        pool: req_pool,
+        nadeo: NadeoLiveClient::from_env(),
+        oauth: TmOauthConfig::from_env(),
+    };
+    let mod_routes = moderation_http::routes(mod_state);
 
     // info!("Enabling route: get /mlping_intro");
     // let ping_path = warp::path!("mlping_intro")
@@ -344,6 +364,7 @@ pub async fn run_http_server(
         .or(get_map_uid_minigame_lb)
         .or(get_map_uid_minigame_lb_len)
         .or(get_map_uid_minigame_lb_page)
+        .or(mod_routes)
         .with(warp::log("dips++"));
 
     info!("Starting HTTP server: {}", soc_addr.to_string());

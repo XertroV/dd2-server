@@ -29,7 +29,11 @@ pub async fn get_map_nb_playing_live(pool: &Pool<Postgres>, map_uid: &str) -> Re
         r#"--sql
         SELECT COUNT(*) FROM map_curr_heights m
             LEFT JOIN shadow_bans sb ON m.user_id = sb.user_id
+            LEFT JOIN map_bans mb ON m.user_id = mb.user_id AND mb.map_uid = m.map_uid
+                AND mb.lifted_at IS NULL
+                AND (mb.expires_at IS NULL OR mb.expires_at > NOW())
             WHERE sb.user_id IS NULL
+              AND mb.user_id IS NULL
               AND m.afk_update_count < 360
               AND m.map_uid = $1
               AND m.updated_at > now() - interval '120 seconds'
@@ -43,6 +47,13 @@ pub async fn get_map_nb_playing_live(pool: &Pool<Postgres>, map_uid: &str) -> Re
     Ok(nb_playing_now)
 }
 
+/// Shared MapOverview counts: public LB size + live players (Map Ban + Shadowban filtered).
+pub async fn get_map_overview_player_counts(pool: &Pool<Postgres>, map_uid: &str) -> Result<(i64, i64), sqlx::Error> {
+    let nb_players_on_lb = get_map_leaderboard_len(pool, map_uid).await?;
+    let nb_playing_now = get_map_nb_playing_live(pool, map_uid).await?;
+    Ok((nb_players_on_lb, nb_playing_now))
+}
+
 pub async fn get_map_leaderboard_len(pool: &Pool<Postgres>, map_uid: &str) -> Result<i64, sqlx::Error> {
     if map_uid.len() > 30 {
         return Err(sqlx::Error::RowNotFound);
@@ -51,7 +62,10 @@ pub async fn get_map_leaderboard_len(pool: &Pool<Postgres>, map_uid: &str) -> Re
         r#"--sql
         SELECT COUNT(*) FROM map_leaderboard m
         LEFT JOIN shadow_bans sb ON m.user_id = sb.user_id
-        WHERE sb.user_id IS NULL AND m.map_uid = $1
+        LEFT JOIN map_bans mb ON m.user_id = mb.user_id AND mb.map_uid = m.map_uid
+            AND mb.lifted_at IS NULL
+            AND (mb.expires_at IS NULL OR mb.expires_at > NOW())
+        WHERE sb.user_id IS NULL AND mb.user_id IS NULL AND m.map_uid = $1
     "#,
         map_uid
     )
@@ -81,7 +95,10 @@ pub async fn get_map_leaderboard(
         LEFT JOIN users u ON u.web_services_user_id = m.user_id
         LEFT JOIN colors c ON c.user_id = m.user_id
         LEFT JOIN shadow_bans sb ON m.user_id = sb.user_id
-        WHERE sb.user_id IS NULL AND m.map_uid = $1
+        LEFT JOIN map_bans mb ON m.user_id = mb.user_id AND mb.map_uid = m.map_uid
+            AND mb.lifted_at IS NULL
+            AND (mb.expires_at IS NULL OR mb.expires_at > NOW())
+        WHERE sb.user_id IS NULL AND mb.user_id IS NULL AND m.map_uid = $1
         ORDER BY m.height DESC
         LIMIT $2
         OFFSET $3
@@ -106,6 +123,46 @@ pub async fn get_map_leaderboard(
         })
         .collect();
     Ok(entries)
+}
+
+/// Standing for MapRank: includes the subject even when Map-Banned.
+/// Public LB/live queries exclude Map Bans; Shadowbans remain filtered.
+pub async fn get_map_rank_entry(
+    pool: &Pool<Postgres>,
+    map_uid: &str,
+    user_id: &Uuid,
+) -> Result<Option<LeaderboardEntry2>, sqlx::Error> {
+    let resp = query!(
+        r#"--sql
+        WITH lb AS (
+            SELECT m.user_id, u.display_name, c.color, m.pos, m.race_time, rank() OVER (ORDER BY m.height DESC) AS rank, m.updated_at
+            FROM map_leaderboard m
+            LEFT JOIN users u ON u.web_services_user_id = m.user_id
+            LEFT JOIN colors c ON c.user_id = m.user_id
+            LEFT JOIN shadow_bans AS sb ON m.user_id = sb.user_id
+            LEFT JOIN map_bans mb ON m.user_id = mb.user_id AND mb.map_uid = m.map_uid
+                AND mb.lifted_at IS NULL
+                AND (mb.expires_at IS NULL OR mb.expires_at > NOW())
+            WHERE m.map_uid = $1 AND sb.user_id IS NULL
+              AND (mb.user_id IS NULL OR m.user_id = $2)
+        )
+        SELECT * FROM lb WHERE user_id = $2
+    "#,
+        map_uid,
+        user_id
+    )
+    .fetch_optional(pool)
+    .await?;
+    Ok(resp.map(|r| LeaderboardEntry2 {
+        rank: r.rank.unwrap_or_default() as u32,
+        wsid: r.user_id.to_string(),
+        pos: [r.pos[0], r.pos[1], r.pos[2]],
+        ts: r.updated_at.and_utc().timestamp() as u32,
+        name: r.display_name,
+        update_count: 0,
+        color: [r.color[0], r.color[1], r.color[2]],
+        race_time: r.race_time as i64,
+    }))
 }
 
 /// Upsert a player's current live position for a map (custom-map live heights path).
@@ -148,7 +205,11 @@ pub async fn get_map_live_heights(pool: &Pool<Postgres>, map_uid: &str) -> Resul
         LEFT JOIN users u ON u.web_services_user_id = m.user_id
         LEFT JOIN colors c ON c.user_id = m.user_id
         LEFT JOIN shadow_bans sb ON m.user_id = sb.user_id
+        LEFT JOIN map_bans mb ON m.user_id = mb.user_id AND mb.map_uid = m.map_uid
+            AND mb.lifted_at IS NULL
+            AND (mb.expires_at IS NULL OR mb.expires_at > NOW())
         WHERE sb.user_id IS NULL
+          AND mb.user_id IS NULL
           AND m.afk_update_count < 360
           AND m.map_uid = $1
           AND m.updated_at > now() - interval '120 seconds'
@@ -198,7 +259,11 @@ pub async fn get_map_live_heights_top_n(pool: &Pool<Postgres>, map_uid: &str, n:
             LEFT JOIN users u ON u.web_services_user_id = m.user_id
             LEFT JOIN colors c ON c.user_id = m.user_id
             LEFT JOIN shadow_bans sb ON m.user_id = sb.user_id
+            LEFT JOIN map_bans mb ON m.user_id = mb.user_id AND mb.map_uid = m.map_uid
+                AND mb.lifted_at IS NULL
+                AND (mb.expires_at IS NULL OR mb.expires_at > NOW())
             WHERE sb.user_id IS NULL
+                AND mb.user_id IS NULL
                 AND m.afk_update_count < 360
                 AND m.map_uid = $1
                 AND m.updated_at > now() - interval '120 seconds'
@@ -278,9 +343,7 @@ mod tests {
     /// Serialize DB-backed live-height tests (shared DD2_MAP_UID rows).
     fn test_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap_or_else(|e| e.into_inner())
     }
 
     async fn test_pool() -> Pool<Postgres> {
@@ -353,7 +416,8 @@ mod tests {
         cleanup_user(&pool, &user_id).await;
 
         assert!(
-            rows.iter().any(|p| p.user_id == user_id.to_string() && (p.height - 55.5).abs() < 1e-6),
+            rows.iter()
+                .any(|p| p.user_id == user_id.to_string() && (p.height - 55.5).abs() < 1e-6),
             "custom map live heights must still work; got: {:?}",
             rows
         );
@@ -361,6 +425,148 @@ mod tests {
             !dd2_rows.iter().any(|p| p.user_id == user_id.to_string()),
             "custom-map upsert must not appear under DD2 live heights"
         );
+    }
+
+    #[tokio::test]
+    async fn active_map_ban_soft_filters_all_public_map_reads() {
+        let _guard = test_lock();
+        let pool = test_pool().await;
+        let actor = seed_user(&pool, "map-ban-filter-actor").await;
+        let target = seed_user(&pool, "map-ban-filter-target").await;
+        let map_uid = format!("MapBanFilter{}", Uuid::new_v4().simple());
+        let map_uid = &map_uid[..27];
+
+        upsert_map_curr_height(&pool, map_uid, &target, [1.0, 100.0, 2.0], 1000)
+            .await
+            .expect("seed live height");
+        query!(
+            r#"
+            INSERT INTO map_leaderboard (map_uid, user_id, height, pos, race_time)
+            VALUES ($1, $2, $3, $4, $5)
+            "#,
+            map_uid,
+            target,
+            100.0,
+            &[1.0_f64, 100.0, 2.0] as &[f64],
+            1000
+        )
+        .execute(&pool)
+        .await
+        .expect("seed leaderboard");
+
+        crate::queries::moderation::apply_map_ban(&pool, map_uid, &target, &actor, "private", "public", None)
+            .await
+            .expect("apply Map Ban");
+
+        assert!(get_map_leaderboard(&pool, map_uid, 0, 10).await.expect("leaderboard").is_empty());
+        assert_eq!(get_map_leaderboard_len(&pool, map_uid).await.expect("leaderboard count"), 0);
+        assert!(get_map_live_heights(&pool, map_uid).await.expect("live heights").is_empty());
+        assert!(get_map_live_heights_top_n(&pool, map_uid, 10)
+            .await
+            .expect("top live heights")
+            .is_empty());
+        assert_eq!(get_map_nb_playing_live(&pool, map_uid).await.expect("live count"), 0);
+        let (overview_lb, overview_live) = get_map_overview_player_counts(&pool, map_uid)
+            .await
+            .expect("overview counts");
+        assert_eq!(overview_lb, 0);
+        assert_eq!(overview_live, 0);
+        assert_eq!(
+            overview_lb,
+            get_map_leaderboard_len(&pool, map_uid).await.expect("leaderboard count"),
+            "overview LB count must share get_map_leaderboard_len"
+        );
+
+        upsert_map_curr_height(&pool, map_uid, &target, [1.0, 101.0, 2.0], 1100)
+            .await
+            .expect("update soft-filtered live height");
+        let row = query!(
+            "SELECT height, update_count FROM map_curr_heights WHERE map_uid = $1 AND user_id = $2",
+            map_uid,
+            target
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read retained live row");
+        assert_eq!(row.height, 101.0);
+        assert_eq!(row.update_count, 1);
+
+        cleanup_user(&pool, &target).await;
+        cleanup_user(&pool, &actor).await;
+    }
+
+    /// MapRank seam: Map-Banned Standing stays visible and carries `banned` + public message only.
+    #[tokio::test]
+    async fn map_rank_includes_banned_player_with_public_ban_flag() {
+        let _guard = test_lock();
+        let pool = test_pool().await;
+        let actor = seed_user(&pool, "map-rank-ban-actor").await;
+        let target = seed_user(&pool, "map-rank-ban-target").await;
+        let map_uid = format!("MapRankBan{}", Uuid::new_v4().simple());
+        let map_uid = &map_uid[..27];
+
+        query!(
+            r#"
+            INSERT INTO map_leaderboard (map_uid, user_id, height, pos, race_time)
+            VALUES ($1, $2, $3, $4, $5)
+            "#,
+            map_uid,
+            target,
+            42.0,
+            &[1.0_f64, 42.0, 2.0] as &[f64],
+            500
+        )
+        .execute(&pool)
+        .await
+        .expect("seed leaderboard");
+
+        crate::queries::moderation::apply_map_ban(
+            &pool,
+            map_uid,
+            &target,
+            &actor,
+            "secret-mod-note",
+            "you are banned from this map LB",
+            None,
+        )
+        .await
+        .expect("apply Map Ban");
+
+        let standing = get_map_rank_entry(&pool, map_uid, &target)
+            .await
+            .expect("map rank entry")
+            .expect("Standing must remain visible on MapRank");
+        assert_eq!(standing.wsid, target.to_string());
+        assert!((standing.pos[1] - 42.0).abs() < 1e-6);
+
+        let status = crate::queries::moderation::get_ban_status(&pool, map_uid, &target)
+            .await
+            .expect("ban status");
+        assert!(status.banned);
+        assert_eq!(
+            status.public_message.as_deref(),
+            Some("you are banned from this map LB")
+        );
+        assert!(status.unofficial);
+
+        let status_json = serde_json::to_value(&status).expect("serialize MapBanStatus");
+        assert!(status_json.get("private_reason").is_none());
+        assert_eq!(status_json["banned"], true);
+
+        assert!(
+            crate::queries::moderation::lift_map_ban(&pool, map_uid, &target, &actor, false)
+                .await
+                .expect("lift"),
+            "lift for S2"
+        );
+        let after = crate::queries::moderation::get_ban_status(&pool, map_uid, &target)
+            .await
+            .expect("status after lift");
+        assert!(!after.banned);
+        assert!(after.public_message.is_none());
+
+        cleanup_user(&pool, &target).await;
+        cleanup_user(&pool, &actor).await;
     }
 
     /// Control: custom-map live heights read path works when `map_curr_heights` is populated
@@ -375,18 +581,15 @@ mod tests {
             .await
             .expect("upsert map_curr_heights");
 
-        let rows = get_map_live_heights(&pool, DD2_MAP_UID)
-            .await
-            .expect("get_map_live_heights");
-        let handler_ok = handle_get_map_uid_live_heights(&pool, DD2_MAP_UID.to_string())
-            .await
-            .is_ok();
+        let rows = get_map_live_heights(&pool, DD2_MAP_UID).await.expect("get_map_live_heights");
+        let handler_ok = handle_get_map_uid_live_heights(&pool, DD2_MAP_UID.to_string()).await.is_ok();
 
         cleanup_user(&pool, &user_id).await;
 
         assert!(handler_ok, "handle_get_map_uid_live_heights should succeed for DD2 UID");
         assert!(
-            rows.iter().any(|p| p.user_id == user_id.to_string() && (p.height - 123.45).abs() < 1e-6),
+            rows.iter()
+                .any(|p| p.user_id == user_id.to_string() && (p.height - 123.45).abs() < 1e-6),
             "expected seeded DD2 player in map live heights, got: {:?}",
             rows
         );
@@ -420,7 +623,8 @@ mod tests {
         cleanup_user(&pool, &user_id).await;
 
         assert!(
-            rows.iter().any(|p| p.user_id == user_id.to_string() && (p.height - 250.0).abs() < 1e-6),
+            rows.iter()
+                .any(|p| p.user_id == user_id.to_string() && (p.height - 250.0).abs() < 1e-6),
             "DD2 vehicle-state live report must appear on map live heights API \
              (migration onto custom-map path). got: {:?}",
             rows
@@ -448,9 +652,7 @@ mod tests {
         .await
         .expect("report_live_vehicle_state");
 
-        let rows = get_map_live_heights(&pool, DD2_MAP_UID)
-            .await
-            .expect("get_map_live_heights");
+        let rows = get_map_live_heights(&pool, DD2_MAP_UID).await.expect("get_map_live_heights");
 
         cleanup_user(&pool, &user_id).await;
 
@@ -478,7 +680,8 @@ mod tests {
         cleanup_user(&pool, &user_id).await;
 
         assert!(
-            rows.iter().any(|p| p.user_id == user_id.to_string() && (p.height - 300.0).abs() < 1e-6),
+            rows.iter()
+                .any(|p| p.user_id == user_id.to_string() && (p.height - 300.0).abs() < 1e-6),
             "global live heights should include DD2 map_curr_heights rows; got: {:?}",
             rows
         );
@@ -510,7 +713,8 @@ mod tests {
         cleanup_user(&pool, &user_id).await;
 
         assert!(
-            rows.iter().any(|p| p.user_id == user_id.to_string() && (p.height - 275.0).abs() < 1e-6),
+            rows.iter()
+                .any(|p| p.user_id == user_id.to_string() && (p.height - 275.0).abs() < 1e-6),
             "global live heights should include official DD2 vehicle reports after mirror; got: {:?}",
             rows
         );
