@@ -216,6 +216,7 @@ impl PlayerMgr {
                             info!("New top3");
                             let _ = new_top3_tx.send(());
                         }
+                        ToPlayerMgr::Broadcast(_) => {}
                     },
                     None => {
                         break;

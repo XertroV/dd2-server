@@ -46,6 +46,7 @@ pub enum ToPlayerMgr {
     AuthFailed(),
     SocketError(),
     NewTop3(),
+    Broadcast(Response),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -169,6 +170,16 @@ pub enum Request {
         /// `zone` or `grant`.
         source: String,
     } = 83,
+    ReportHatUnlock {
+        uid: String,
+        slug: String,
+        spec_id: i64,
+    } = 84,
+    ReportHatEquip {
+        uid: String,
+        /// Empty slug unequips.
+        slug: String,
+    } = 85,
 
     GetMyStats {} = 128,
     GetGlobalLB {
@@ -244,6 +255,12 @@ pub enum Request {
     GetCollectibleMine {
         uid: String,
     } = 212,
+    GetHatsMine {
+        uid: String,
+    } = 213,
+    GetHatsOnMap {
+        uid: String,
+    } = 214,
 
     GetSecretAssets {} = 254,
 
@@ -279,6 +296,8 @@ impl Request {
             Request::ReportMinigameMap { .. } => 81,
             Request::ReportCollectibleUnlock { .. } => 82,
             Request::ReportCollectibleCollect { .. } => 83,
+            Request::ReportHatUnlock { .. } => 84,
+            Request::ReportHatEquip { .. } => 85,
             // get
             Request::GetMyStats { .. } => 128,
             Request::GetGlobalLB { .. } => 129,
@@ -308,6 +327,8 @@ impl Request {
             Request::GetMinigameList { .. } => 210,
             Request::GetCollectibleList { .. } => 211,
             Request::GetCollectibleMine { .. } => 212,
+            Request::GetHatsMine { .. } => 213,
+            Request::GetHatsOnMap { .. } => 214,
             //
             Request::GetSecretAssets { .. } => 254,
             // debug
@@ -343,6 +364,8 @@ impl Request {
             Request::ReportMinigameMap { .. } => "ReportMinigameMap",
             Request::ReportCollectibleUnlock { .. } => "ReportCollectibleUnlock",
             Request::ReportCollectibleCollect { .. } => "ReportCollectibleCollect",
+            Request::ReportHatUnlock { .. } => "ReportHatUnlock",
+            Request::ReportHatEquip { .. } => "ReportHatEquip",
             // get
             Request::GetMyStats { .. } => "GetMyStats",
             Request::GetGlobalLB { .. } => "GetGlobalLB",
@@ -371,6 +394,8 @@ impl Request {
             Request::GetMinigameList { .. } => "GetMinigameList",
             Request::GetCollectibleList { .. } => "GetCollectibleList",
             Request::GetCollectibleMine { .. } => "GetCollectibleMine",
+            Request::GetHatsMine { .. } => "GetHatsMine",
+            Request::GetHatsOnMap { .. } => "GetHatsOnMap",
 
             Request::GetSecretAssets { .. } => "GetSecretAssets",
             // debug
@@ -629,6 +654,20 @@ pub enum Response {
         uid: String,
         items: Vec<CollectibleMineItem>,
     },
+    HatsMine {
+        uid: String,
+        /// Empty string = none equipped.
+        equipped: String,
+        items: Vec<HatMineItem>,
+    },
+    HatsOnMap {
+        uid: String,
+        hats: Vec<HatOnMapPlayer>,
+    },
+    HatsOnMapUpdate {
+        uid: String,
+        hats: Vec<HatOnMapPlayer>,
+    },
     // near end
     TaskResponse {
         id: u32,
@@ -686,6 +725,9 @@ impl Response {
             Response::MinigameList { .. } => 210,
             Response::CollectibleList { .. } => 211,
             Response::CollectibleMine { .. } => 212,
+            Response::HatsMine { .. } => 213,
+            Response::HatsOnMap { .. } => 214,
+            Response::HatsOnMapUpdate { .. } => 215,
 
             Response::TaskResponseJson { .. } => 252,
             Response::TaskResponse { .. } => 253,
@@ -725,6 +767,9 @@ impl Response {
             Response::MinigameList { .. } => "MinigameList",
             Response::CollectibleList { .. } => "CollectibleList",
             Response::CollectibleMine { .. } => "CollectibleMine",
+            Response::HatsMine { .. } => "HatsMine",
+            Response::HatsOnMap { .. } => "HatsOnMap",
+            Response::HatsOnMapUpdate { .. } => "HatsOnMapUpdate",
             //
             Response::TaskResponseJson { .. } => "TaskResponseJson",
             Response::TaskResponse { .. } => "TaskResponse",
@@ -840,6 +885,21 @@ pub struct CollectibleMineItem {
     pub collected_at: Option<u32>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HatMineItem {
+    pub slug: String,
+    pub name: String,
+    pub key: String,
+    pub unlocked_at: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HatOnMapPlayer {
+    pub wsid: String,
+    pub name: String,
+    pub slug: String,
+}
+
 impl PartialEq for LeaderboardEntry2 {
     fn eq(&self, other: &Self) -> bool {
         // only cheap stuff:
@@ -905,5 +965,56 @@ mod tests {
         }
         let old = r#"{"ReportCollectibleCollect":{"uid":"abcdefghijklmnopqrstuvwxyza","slug":"coin-1","spec_id":42}}"#;
         assert!(serde_json::from_str::<Request>(old).is_err());
+    }
+
+    #[test]
+    fn hat_type_bytes_are_84_85_213_214_215() {
+        let unlock = Request::ReportHatUnlock {
+            uid: "abcdefghijklmnopqrstuvwxyza".into(),
+            slug: "Hat-1".into(),
+            spec_id: 1,
+        };
+        let equip = Request::ReportHatEquip {
+            uid: "abcdefghijklmnopqrstuvwxyza".into(),
+            slug: String::new(),
+        };
+        let mine = Request::GetHatsMine {
+            uid: "abcdefghijklmnopqrstuvwxyza".into(),
+        };
+        let on_map = Request::GetHatsOnMap {
+            uid: "abcdefghijklmnopqrstuvwxyza".into(),
+        };
+        assert_eq!(unlock.ty(), 84);
+        assert_eq!(equip.ty(), 85);
+        assert_eq!(mine.ty(), 213);
+        assert_eq!(on_map.ty(), 214);
+        assert_eq!(
+            Response::into(&Response::HatsMine {
+                uid: "abcdefghijklmnopqrstuvwxyza".into(),
+                equipped: String::new(),
+                items: vec![],
+            }),
+            213
+        );
+        assert_eq!(
+            Response::into(&Response::HatsOnMap {
+                uid: "abcdefghijklmnopqrstuvwxyza".into(),
+                hats: vec![],
+            }),
+            214
+        );
+        assert_eq!(
+            Response::into(&Response::HatsOnMapUpdate {
+                uid: "abcdefghijklmnopqrstuvwxyza".into(),
+                hats: vec![],
+            }),
+            215
+        );
+        let json = r#"{"ReportHatEquip":{"uid":"abcdefghijklmnopqrstuvwxyza","slug":""}}"#;
+        let req: Request = serde_json::from_str(json).expect("empty slug unequip");
+        match req {
+            Request::ReportHatEquip { slug, .. } => assert!(slug.is_empty()),
+            other => panic!("unexpected {other:?}"),
+        }
     }
 }

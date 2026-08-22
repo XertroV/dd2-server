@@ -1,0 +1,4 @@
+DROP TABLE IF EXISTS hat_equipped;
+DROP TABLE IF EXISTS hat_unlock;
+DROP TABLE IF EXISTS hat_on_map;
+DROP TABLE IF EXISTS hat_catalog;

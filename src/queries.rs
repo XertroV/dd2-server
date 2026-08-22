@@ -5,6 +5,7 @@ pub mod context;
 pub mod custom_maps;
 pub mod custom_map_aux_specs;
 pub mod collectibles;
+pub mod hats;
 pub mod minigames;
 pub mod moderation;
 pub mod players;
