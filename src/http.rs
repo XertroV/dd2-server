@@ -328,7 +328,7 @@ pub async fn run_http_server(
         nadeo: NadeoLiveClient::from_env(),
         oauth: TmOauthConfig::from_env(),
     };
-    let mod_routes = moderation_http::routes(mod_state);
+    let mod_routes = moderation_http::routes(mod_state).boxed();
 
     // info!("Enabling route: get /mlping_intro");
     // let ping_path = warp::path!("mlping_intro")
@@ -349,7 +349,9 @@ pub async fn run_http_server(
     //         ))
     //     });
 
-    let site = ping_path
+    // Boxed chunks keep the combined Filter type shallow. A single .or() chain
+    // of this length overflows rustc's Unpin recursion in release builds (E0275).
+    let core_routes = ping_path
         .or(intro_ping_path)
         .or(api_routes)
         .or(version_route)
@@ -363,7 +365,8 @@ pub async fn run_http_server(
         .or(get_last_heights_of_user)
         .or(get_donations_totals)
         .or(get_twitch_handles)
-        .or(get_custom_map_aux_spec)
+        .boxed();
+    let map_routes = get_custom_map_aux_spec
         .or(get_map_uid_nb_climbers)
         .or(get_map_uid_leaderboard)
         .or(get_map_uid_leaderboard_len)
@@ -374,6 +377,9 @@ pub async fn run_http_server(
         .or(get_map_uid_minigame_lb_len)
         .or(get_map_uid_minigame_lb_page)
         .or(get_map_uid_collectibles)
+        .boxed();
+    let site = core_routes
+        .or(map_routes)
         .or(mod_routes)
         .with(warp::log("dips++"));
 
