@@ -624,14 +624,14 @@ mod tests {
 
     #[test]
     fn parse_ban_expires_at_accepts_datetime_local_and_rfc3339() {
-        let naive_min = parse_ban_expires_at(Some("2026-08-01T12:00")).unwrap().unwrap();
-        assert_eq!(naive_min, Utc.with_ymd_and_hms(2026, 8, 1, 12, 0, 0).unwrap());
+        let naive_min = parse_ban_expires_at(Some("2030-08-01T12:00")).unwrap().unwrap();
+        assert_eq!(naive_min, Utc.with_ymd_and_hms(2030, 8, 1, 12, 0, 0).unwrap());
 
-        let naive_sec = parse_ban_expires_at(Some("2026-08-01T12:00:00")).unwrap().unwrap();
-        assert_eq!(naive_sec, Utc.with_ymd_and_hms(2026, 8, 1, 12, 0, 0).unwrap());
+        let naive_sec = parse_ban_expires_at(Some("2030-08-01T12:00:00")).unwrap().unwrap();
+        assert_eq!(naive_sec, Utc.with_ymd_and_hms(2030, 8, 1, 12, 0, 0).unwrap());
 
-        let zulu = parse_ban_expires_at(Some("2026-08-01T12:00:00Z")).unwrap().unwrap();
-        assert_eq!(zulu, Utc.with_ymd_and_hms(2026, 8, 1, 12, 0, 0).unwrap());
+        let zulu = parse_ban_expires_at(Some("2030-08-01T12:00:00Z")).unwrap().unwrap();
+        assert_eq!(zulu, Utc.with_ymd_and_hms(2030, 8, 1, 12, 0, 0).unwrap());
     }
 
     #[test]
