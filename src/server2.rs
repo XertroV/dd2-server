@@ -148,7 +148,7 @@ async fn accept_conns(subsys: SubsystemHandle, db: Arc<Pool<Postgres>>) -> miett
 pub struct PlayerMgr {
     // players: Mutex<Vec<Arc<Player>>>,
     players: Arc<Mutex<Vec<UnboundedSender<ToPlayer>>>>,
-    rx: UnboundedReceiver<ToPlayerMgr>,
+    rx: Option<UnboundedReceiver<ToPlayerMgr>>,
     tx: UnboundedSender<ToPlayerMgr>,
     // state: Mutex<PlayerMgrState>,
     pool: Arc<Pool<Postgres>>,
@@ -163,7 +163,7 @@ impl PlayerMgr {
             players: Mutex::new(Vec::new()).into(),
             /// send ToPlayerMgr msgs
             tx,
-            rx,
+            rx: Some(rx),
             // state: Mutex::new(PlayerMgrState::default()),
             /// the db
             pool,
@@ -238,6 +238,26 @@ impl PlayerMgr {
         let players = self.players.clone();
         subsys.start(SubsystemBuilder::new("PlayerMgr_TellTop3", |a| {
             PlayerMgr::top_3_loop(pool, players, a)
+        }));
+        let players = self.players.clone();
+        let mut inbox = self.rx.take().expect("player mgr inbox");
+        subsys.start(SubsystemBuilder::new("PlayerMgr_Inbox", move |a| async move {
+            loop {
+                tokio::select! {
+                    _ = a.on_shutdown_requested() => break,
+                    msg = inbox.recv() => {
+                        let Some(msg) = msg else { break };
+                        if let ToPlayerMgr::Broadcast(resp) = msg {
+                            let mut ps = players.lock().await;
+                            ps.retain(|p| !p.is_closed());
+                            for p in ps.iter() {
+                                let _ = p.send(ToPlayer::Send(resp.clone()));
+                            }
+                        }
+                    }
+                }
+            }
+            Ok::<(), miette::Error>(())
         }));
         let cancel_t = subsys.create_cancellation_token();
         // let conn_tracker = TaskTracker::new();
@@ -599,8 +619,20 @@ impl XPlayer {
                 Request::ReportCollectibleUnlock { uid, slug, spec_id } => {
                     XPlayer::report_collectible_unlock(&pool, user_id, uid, slug, spec_id).await
                 }
-                Request::ReportCollectibleCollect { uid, slug, spec_id } => {
-                    XPlayer::report_collectible_collect(&pool, user_id, uid, slug, spec_id).await
+                Request::ReportCollectibleCollect {
+                    uid,
+                    slug,
+                    spec_id,
+                    x,
+                    y,
+                    z,
+                    source,
+                } => XPlayer::report_collectible_collect(&pool, user_id, uid, slug, spec_id, x, y, z, source).await,
+                Request::ReportHatUnlock { uid, slug, spec_id } => {
+                    XPlayer::report_hat_unlock(&pool, user_id, uid, slug, spec_id).await
+                }
+                Request::ReportHatEquip { uid, slug } => {
+                    XPlayer::report_hat_equip(&pool, &mgr_tx, user_id, uid, slug).await
                 }
 
                 // get requests
@@ -656,6 +688,10 @@ impl XPlayer {
                 Request::GetCollectibleList { uid } => XPlayer::send_collectible_list(&pool, &queue_tx, uid).await,
                 Request::GetCollectibleMine { uid } => {
                     XPlayer::send_collectible_mine(&pool, &queue_tx, uid, user_id).await
+                }
+                Request::GetHatsMine { uid } => XPlayer::send_hats_mine(&pool, &queue_tx, uid, user_id).await,
+                Request::GetHatsOnMap { uid } => {
+                    XPlayer::send_hats_on_map(&pool, &mgr_tx, &queue_tx, uid, user_id).await
                 }
 
                 Request::GetSecretAssets {} => XPlayer::get_secret_assets(&pool, user_id, &queue_tx).await,
@@ -1600,6 +1636,7 @@ impl XPlayer {
         let spec_id = queries::custom_map_aux_specs::upsert_spec(pool, user_id, name_id, spec).await?;
         queries::minigames::replace_catalog(pool, spec_id, user_id, name_id, spec).await?;
         queries::collectibles::replace_catalog(pool, spec_id, user_id, name_id, spec).await?;
+        queries::hats::replace_catalog(pool, spec_id, user_id, name_id, spec).await?;
         queue_tx.send(Response::TaskResponse {
             id: request_id,
             success: true,
@@ -1624,6 +1661,7 @@ impl XPlayer {
         queries::custom_map_aux_specs::delete_spec(pool, user_id, name_id).await?;
         queries::minigames::delete_catalog(pool, user_id, name_id).await?;
         queries::collectibles::delete_catalog(pool, user_id, name_id).await?;
+        queries::hats::delete_catalog(pool, user_id, name_id).await?;
         queue_tx.send(Response::TaskResponse {
             id: request_id,
             success: true,
@@ -1667,6 +1705,7 @@ impl XPlayer {
         }
         let _ = queries::minigames::bind_map_from_catalog(pool, &map_uid, spec_id).await?;
         let _ = queries::collectibles::bind_map_from_catalog(pool, &map_uid, spec_id).await?;
+        let _ = queries::hats::bind_map_from_catalog(pool, &map_uid, spec_id).await?;
         queries::listed_maps::bind_first_spec(pool, &map_uid, spec_id).await?;
         Ok(())
     }
@@ -1691,11 +1730,88 @@ impl XPlayer {
         map_uid: String,
         slug: String,
         spec_id: i64,
+        x: f32,
+        y: f32,
+        z: f32,
+        source: String,
     ) -> Result<(), api_error::Error> {
         if map_uid.len() != 27 || spec_id <= 0 || slug.is_empty() {
             return Ok(());
         }
-        queries::collectibles::report_collect(pool, user_id, &map_uid, &slug, spec_id).await?;
+        let Some(source) = queries::collectibles::collect_log_source(&source) else {
+            return Ok(());
+        };
+        queries::collectibles::report_collect(pool, user_id, &map_uid, &slug, spec_id, x, y, z, source).await?;
+        Ok(())
+    }
+
+    pub async fn report_hat_unlock(
+        pool: &Pool<Postgres>,
+        user_id: &Uuid,
+        map_uid: String,
+        slug: String,
+        spec_id: i64,
+    ) -> Result<(), api_error::Error> {
+        if map_uid.len() != 27 || spec_id <= 0 || slug.is_empty() {
+            return Ok(());
+        }
+        let _ = queries::hats::report_unlock(pool, user_id, &map_uid, &slug, spec_id).await?;
+        Ok(())
+    }
+
+    pub async fn report_hat_equip(
+        pool: &Pool<Postgres>,
+        mgr_tx: &UnboundedSender<ToPlayerMgr>,
+        user_id: &Uuid,
+        map_uid: String,
+        slug: String,
+    ) -> Result<(), api_error::Error> {
+        if map_uid.len() != 27 {
+            return Ok(());
+        }
+        let Some(entry) = queries::hats::report_equip(pool, user_id, &map_uid, &slug).await? else {
+            return Ok(());
+        };
+        let _ = mgr_tx.send(ToPlayerMgr::Broadcast(Response::HatsOnMapUpdate {
+            uid: map_uid,
+            hats: vec![entry],
+        }));
+        Ok(())
+    }
+
+    pub async fn send_hats_mine(
+        pool: &Pool<Postgres>,
+        queue_tx: &UnboundedSender<Response>,
+        map_uid: String,
+        user_id: &Uuid,
+    ) -> Result<(), api_error::Error> {
+        let (equipped, items) = queries::hats::get_hats_mine(pool, &map_uid, user_id).await?;
+        queue_tx.send(Response::HatsMine {
+            uid: map_uid,
+            equipped,
+            items,
+        })?;
+        Ok(())
+    }
+
+    pub async fn send_hats_on_map(
+        pool: &Pool<Postgres>,
+        mgr_tx: &UnboundedSender<ToPlayerMgr>,
+        queue_tx: &UnboundedSender<Response>,
+        map_uid: String,
+        user_id: &Uuid,
+    ) -> Result<(), api_error::Error> {
+        let hats = queries::hats::get_hats_on_map(pool, &map_uid).await?;
+        queue_tx.send(Response::HatsOnMap {
+            uid: map_uid.clone(),
+            hats,
+        })?;
+        if let Some(entry) = queries::hats::equipped_push_entry(pool, user_id, &map_uid).await? {
+            let _ = mgr_tx.send(ToPlayerMgr::Broadcast(Response::HatsOnMapUpdate {
+                uid: map_uid,
+                hats: vec![entry],
+            }));
+        }
         Ok(())
     }
 
