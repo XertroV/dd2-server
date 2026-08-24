@@ -75,19 +75,45 @@ pub fn spec_json_with_id(id: i64, spec: &Value) -> Value {
     v
 }
 
+pub const DEFAULT_LISTING_THRESHOLD: i32 = 25;
+pub const MIN_LISTING_THRESHOLD: i32 = 5;
+pub const MAX_LISTING_THRESHOLD: i32 = 100;
+
+/// Top-level aux spec `listingThreshold`: omit/invalid = 25, clamp 5–100.
+pub fn listing_threshold_from_spec(spec: &Value) -> i32 {
+    let Some(raw) = spec.get("listingThreshold") else {
+        return DEFAULT_LISTING_THRESHOLD;
+    };
+    let n = if let Some(i) = raw.as_i64() {
+        i
+    } else if let Some(u) = raw.as_u64() {
+        i64::try_from(u).unwrap_or(DEFAULT_LISTING_THRESHOLD as i64)
+    } else if let Some(f) = raw.as_f64() {
+        if !f.is_finite() {
+            return DEFAULT_LISTING_THRESHOLD;
+        }
+        f.trunc() as i64
+    } else {
+        return DEFAULT_LISTING_THRESHOLD;
+    };
+    n.clamp(MIN_LISTING_THRESHOLD as i64, MAX_LISTING_THRESHOLD as i64) as i32
+}
+
 pub async fn upsert_spec(pool: &Pool<Postgres>, user_id: &Uuid, name_id: &str, spec: &Value) -> Result<i64, Error> {
     let spec = strip_injected_spec_id(spec);
+    let listing_threshold = listing_threshold_from_spec(&spec);
     let row = sqlx::query!(
         r#"
-        INSERT INTO custom_map_aux_specs (user_id, name_id, spec)
-        VALUES ($1, $2, $3)
+        INSERT INTO custom_map_aux_specs (user_id, name_id, spec, listing_threshold)
+        VALUES ($1, $2, $3, $4)
         ON CONFLICT (user_id, name_id)
-        DO UPDATE SET spec = $3, updated_at = NOW()
+        DO UPDATE SET spec = $3, listing_threshold = $4, updated_at = NOW()
         RETURNING id
         "#,
         user_id,
         name_id,
-        spec
+        spec,
+        listing_threshold
     )
     .fetch_one(pool)
     .await?;
@@ -145,5 +171,44 @@ mod tests {
         let out = spec_json_with_id(42, &spec);
         assert_eq!(out["specId"], 42);
         assert!(out.get("minigames").is_some());
+    }
+
+    #[test]
+    fn listing_threshold_omitted_defaults_to_25() {
+        assert_eq!(listing_threshold_from_spec(&json!({})), 25);
+        assert_eq!(listing_threshold_from_spec(&json!({"minigames": {}})), 25);
+    }
+
+    #[test]
+    fn listing_threshold_null_or_invalid_defaults_to_25() {
+        assert_eq!(listing_threshold_from_spec(&json!({"listingThreshold": null})), 25);
+        assert_eq!(listing_threshold_from_spec(&json!({"listingThreshold": "25"})), 25);
+        assert_eq!(listing_threshold_from_spec(&json!({"listingThreshold": true})), 25);
+        assert_eq!(listing_threshold_from_spec(&json!({"listingThreshold": []})), 25);
+        assert_eq!(listing_threshold_from_spec(&json!({"listingThreshold": {}})), 25);
+    }
+
+    #[test]
+    fn listing_threshold_keeps_in_range_integers() {
+        assert_eq!(listing_threshold_from_spec(&json!({"listingThreshold": 5})), 5);
+        assert_eq!(listing_threshold_from_spec(&json!({"listingThreshold": 25})), 25);
+        assert_eq!(listing_threshold_from_spec(&json!({"listingThreshold": 100})), 100);
+        assert_eq!(listing_threshold_from_spec(&json!({"listingThreshold": 42})), 42);
+    }
+
+    #[test]
+    fn listing_threshold_clamps_to_5_100() {
+        assert_eq!(listing_threshold_from_spec(&json!({"listingThreshold": 4})), 5);
+        assert_eq!(listing_threshold_from_spec(&json!({"listingThreshold": 0})), 5);
+        assert_eq!(listing_threshold_from_spec(&json!({"listingThreshold": -10})), 5);
+        assert_eq!(listing_threshold_from_spec(&json!({"listingThreshold": 101})), 100);
+        assert_eq!(listing_threshold_from_spec(&json!({"listingThreshold": 1000})), 100);
+    }
+
+    #[test]
+    fn listing_threshold_truncates_floats_then_clamps() {
+        assert_eq!(listing_threshold_from_spec(&json!({"listingThreshold": 7.9})), 7);
+        assert_eq!(listing_threshold_from_spec(&json!({"listingThreshold": 4.9})), 5);
+        assert_eq!(listing_threshold_from_spec(&json!({"listingThreshold": 100.9})), 100);
     }
 }

@@ -141,6 +141,9 @@ pub async fn run_http_server(
             "/map/<uid>/minigame/<slug>/leaderboard/len",
             "/map/<uid>/minigame/<slug>/leaderboard/<page>",
             "/map/<uid>/collectibles",
+            "/maps/listed",
+            "/maps/listed/len",
+            "/maps/listed/<page>",
             "/admin",
             "/api/mod/oauth/start",
             "/api/mod/oauth/callback",
@@ -323,6 +326,26 @@ pub async fn run_http_server(
         );
     let req_pool = pool.clone();
 
+    let get_listed_maps = warp::path!("maps" / "listed")
+        .and(warp::path::end())
+        .map(move || req_pool.clone())
+        .and_then(|pool: Arc<Pool<Postgres>>| async move { api::handle_get_listed_maps(pool.as_ref(), 0).await });
+    let req_pool = pool.clone();
+
+    let get_listed_maps_len = warp::path!("maps" / "listed" / "len")
+        .and(warp::path::end())
+        .map(move || req_pool.clone())
+        .and_then(|pool: Arc<Pool<Postgres>>| async move { api::handle_get_listed_maps_len(pool.as_ref()).await });
+    let req_pool = pool.clone();
+
+    let get_listed_maps_page = warp::path!("maps" / "listed" / u32)
+        .and(warp::path::end())
+        .map(move |page| (page, req_pool.clone()))
+        .and_then(|(page, pool): (u32, Arc<Pool<Postgres>>)| async move {
+            api::handle_get_listed_maps(pool.as_ref(), page).await
+        });
+    let req_pool = pool.clone();
+
     let mod_state = ModerationState {
         pool: req_pool,
         nadeo: NadeoLiveClient::from_env(),
@@ -378,8 +401,13 @@ pub async fn run_http_server(
         .or(get_map_uid_minigame_lb_page)
         .or(get_map_uid_collectibles)
         .boxed();
+    let listed_routes = get_listed_maps
+        .or(get_listed_maps_len)
+        .or(get_listed_maps_page)
+        .boxed();
     let site = core_routes
         .or(map_routes)
+        .or(listed_routes)
         .or(mod_routes)
         .with(warp::log("dips++"));
 

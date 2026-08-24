@@ -17,6 +17,15 @@ _Avoid_: Run (this system does not store per-attempt history), race, time attack
 **Leaderboard**:
 The ordered public list of Standings on a Map (or the global DD2 height list), excluding players who must not appear.
 
+**Listed map**:
+A custom Map whose public Leaderboard has reached the listing threshold. Once listed, it stays listed. Deep Dip 2 is never listed.
+
+**Listing threshold**:
+Unique public Leaderboard players required to list a Map. From the aux spec `listingThreshold` (omit = 25, clamp 5–100) after the first spec-on-map bind; otherwise 25.
+
+**Became listed**:
+The time a Map first became listed. Sorts the listed-maps route, newest first.
+
 ### Roles
 
 **Map Author**:

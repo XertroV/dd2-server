@@ -1667,6 +1667,7 @@ impl XPlayer {
         }
         let _ = queries::minigames::bind_map_from_catalog(pool, &map_uid, spec_id).await?;
         let _ = queries::collectibles::bind_map_from_catalog(pool, &map_uid, spec_id).await?;
+        queries::listed_maps::bind_first_spec(pool, &map_uid, spec_id).await?;
         Ok(())
     }
 

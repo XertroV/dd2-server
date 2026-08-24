@@ -323,3 +323,28 @@ pub async fn handle_get_map_uid_collectibles(pool: &Pool<Postgres>, map_uid: Str
         }
     }
 }
+
+pub async fn handle_get_listed_maps(pool: &Pool<Postgres>, page: u32) -> Result<impl Reply, warp::Rejection> {
+    let r = super::listed_maps::get_listed_maps_page(pool, page).await;
+    match r {
+        Ok(r) => Ok(warp::reply::json(&r)),
+        Err(e) => {
+            eprintln!("Error: {:?}", e);
+            Err(warp::reject::custom(Into::<ApiErrRejection>::into(e)))
+        }
+    }
+}
+
+pub async fn handle_get_listed_maps_len(pool: &Pool<Postgres>) -> Result<impl Reply, warp::Rejection> {
+    let r = super::listed_maps::get_listed_maps_len(pool).await;
+    match r {
+        Ok(r) => Ok(warp::reply::json(&serde_json::json!({
+            "len": r,
+            "pages": super::listed_maps::listed_maps_page_count(r)
+        }))),
+        Err(e) => {
+            eprintln!("Error: {:?}", e);
+            Err(warp::reject::custom(Into::<ApiErrRejection>::into(e)))
+        }
+    }
+}
