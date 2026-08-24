@@ -8,6 +8,8 @@ pub struct CatalogCollectible {
     pub slug: String,
     pub name: String,
     pub pickup: String,
+    pub collect_on_unlock: bool,
+    pub has_zone: bool,
     pub gated_by: Option<String>,
     pub unlock_score: Option<i64>,
 }
@@ -28,27 +30,35 @@ fn collectible_array(spec: &Value) -> Option<&Vec<Value>> {
     None
 }
 
-fn parse_pickup(item: &Value) -> Option<&'static str> {
-    let raw = item
+fn parse_collect_paths(item: &Value) -> Option<(bool, bool, &'static str)> {
+    let canonical_collect = item.get("collectOnUnlock").and_then(Value::as_bool);
+    let canonical_marker = item.get("collectOnUnlock").is_some() || item.get("zone").is_some();
+    let has_canonical_zone = item.get("zone").is_some_and(Value::is_object);
+    let legacy_pickup = item
         .get("pickup")
-        .and_then(|v| v.as_str())
-        .unwrap_or("zone")
-        .trim();
-    match raw.to_ascii_lowercase().as_str() {
-        "" | "zone" => Some("zone"),
-        "grant" => Some("grant"),
-        _ => None,
+        .and_then(Value::as_str)
+        .map(|value| value.trim().to_ascii_lowercase());
+    let (legacy_collect, legacy_zone) = match legacy_pickup.as_deref() {
+        Some("") | Some("zone") => (false, true),
+        Some("grant") => (true, false),
+        Some(_) => return None,
+        None => (false, !canonical_marker), // intentional legacy default: omitted pickup meant zone
+    };
+    let collect_on_unlock = canonical_collect.unwrap_or(false) || legacy_collect;
+    let has_zone = has_canonical_zone || legacy_zone;
+    if !collect_on_unlock && !has_zone {
+        return None;
     }
+    let compatibility_pickup = if collect_on_unlock { "grant" } else { "zone" };
+    Some((collect_on_unlock, has_zone, compatibility_pickup))
 }
 
 fn parse_unlock_score(item: &Value) -> Option<i64> {
-    item.get("unlock_score")
-        .or_else(|| item.get("unlockScore"))
-        .and_then(|v| {
-            v.as_i64()
-                .or_else(|| v.as_u64().map(|u| u as i64))
-                .or_else(|| v.as_f64().map(|f| f as i64))
-        })
+    item.get("unlock_score").or_else(|| item.get("unlockScore")).and_then(|v| {
+        v.as_i64()
+            .or_else(|| v.as_u64().map(|u| u as i64))
+            .or_else(|| v.as_f64().map(|f| f as i64))
+    })
 }
 
 fn parse_gated_by(item: &Value) -> Option<String> {
@@ -77,7 +87,7 @@ pub fn parse_catalog_collectibles(spec: &Value) -> Vec<CatalogCollectible> {
         if !item.is_object() {
             continue;
         }
-        let Some(pickup) = parse_pickup(item) else {
+        let Some((collect_on_unlock, has_zone, pickup)) = parse_collect_paths(item) else {
             continue;
         };
         let slug = item.get("slug").and_then(|s| s.as_str()).unwrap_or("").trim();
@@ -95,24 +105,17 @@ pub fn parse_catalog_collectibles(spec: &Value) -> Vec<CatalogCollectible> {
                 slug,
                 name,
                 pickup: pickup.to_string(),
+                collect_on_unlock,
+                has_zone,
                 gated_by: parse_gated_by(item),
                 unlock_score: parse_unlock_score(item),
             },
         );
     }
-    order
-        .into_iter()
-        .filter_map(|s| last_by_slug.remove(&s))
-        .collect()
+    order.into_iter().filter_map(|s| last_by_slug.remove(&s)).collect()
 }
 
-pub async fn replace_catalog(
-    pool: &Pool<Postgres>,
-    spec_id: i64,
-    user_id: &Uuid,
-    name_id: &str,
-    spec: &Value,
-) -> Result<(), sqlx::Error> {
+pub async fn replace_catalog(pool: &Pool<Postgres>, spec_id: i64, user_id: &Uuid, name_id: &str, spec: &Value) -> Result<(), sqlx::Error> {
     let items = parse_catalog_collectibles(spec);
     let mut tx = pool.begin().await?;
     sqlx::query!(
@@ -126,8 +129,9 @@ pub async fn replace_catalog(
     for c in items {
         sqlx::query!(
             r#"--sql
-            INSERT INTO collectible_catalog (spec_id, user_id, name_id, slug, name, pickup, gated_by, unlock_score)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            INSERT INTO collectible_catalog
+                (spec_id, user_id, name_id, slug, name, pickup, collect_on_unlock, has_zone, gated_by, unlock_score)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
             "#,
             spec_id,
             user_id,
@@ -135,6 +139,8 @@ pub async fn replace_catalog(
             &c.slug,
             &c.name,
             &c.pickup,
+            c.collect_on_unlock,
+            c.has_zone,
             c.gated_by.as_deref(),
             c.unlock_score
         )
@@ -186,16 +192,24 @@ async fn ensure_catalog(pool: &Pool<Postgres>, spec_id: i64) -> Result<(), sqlx:
 
 pub async fn bind_map_from_catalog(pool: &Pool<Postgres>, map_uid: &str, spec_id: i64) -> Result<bool, sqlx::Error> {
     ensure_catalog(pool, spec_id).await?;
+    let mut tx = pool.begin().await?;
+    sqlx::query!("DELETE FROM collectible_on_map WHERE map_uid = $1", map_uid)
+        .execute(&mut *tx)
+        .await?;
     let r = sqlx::query!(
         r#"--sql
-        INSERT INTO collectible_on_map (map_uid, slug, collectible_key, name, pickup, gated_by, unlock_score, spec_user, name_id)
-        SELECT $1, c.slug, substring(md5($3 || ':c:' || c.slug) from 1 for 16), c.name, c.pickup, c.gated_by, c.unlock_score, c.user_id, c.name_id
+        INSERT INTO collectible_on_map
+            (map_uid, slug, collectible_key, name, pickup, collect_on_unlock, has_zone, gated_by, unlock_score, spec_user, name_id)
+        SELECT $1, c.slug, substring(md5($3 || ':c:' || c.slug) from 1 for 16),
+               c.name, c.pickup, c.collect_on_unlock, c.has_zone, c.gated_by, c.unlock_score, c.user_id, c.name_id
         FROM collectible_catalog c
         WHERE c.spec_id = $2
         ON CONFLICT (map_uid, slug) DO UPDATE SET
             collectible_key = EXCLUDED.collectible_key,
             name = EXCLUDED.name,
             pickup = EXCLUDED.pickup,
+            collect_on_unlock = EXCLUDED.collect_on_unlock,
+            has_zone = EXCLUDED.has_zone,
             gated_by = EXCLUDED.gated_by,
             unlock_score = EXCLUDED.unlock_score,
             spec_user = EXCLUDED.spec_user,
@@ -205,39 +219,48 @@ pub async fn bind_map_from_catalog(pool: &Pool<Postgres>, map_uid: &str, spec_id
         spec_id,
         map_uid
     )
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(r.rows_affected() > 0)
 }
 
 struct CatalogRow {
-    pickup: String,
+    collect_on_unlock: bool,
+    has_zone: bool,
 }
 
 async fn catalog_row(pool: &Pool<Postgres>, spec_id: i64, slug: &str) -> Result<Option<CatalogRow>, sqlx::Error> {
     let r = sqlx::query!(
         r#"--sql
-        SELECT pickup FROM collectible_catalog WHERE spec_id = $1 AND slug = $2
+        SELECT collect_on_unlock, has_zone FROM collectible_catalog WHERE spec_id = $1 AND slug = $2
         "#,
         spec_id,
         slug
     )
     .fetch_optional(pool)
     .await?;
-    Ok(r.map(|row| CatalogRow { pickup: row.pickup }))
+    Ok(r.map(|row| CatalogRow {
+        collect_on_unlock: row.collect_on_unlock,
+        has_zone: row.has_zone,
+    }))
 }
 
 async fn bind_one(pool: &Pool<Postgres>, map_uid: &str, spec_id: i64, slug: &str) -> Result<(), sqlx::Error> {
     sqlx::query!(
         r#"--sql
-        INSERT INTO collectible_on_map (map_uid, slug, collectible_key, name, pickup, gated_by, unlock_score, spec_user, name_id)
-        SELECT $1, c.slug, substring(md5($4 || ':c:' || c.slug) from 1 for 16), c.name, c.pickup, c.gated_by, c.unlock_score, c.user_id, c.name_id
+        INSERT INTO collectible_on_map
+            (map_uid, slug, collectible_key, name, pickup, collect_on_unlock, has_zone, gated_by, unlock_score, spec_user, name_id)
+        SELECT $1, c.slug, substring(md5($4 || ':c:' || c.slug) from 1 for 16),
+               c.name, c.pickup, c.collect_on_unlock, c.has_zone, c.gated_by, c.unlock_score, c.user_id, c.name_id
         FROM collectible_catalog c
         WHERE c.spec_id = $2 AND c.slug = $3
         ON CONFLICT (map_uid, slug) DO UPDATE SET
             collectible_key = EXCLUDED.collectible_key,
             name = EXCLUDED.name,
             pickup = EXCLUDED.pickup,
+            collect_on_unlock = EXCLUDED.collect_on_unlock,
+            has_zone = EXCLUDED.has_zone,
             gated_by = EXCLUDED.gated_by,
             unlock_score = EXCLUDED.unlock_score,
             spec_user = EXCLUDED.spec_user,
@@ -261,73 +284,90 @@ pub(crate) fn collect_log_source(raw: &str) -> Option<&str> {
     }
 }
 
-/// First accepted collect only. Progress upsert must run after this so a prior
-/// `collected_at` still suppresses the log (including pre-migration collects).
-async fn insert_first_collect_log(
+/// Atomically establish sticky unlock+collection and append the first-collect
+/// audit event. Any audit failure rolls the progress transition back.
+async fn record_collect_transition(
     pool: &Pool<Postgres>,
     user_id: &Uuid,
     map_uid: &str,
     slug: &str,
-    pos_x: Option<f64>,
-    pos_y: Option<f64>,
-    pos_z: Option<f64>,
+    pos_x: f64,
+    pos_y: f64,
+    pos_z: f64,
     source: &str,
 ) -> Result<(), sqlx::Error> {
-    sqlx::query!(
+    let mut tx = pool.begin().await?;
+    let previous = sqlx::query!(
         r#"--sql
-        INSERT INTO collectible_collect_log (user_id, map_uid, slug, collectible_key, collected_at, pos_x, pos_y, pos_z, source)
-        SELECT $1, $2, $3, substring(md5($4 || ':c:' || $3) from 1 for 16), now(), $5, $6, $7, $8
-        WHERE NOT EXISTS (
-            SELECT 1 FROM collectible_progress
-            WHERE user_id = $1
-              AND collectible_key = substring(md5($4 || ':c:' || $3) from 1 for 16)
-              AND collected_at IS NOT NULL
-        )
-        ON CONFLICT (user_id, collectible_key) DO NOTHING
+        SELECT collected_at FROM collectible_progress
+        WHERE user_id = $1
+          AND collectible_key = substring(md5($2 || ':c:' || $3) from 1 for 16)
+        FOR UPDATE
         "#,
         user_id,
         map_uid,
-        slug,
-        map_uid,
-        pos_x,
-        pos_y,
-        pos_z,
-        source
+        slug
     )
-    .execute(pool)
+    .fetch_optional(&mut *tx)
     .await?;
-    Ok(())
-}
 
-/// Sticky unlock. Grant pickup also collects. Unknown slug: silent drop.
-pub async fn report_unlock(
-    pool: &Pool<Postgres>,
-    user_id: &Uuid,
-    map_uid: &str,
-    slug: &str,
-    spec_id: i64,
-) -> Result<(), sqlx::Error> {
-    ensure_catalog(pool, spec_id).await?;
-    let Some(row) = catalog_row(pool, spec_id, slug).await? else {
-        return Ok(());
-    };
-    bind_one(pool, map_uid, spec_id, slug).await?;
-    let grant = row.pickup == "grant";
-    if grant {
-        insert_first_collect_log(pool, user_id, map_uid, slug, None, None, None, "grant").await?;
-    }
     sqlx::query!(
         r#"--sql
         INSERT INTO collectible_progress (user_id, collectible_key, map_uid, slug, unlocked_at, collected_at)
-        VALUES ($1, substring(md5($2 || ':c:' || $3) from 1 for 16), $2, $3, now(), CASE WHEN $4 THEN now() ELSE NULL END)
+        VALUES ($1, substring(md5($2 || ':c:' || $3) from 1 for 16), $2, $3, now(), now())
         ON CONFLICT (user_id, collectible_key) DO UPDATE SET
             unlocked_at = COALESCE(collectible_progress.unlocked_at, now()),
-            collected_at = CASE WHEN $4 THEN COALESCE(collectible_progress.collected_at, now()) ELSE collectible_progress.collected_at END
+            collected_at = COALESCE(collectible_progress.collected_at, now())
         "#,
         user_id,
         map_uid,
-        slug,
-        grant
+        slug
+    )
+    .execute(&mut *tx)
+    .await?;
+
+    if previous.as_ref().map_or(true, |row| row.collected_at.is_none()) {
+        sqlx::query!(
+            r#"--sql
+            INSERT INTO collectible_collect_log
+                (user_id, map_uid, slug, collectible_key, collected_at, pos_x, pos_y, pos_z, source)
+            VALUES ($1, $2, $3, substring(md5($8 || ':c:' || $3) from 1 for 16), now(), $4, $5, $6, $7)
+            ON CONFLICT (user_id, collectible_key) DO NOTHING
+            "#,
+            user_id,
+            map_uid,
+            slug,
+            pos_x,
+            pos_y,
+            pos_z,
+            source,
+            map_uid
+        )
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Sticky unlock only. Collection is exclusively report 83 so its audit event
+/// always carries the authoritative position.
+pub async fn report_unlock(pool: &Pool<Postgres>, user_id: &Uuid, map_uid: &str, slug: &str, spec_id: i64) -> Result<(), sqlx::Error> {
+    ensure_catalog(pool, spec_id).await?;
+    let Some(_) = catalog_row(pool, spec_id, slug).await? else {
+        return Ok(());
+    };
+    bind_one(pool, map_uid, spec_id, slug).await?;
+    sqlx::query!(
+        r#"--sql
+        INSERT INTO collectible_progress (user_id, collectible_key, map_uid, slug, unlocked_at, collected_at)
+        VALUES ($1, substring(md5($2 || ':c:' || $3) from 1 for 16), $2, $3, now(), NULL)
+        ON CONFLICT (user_id, collectible_key) DO UPDATE SET
+            unlocked_at = COALESCE(collectible_progress.unlocked_at, now())
+        "#,
+        user_id,
+        map_uid,
+        slug
     )
     .execute(pool)
     .await?;
@@ -350,43 +390,30 @@ pub async fn report_collect(
     let Some(source) = collect_log_source(source) else {
         return Ok(());
     };
+    if !x.is_finite() || !y.is_finite() || !z.is_finite() {
+        return Ok(());
+    }
     ensure_catalog(pool, spec_id).await?;
-    if catalog_row(pool, spec_id, slug).await?.is_none() {
+    let Some(row) = catalog_row(pool, spec_id, slug).await? else {
+        return Ok(());
+    };
+    let source_allowed = match source {
+        "grant" => row.collect_on_unlock,
+        "zone" => row.has_zone,
+        _ => false,
+    };
+    if !source_allowed {
         return Ok(());
     }
     bind_one(pool, map_uid, spec_id, slug).await?;
-    insert_first_collect_log(
-        pool,
-        user_id,
-        map_uid,
-        slug,
-        Some(x as f64),
-        Some(y as f64),
-        Some(z as f64),
-        source,
-    )
-    .await?;
-    sqlx::query!(
-        r#"--sql
-        INSERT INTO collectible_progress (user_id, collectible_key, map_uid, slug, unlocked_at, collected_at)
-        VALUES ($1, substring(md5($2 || ':c:' || $3) from 1 for 16), $2, $3, now(), now())
-        ON CONFLICT (user_id, collectible_key) DO UPDATE SET
-            unlocked_at = COALESCE(collectible_progress.unlocked_at, now()),
-            collected_at = COALESCE(collectible_progress.collected_at, now())
-        "#,
-        user_id,
-        map_uid,
-        slug
-    )
-    .execute(pool)
-    .await?;
+    record_collect_transition(pool, user_id, map_uid, slug, x as f64, y as f64, z as f64, source).await?;
     Ok(())
 }
 
 pub async fn get_collectible_list(pool: &Pool<Postgres>, map_uid: &str) -> Result<Vec<CollectibleListItem>, sqlx::Error> {
     let rows = sqlx::query!(
         r#"--sql
-        SELECT slug, name, pickup, gated_by, unlock_score, collectible_key
+        SELECT slug, name, pickup, collect_on_unlock, has_zone, gated_by, unlock_score, collectible_key
         FROM collectible_on_map
         WHERE map_uid = $1
         ORDER BY slug
@@ -401,6 +428,8 @@ pub async fn get_collectible_list(pool: &Pool<Postgres>, map_uid: &str) -> Resul
             slug: r.slug,
             name: r.name,
             pickup: r.pickup,
+            collect_on_unlock: r.collect_on_unlock,
+            has_zone: r.has_zone,
             gated_by: r.gated_by,
             unlock_score: r.unlock_score,
             key: r.collectible_key.trim().to_string(),
@@ -408,14 +437,11 @@ pub async fn get_collectible_list(pool: &Pool<Postgres>, map_uid: &str) -> Resul
         .collect())
 }
 
-pub async fn get_collectible_mine(
-    pool: &Pool<Postgres>,
-    map_uid: &str,
-    user_id: &Uuid,
-) -> Result<Vec<CollectibleMineItem>, sqlx::Error> {
+pub async fn get_collectible_mine(pool: &Pool<Postgres>, map_uid: &str, user_id: &Uuid) -> Result<Vec<CollectibleMineItem>, sqlx::Error> {
     let rows = sqlx::query!(
         r#"--sql
-        SELECT m.slug, m.name, m.pickup, m.gated_by, m.unlock_score, m.collectible_key,
+        SELECT m.slug, m.name, m.pickup, m.collect_on_unlock, m.has_zone,
+               m.gated_by, m.unlock_score, m.collectible_key,
                p.unlocked_at, p.collected_at
         FROM collectible_on_map m
         LEFT JOIN collectible_progress p
@@ -434,6 +460,8 @@ pub async fn get_collectible_mine(
             slug: r.slug,
             name: r.name,
             pickup: r.pickup,
+            collect_on_unlock: r.collect_on_unlock,
+            has_zone: r.has_zone,
             gated_by: r.gated_by,
             unlock_score: r.unlock_score,
             key: r.collectible_key.trim().to_string(),
@@ -474,9 +502,13 @@ mod tests {
         assert_eq!(c.len(), 2);
         assert_eq!(c[0].slug, "coin-1");
         assert_eq!(c[0].pickup, "zone");
+        assert!(!c[0].collect_on_unlock);
+        assert!(c[0].has_zone);
         assert_eq!(c[0].gated_by.as_deref(), Some("TimeTrial-1"));
         assert_eq!(c[0].unlock_score, Some(12000));
         assert_eq!(c[1].pickup, "grant");
+        assert!(c[1].collect_on_unlock);
+        assert!(!c[1].has_zone);
         assert!(c[1].gated_by.is_none());
         assert!(c[1].unlock_score.is_none());
     }
@@ -499,6 +531,35 @@ mod tests {
         let spec = json!({"collectibles":[{"name":"x","slug":"x-1"}]});
         let c = parse_catalog_collectibles(&spec);
         assert_eq!(c[0].pickup, "zone");
+        assert!(c[0].has_zone);
+        assert!(!c[0].collect_on_unlock);
+    }
+
+    #[test]
+    fn canonical_editor_json_models_zone_and_collect_on_unlock_independently() {
+        let spec = json!({"collectibles":[
+            {
+                "name":"Both",
+                "slug":"both-1",
+                "collectOnUnlock":true,
+                "zone":{"pos":{"x":1,"y":2,"z":3},"size":{"x":4,"y":5,"z":6}}
+            },
+            {"name":"Zone","slug":"zone-1","collectOnUnlock":false,"zone":{}},
+            {"name":"Grant","slug":"grant-1","collectOnUnlock":true}
+        ]});
+        let c = parse_catalog_collectibles(&spec);
+        assert_eq!(c.len(), 3);
+        assert!(c[0].collect_on_unlock && c[0].has_zone);
+        assert!(!c[1].collect_on_unlock && c[1].has_zone);
+        assert!(c[2].collect_on_unlock && !c[2].has_zone);
+    }
+
+    #[test]
+    fn canonical_collectible_without_any_collect_path_is_rejected() {
+        let spec = json!({"collectibles":[
+            {"name":"None","slug":"none-1","collectOnUnlock":false}
+        ]});
+        assert!(parse_catalog_collectibles(&spec).is_empty());
     }
 
     #[test]
@@ -545,8 +606,8 @@ mod db_tests {
     async fn seed_spec(pool: &Pool<Postgres>, user_id: &Uuid) -> (i64, String) {
         let name_id = Uuid::new_v4().simple().to_string();
         let spec = json!({"collectibles":[
-            {"name":"Coin","slug":"coin-1","pickup":"zone"},
-            {"name":"Gift","slug":"gift-1","pickup":"grant"}
+            {"name":"Coin","slug":"coin-1","collectOnUnlock":false,"zone":{}},
+            {"name":"Gift","slug":"gift-1","collectOnUnlock":true}
         ]});
         let spec_id = crate::queries::custom_map_aux_specs::upsert_spec(pool, user_id, &name_id, &spec)
             .await
@@ -569,15 +630,12 @@ mod db_tests {
     }
 
     async fn log_count(pool: &Pool<Postgres>, user_id: &Uuid) -> i64 {
-        sqlx::query!(
-            "SELECT COUNT(*) AS n FROM collectible_collect_log WHERE user_id = $1",
-            user_id
-        )
-        .fetch_one(pool)
-        .await
-        .expect("count log")
-        .n
-        .unwrap_or(0)
+        sqlx::query!("SELECT COUNT(*) AS n FROM collectible_collect_log WHERE user_id = $1", user_id)
+            .fetch_one(pool)
+            .await
+            .expect("count log")
+            .n
+            .unwrap_or(0)
     }
 
     #[tokio::test]
@@ -621,7 +679,7 @@ mod db_tests {
     }
 
     #[tokio::test]
-    async fn grant_via_unlock_logs_once_with_null_pos() {
+    async fn grant_via_report_83_atomically_unlocks_collects_and_logs_position() {
         let pool = test_pool().await;
         let user_id = seed_user(&pool, "clog-grant").await;
         let (spec_id, _) = seed_spec(&pool, &user_id).await;
@@ -629,13 +687,21 @@ mod db_tests {
 
         report_unlock(&pool, &user_id, &map_uid, "gift-1", spec_id)
             .await
-            .expect("grant unlock");
-        report_unlock(&pool, &user_id, &map_uid, "gift-1", spec_id)
+            .expect("82 is unlock-only");
+        assert_eq!(log_count(&pool, &user_id).await, 0);
+        let before = sqlx::query!(
+            "SELECT unlocked_at, collected_at FROM collectible_progress WHERE user_id = $1 AND slug = 'gift-1'",
+            user_id
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("unlock progress");
+        assert!(before.unlocked_at.is_some());
+        assert!(before.collected_at.is_none());
+
+        report_collect(&pool, &user_id, &map_uid, "gift-1", spec_id, 1.0, 2.0, 3.0, "grant")
             .await
-            .expect("repeat grant");
-        report_collect(&pool, &user_id, &map_uid, "gift-1", spec_id, 1.0, 2.0, 3.0, "zone")
-            .await
-            .expect("later 83 must not log again");
+            .expect("grant report 83");
 
         assert_eq!(log_count(&pool, &user_id).await, 1);
         let row = sqlx::query!(
@@ -646,7 +712,17 @@ mod db_tests {
         .await
         .expect("log row");
         assert_eq!(row.source, "grant");
-        assert!(row.pos_x.is_none() && row.pos_y.is_none() && row.pos_z.is_none());
+        assert_eq!(row.pos_x, Some(1.0));
+        assert_eq!(row.pos_y, Some(2.0));
+        assert_eq!(row.pos_z, Some(3.0));
+        let after = sqlx::query!(
+            "SELECT unlocked_at, collected_at FROM collectible_progress WHERE user_id = $1 AND slug = 'gift-1'",
+            user_id
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("collected progress");
+        assert!(after.unlocked_at.is_some() && after.collected_at.is_some());
 
         cleanup(&pool, &user_id).await;
     }
@@ -666,15 +742,12 @@ mod db_tests {
             .expect("unknown unlock");
 
         assert_eq!(log_count(&pool, &user_id).await, 0);
-        let n = sqlx::query!(
-            "SELECT COUNT(*) AS n FROM collectible_progress WHERE user_id = $1",
-            user_id
-        )
-        .fetch_one(&pool)
-        .await
-        .expect("count progress")
-        .n
-        .unwrap_or(0);
+        let n = sqlx::query!("SELECT COUNT(*) AS n FROM collectible_progress WHERE user_id = $1", user_id)
+            .fetch_one(&pool)
+            .await
+            .expect("count progress")
+            .n
+            .unwrap_or(0);
         assert_eq!(n, 0);
 
         cleanup(&pool, &user_id).await;
@@ -718,17 +791,60 @@ mod db_tests {
             .expect("wrong-case source");
 
         assert_eq!(log_count(&pool, &user_id).await, 0);
-        let n = sqlx::query!(
-            "SELECT COUNT(*) AS n FROM collectible_progress WHERE user_id = $1",
-            user_id
-        )
-        .fetch_one(&pool)
-        .await
-        .expect("count progress")
-        .n
-        .unwrap_or(0);
+        let n = sqlx::query!("SELECT COUNT(*) AS n FROM collectible_progress WHERE user_id = $1", user_id)
+            .fetch_one(&pool)
+            .await
+            .expect("count progress")
+            .n
+            .unwrap_or(0);
         assert_eq!(n, 0);
 
+        cleanup(&pool, &user_id).await;
+    }
+
+    #[tokio::test]
+    async fn source_must_match_the_catalog_collect_path() {
+        let pool = test_pool().await;
+        let user_id = seed_user(&pool, "clog-wrong-path").await;
+        let (spec_id, _) = seed_spec(&pool, &user_id).await;
+        let map_uid = test_map_uid();
+
+        report_collect(&pool, &user_id, &map_uid, "coin-1", spec_id, 1.0, 2.0, 3.0, "grant")
+            .await
+            .expect("invalid grant is dropped");
+        report_collect(&pool, &user_id, &map_uid, "gift-1", spec_id, 1.0, 2.0, 3.0, "zone")
+            .await
+            .expect("invalid zone is dropped");
+
+        assert_eq!(log_count(&pool, &user_id).await, 0);
+        let count = sqlx::query!("SELECT COUNT(*) AS n FROM collectible_progress WHERE user_id = $1", user_id)
+            .fetch_one(&pool)
+            .await
+            .expect("progress count")
+            .n
+            .unwrap_or(0);
+        assert_eq!(count, 0);
+        cleanup(&pool, &user_id).await;
+    }
+
+    #[tokio::test]
+    async fn audit_insert_failure_rolls_back_progress_transition() {
+        let pool = test_pool().await;
+        let user_id = seed_user(&pool, "clog-rollback").await;
+        let map_uid = test_map_uid();
+
+        let error = record_collect_transition(&pool, &user_id, &map_uid, "rollback-1", 1.0, 2.0, 3.0, "invalid")
+            .await
+            .expect_err("audit source constraint must reject the transaction");
+        assert!(error.to_string().contains("collectible_collect_log_source_check"));
+        let progress = sqlx::query!("SELECT COUNT(*) AS n FROM collectible_progress WHERE user_id = $1", user_id)
+            .fetch_one(&pool)
+            .await
+            .expect("progress count")
+            .n
+            .unwrap_or(0);
+        assert_eq!(progress, 0, "progress must roll back with the audit insert");
+        assert_eq!(log_count(&pool, &user_id).await, 0);
         cleanup(&pool, &user_id).await;
     }
 

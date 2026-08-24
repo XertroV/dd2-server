@@ -28,24 +28,24 @@ pub fn map_kind_from_game(game: &Value) -> Option<(&'static str, bool)> {
 
 fn map_kind_str(k: &str) -> Option<(&'static str, bool)> {
     match k {
-        "TimeTrial" => Some(("TimeTrial", true)),
-        "PuzzleLocations" => Some(("TimeTrial", true)),
-        "JumpHigh" => Some(("HighJump", false)),
-        "JumpAccuracy" => Some(("Darts", false)),
+        "Sprint" | "TimeTrial" | "PuzzleLocations" => Some(("Sprint", true)),
+        "Survival" | "TimeOffGround" | "KingOfTheHill" => Some(("Survival", false)),
+        "Darts" | "JumpAccuracy" => Some(("Darts", false)),
+        "HighJump" | "JumpHigh" => Some(("HighJump", false)),
+        "LongJump" => Some(("LongJump", false)),
         "MaxAvgSpeed" => Some(("MaxAvgSpeed", false)),
-        "TimeOffGround" => Some(("KingOfTheHill", false)),
         _ => None,
     }
 }
 
 fn map_kind_int(t: i64) -> Option<(&'static str, bool)> {
     match t {
-        1 => Some(("TimeTrial", true)),
+        1 => Some(("Sprint", true)),
         2 => Some(("HighJump", false)),
         3 => Some(("Darts", false)),
         4 => Some(("MaxAvgSpeed", false)),
-        5 => Some(("KingOfTheHill", false)),
-        6 => Some(("TimeTrial", true)),
+        5 => Some(("Survival", false)),
+        6 => Some(("Sprint", true)),
         _ => None,
     }
 }
@@ -53,11 +53,7 @@ fn map_kind_int(t: i64) -> Option<(&'static str, bool)> {
 /// Replace catalog for `(user_id, name_id)` from `spec.minigames.games[]`.
 /// Missing/empty games → delete prior rows.
 pub fn parse_catalog_games(spec: &Value) -> Vec<CatalogGame> {
-    let Some(games) = spec
-        .get("minigames")
-        .and_then(|m| m.get("games"))
-        .and_then(|g| g.as_array())
-    else {
+    let Some(games) = spec.get("minigames").and_then(|m| m.get("games")).and_then(|g| g.as_array()) else {
         return vec![];
     };
     let mut last_by_slug = std::collections::HashMap::new();
@@ -71,7 +67,7 @@ pub fn parse_catalog_games(spec: &Value) -> Vec<CatalogGame> {
         };
         let slug_raw = g.get("slug").and_then(|s| s.as_str()).unwrap_or("");
         let slug = if slug_raw.is_empty() {
-            "TimeTrial-1".to_string()
+            "Sprint-1".to_string()
         } else {
             slug_raw.to_string()
         };
@@ -89,21 +85,12 @@ pub fn parse_catalog_games(spec: &Value) -> Vec<CatalogGame> {
             },
         );
     }
-    order
-        .into_iter()
-        .filter_map(|s| last_by_slug.remove(&s))
-        .collect()
+    order.into_iter().filter_map(|s| last_by_slug.remove(&s)).collect()
 }
 
 /// Replace catalog for a spec row from `spec.minigames.games[]`.
 /// Missing/empty games → delete prior rows for this spec_id.
-pub async fn replace_catalog(
-    pool: &Pool<Postgres>,
-    spec_id: i64,
-    user_id: &Uuid,
-    name_id: &str,
-    spec: &Value,
-) -> Result<(), sqlx::Error> {
+pub async fn replace_catalog(pool: &Pool<Postgres>, spec_id: i64, user_id: &Uuid, name_id: &str, spec: &Value) -> Result<(), sqlx::Error> {
     let games = parse_catalog_games(spec);
     let mut tx = pool.begin().await?;
     sqlx::query!(
@@ -178,6 +165,10 @@ async fn ensure_catalog(pool: &Pool<Postgres>, spec_id: i64) -> Result<(), sqlx:
 /// Returns whether any rows were bound (unknown spec → false).
 pub async fn bind_map_from_catalog(pool: &Pool<Postgres>, map_uid: &str, spec_id: i64) -> Result<bool, sqlx::Error> {
     ensure_catalog(pool, spec_id).await?;
+    let mut tx = pool.begin().await?;
+    sqlx::query!("DELETE FROM minigame_on_map WHERE map_uid = $1", map_uid)
+        .execute(&mut *tx)
+        .await?;
     let r = sqlx::query!(
         r#"--sql
         INSERT INTO minigame_on_map (map_uid, slug, minigame_key, kind, name, spec_user, name_id)
@@ -195,8 +186,9 @@ pub async fn bind_map_from_catalog(pool: &Pool<Postgres>, map_uid: &str, spec_id
         spec_id,
         map_uid
     )
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(r.rows_affected() > 0)
 }
 
@@ -373,13 +365,13 @@ pub async fn get_minigame_leaderboard(
             SELECT minigame_key, kind FROM minigame_on_map WHERE map_uid = $1 AND slug = $2
         )
         SELECT pb.user_id, u.display_name, pb.score, pb.updated_at,
-               rank() OVER (ORDER BY CASE WHEN mom.kind = 'TimeTrial' THEN pb.score ELSE -pb.score END ASC) AS rank
+               rank() OVER (ORDER BY CASE WHEN mom.kind = 'Sprint' THEN pb.score ELSE -pb.score END ASC) AS rank
         FROM minigame_pb pb
         JOIN mom ON pb.minigame_key = mom.minigame_key
         LEFT JOIN users u ON u.web_services_user_id = pb.user_id
         LEFT JOIN shadow_bans sb ON pb.user_id = sb.user_id
         WHERE sb.user_id IS NULL AND pb.finish_count > 0
-        ORDER BY CASE WHEN mom.kind = 'TimeTrial' THEN pb.score ELSE -pb.score END ASC
+        ORDER BY CASE WHEN mom.kind = 'Sprint' THEN pb.score ELSE -pb.score END ASC
         LIMIT $3
         OFFSET $4
         "#,
@@ -434,7 +426,7 @@ pub async fn get_minigame_my_rank(
         ),
         lb AS (
             SELECT pb.user_id, u.display_name, pb.score, pb.updated_at,
-                   rank() OVER (ORDER BY CASE WHEN mom.kind = 'TimeTrial' THEN pb.score ELSE -pb.score END ASC) AS rank
+                   rank() OVER (ORDER BY CASE WHEN mom.kind = 'Sprint' THEN pb.score ELSE -pb.score END ASC) AS rank
             FROM minigame_pb pb
             JOIN mom ON pb.minigame_key = mom.minigame_key
             LEFT JOIN users u ON u.web_services_user_id = pb.user_id
@@ -491,12 +483,12 @@ mod tests {
         ]}});
         let g = parse_catalog_games(&spec);
         assert_eq!(g.len(), 3);
-        assert_eq!(g[0].slug, "TimeTrial-1");
-        assert_eq!(g[0].kind, "TimeTrial");
+        assert_eq!(g[0].slug, "Sprint-1");
+        assert_eq!(g[0].kind, "Sprint");
         assert!(g[0].lower_is_better);
         assert_eq!(g[1].kind, "HighJump");
         assert!(!g[1].lower_is_better);
-        assert_eq!(g[2].kind, "TimeTrial");
+        assert_eq!(g[2].kind, "Sprint");
         assert!(g[2].lower_is_better);
     }
 
@@ -515,5 +507,152 @@ mod tests {
         let g = parse_catalog_games(&spec);
         assert_eq!(g[0].kind, "MaxAvgSpeed");
         assert!(!g[0].lower_is_better);
+    }
+
+    #[test]
+    fn canonical_editor_kinds_and_legacy_aliases_are_normalized() {
+        let canonical = [
+            ("Sprint", "Sprint", true),
+            ("Survival", "Survival", false),
+            ("Darts", "Darts", false),
+            ("HighJump", "HighJump", false),
+            ("LongJump", "LongJump", false),
+            ("MaxAvgSpeed", "MaxAvgSpeed", false),
+        ];
+        for (input, expected, lower_is_better) in canonical {
+            assert_eq!(map_kind_str(input), Some((expected, lower_is_better)), "{input}");
+        }
+
+        let aliases = [
+            ("TimeTrial", "Sprint", true),
+            ("PuzzleLocations", "Sprint", true),
+            ("JumpHigh", "HighJump", false),
+            ("JumpAccuracy", "Darts", false),
+            ("TimeOffGround", "Survival", false),
+            ("KingOfTheHill", "Survival", false),
+        ];
+        for (input, expected, lower_is_better) in aliases {
+            assert_eq!(map_kind_str(input), Some((expected, lower_is_better)), "{input}");
+        }
+
+        let legacy_ints = [
+            (1, "Sprint", true),
+            (2, "HighJump", false),
+            (3, "Darts", false),
+            (4, "MaxAvgSpeed", false),
+            (5, "Survival", false),
+            (6, "Sprint", true),
+        ];
+        for (input, expected, lower_is_better) in legacy_ints {
+            assert_eq!(map_kind_int(input), Some((expected, lower_is_better)), "{input}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod db_tests {
+    use super::*;
+    use serde_json::json;
+    use sqlx::postgres::PgPoolOptions;
+
+    async fn test_pool() -> Pool<Postgres> {
+        dotenv::dotenv().ok();
+        let url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set for minigame DB tests");
+        PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&url)
+            .await
+            .expect("connect to DATABASE_URL")
+    }
+
+    async fn seed_user(pool: &Pool<Postgres>, name: &str) -> Uuid {
+        let user_id = Uuid::now_v7();
+        sqlx::query!(
+            "INSERT INTO users (web_services_user_id, display_name) VALUES ($1, $2)",
+            user_id,
+            name
+        )
+        .execute(pool)
+        .await
+        .expect("insert user");
+        user_id
+    }
+
+    #[tokio::test]
+    async fn all_canonical_kinds_bind_report_and_sort_in_the_right_direction() {
+        let pool = test_pool().await;
+        let author = seed_user(&pool, "minigame-kind-author").await;
+        let low = seed_user(&pool, "minigame-kind-low").await;
+        let high = seed_user(&pool, "minigame-kind-high").await;
+        let suffix = Uuid::new_v4().simple().to_string();
+        let map_uid = format!("Kinds{}", &suffix[..22]);
+        let name_id = format!("kinds-{}", &suffix[..8]);
+        let kinds = ["Sprint", "Survival", "Darts", "HighJump", "LongJump", "MaxAvgSpeed"];
+        let games: Vec<_> = kinds
+            .iter()
+            .map(|kind| json!({"name": kind, "slug": format!("{kind}-1"), "kind": kind}))
+            .collect();
+        let spec = json!({"minigames":{"games": games}});
+        let spec_id = crate::queries::custom_map_aux_specs::upsert_spec(&pool, &author, &name_id, &spec)
+            .await
+            .expect("upsert spec");
+        replace_catalog(&pool, spec_id, &author, &name_id, &spec)
+            .await
+            .expect("replace catalog");
+        assert!(bind_map_from_catalog(&pool, &map_uid, spec_id).await.expect("bind"));
+
+        let list = get_minigame_list(&pool, &map_uid).await.expect("list");
+        let mut listed_kinds: Vec<_> = list.iter().map(|game| game.kind.as_str()).collect();
+        listed_kinds.sort_unstable();
+        let mut expected_kinds = kinds.to_vec();
+        expected_kinds.sort_unstable();
+        assert_eq!(listed_kinds, expected_kinds);
+
+        for kind in kinds {
+            let slug = format!("{kind}-1");
+            report_attempt(&pool, &low, &map_uid, &slug, spec_id, 100, "finish")
+                .await
+                .expect("low finish");
+            report_attempt(&pool, &high, &map_uid, &slug, spec_id, 200, "finish")
+                .await
+                .expect("high finish");
+
+            let board = get_minigame_leaderboard(&pool, &map_uid, &slug, 0, 100).await.expect("leaderboard");
+            assert_eq!(board.len(), 2, "{kind}");
+            let expected_winner = if kind == "Sprint" { low } else { high };
+            assert_eq!(board[0].wsid, expected_winner.to_string(), "{kind} sort direction");
+            assert_eq!(board[0].rank, 1, "{kind}");
+
+            let winner_rank = get_minigame_my_rank(&pool, &map_uid, &slug, &expected_winner)
+                .await
+                .expect("my rank")
+                .expect("winner row");
+            assert_eq!(winner_rank.rank, 1, "{kind} my-rank direction");
+
+            let (winner, worse, better) = if kind == "Sprint" { (low, 300, 50) } else { (high, 50, 300) };
+            report_attempt(&pool, &winner, &map_uid, &slug, spec_id, worse, "finish")
+                .await
+                .expect("worse finish");
+            let after_worse = get_minigame_my_rank(&pool, &map_uid, &slug, &winner)
+                .await
+                .expect("rank after worse")
+                .expect("winner after worse");
+            assert_eq!(after_worse.score, if kind == "Sprint" { 100 } else { 200 }, "{kind} keeps PB");
+            report_attempt(&pool, &winner, &map_uid, &slug, spec_id, better, "finish")
+                .await
+                .expect("better finish");
+            let after_better = get_minigame_my_rank(&pool, &map_uid, &slug, &winner)
+                .await
+                .expect("rank after better")
+                .expect("winner after better");
+            assert_eq!(after_better.score, better, "{kind} updates PB");
+        }
+
+        for user_id in [low, high, author] {
+            sqlx::query!("DELETE FROM users WHERE web_services_user_id = $1", user_id)
+                .execute(&pool)
+                .await
+                .expect("cleanup user");
+        }
     }
 }

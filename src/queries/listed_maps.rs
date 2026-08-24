@@ -1,9 +1,11 @@
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use sqlx::{query, Pool, Postgres};
+use thiserror::Error;
 use uuid::Uuid;
 
 use crate::consts::DD2_MAP_UID;
+use crate::nadeo::MapAuthorVerifier;
 
 pub const LISTED_MAPS_PAGE_SIZE: u32 = 100;
 
@@ -19,12 +21,160 @@ pub fn listed_maps_page_count(len: i64) -> i64 {
     (len as f64 / LISTED_MAPS_PAGE_SIZE as f64).ceil() as i64
 }
 
+#[derive(Debug, Error)]
+pub enum BindSpecError {
+    #[error("map is already bound to a different spec")]
+    ConflictingBinding,
+    #[error("spec does not exist")]
+    SpecNotFound,
+    #[error("authenticated reporter does not own the spec")]
+    SpecNotOwned,
+    #[error("Nadeo map author does not own the spec")]
+    AuthorMismatch,
+    #[error("Nadeo map author verification failed: {0}")]
+    AuthorVerification(String),
+    #[error(transparent)]
+    Database(#[from] sqlx::Error),
+}
+
+struct SpecBinding {
+    spec_id: i64,
+    verified: bool,
+}
+
+async fn get_spec_binding(pool: &Pool<Postgres>, map_uid: &str) -> Result<Option<SpecBinding>, sqlx::Error> {
+    let row = query!(
+        r#"
+        SELECT spec_id, author_verified_at IS NOT NULL AS "verified!"
+        FROM map_listing_bind
+        WHERE map_uid = $1
+        "#,
+        map_uid
+    )
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|row| SpecBinding {
+        spec_id: row.spec_id,
+        verified: row.verified,
+    }))
+}
+
+/// Establish or reuse the immutable authoritative map -> spec binding.
+///
+/// A first bind (including promotion of a legacy unverified bind) is accepted
+/// only when the authenticated reporter owns the spec and Nadeo says that same
+/// account authored the map. A unique map row resolves concurrent first binds;
+/// after the race, every contender reads and checks the actual winner.
+pub async fn bind_authoritative_spec(
+    pool: &Pool<Postgres>,
+    verifier: &dyn MapAuthorVerifier,
+    reporter_id: &Uuid,
+    map_uid: &str,
+    requested_spec_id: i64,
+) -> Result<i64, BindSpecError> {
+    if let Some(binding) = get_spec_binding(pool, map_uid).await? {
+        if binding.spec_id != requested_spec_id {
+            return Err(BindSpecError::ConflictingBinding);
+        }
+        if binding.verified {
+            return Ok(binding.spec_id);
+        }
+    }
+
+    let spec = query!("SELECT user_id FROM custom_map_aux_specs WHERE id = $1", requested_spec_id)
+        .fetch_optional(pool)
+        .await?
+        .ok_or(BindSpecError::SpecNotFound)?;
+    if spec.user_id != *reporter_id {
+        return Err(BindSpecError::SpecNotOwned);
+    }
+
+    let nadeo_author = verifier
+        .author_id_for_uid(map_uid)
+        .await
+        .map_err(BindSpecError::AuthorVerification)?;
+    if nadeo_author != spec.user_id {
+        return Err(BindSpecError::AuthorMismatch);
+    }
+
+    let mut tx = pool.begin().await?;
+    query!(
+        r#"
+        INSERT INTO map_listing_bind (map_uid, spec_id, verified_author_id, author_verified_at)
+        SELECT $1, id, user_id, NOW()
+        FROM custom_map_aux_specs
+        WHERE id = $2 AND user_id = $3
+        ON CONFLICT (map_uid) DO NOTHING
+        "#,
+        map_uid,
+        requested_spec_id,
+        reporter_id
+    )
+    .execute(&mut *tx)
+    .await?;
+    query!(
+        r#"
+        UPDATE map_listing_bind
+        SET verified_author_id = $3, author_verified_at = NOW()
+        WHERE map_uid = $1 AND spec_id = $2 AND author_verified_at IS NULL
+        "#,
+        map_uid,
+        requested_spec_id,
+        reporter_id
+    )
+    .execute(&mut *tx)
+    .await?;
+    let winner = query!(
+        r#"
+        SELECT spec_id, author_verified_at IS NOT NULL AS "verified!"
+        FROM map_listing_bind
+        WHERE map_uid = $1
+        "#,
+        map_uid
+    )
+    .fetch_optional(&mut *tx)
+    .await?;
+    tx.commit().await?;
+
+    let Some(winner) = winner else {
+        return Err(BindSpecError::SpecNotFound);
+    };
+    if winner.spec_id != requested_spec_id {
+        return Err(BindSpecError::ConflictingBinding);
+    }
+    if !winner.verified {
+        return Err(BindSpecError::AuthorVerification("binding was not durably verified".to_string()));
+    }
+    Ok(winner.spec_id)
+}
+
+/// Resolve an already verified binding, treating the client spec id only as a
+/// consistency hint. Unbound, legacy-unverified, and mismatched reports fail
+/// closed without consulting client-selected catalog rows.
+pub async fn resolve_bound_spec(pool: &Pool<Postgres>, map_uid: &str, client_spec_id: i64) -> Result<Option<i64>, sqlx::Error> {
+    let row = query!(
+        r#"
+        SELECT spec_id
+        FROM map_listing_bind
+        WHERE map_uid = $1
+          AND spec_id = $2
+          AND author_verified_at IS NOT NULL
+        "#,
+        map_uid,
+        client_spec_id
+    )
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|row| row.spec_id))
+}
+
 /// First spec-on-map bind wins. Later specs do not replace it.
+#[cfg(test)]
 pub async fn bind_first_spec(pool: &Pool<Postgres>, map_uid: &str, spec_id: i64) -> Result<(), sqlx::Error> {
     query!(
         r#"
-        INSERT INTO map_listing_bind (map_uid, spec_id)
-        SELECT $1, id FROM custom_map_aux_specs WHERE id = $2
+        INSERT INTO map_listing_bind (map_uid, spec_id, verified_author_id, author_verified_at)
+        SELECT $1, id, user_id, NOW() FROM custom_map_aux_specs WHERE id = $2
         ON CONFLICT (map_uid) DO NOTHING
         "#,
         map_uid,
@@ -39,7 +189,7 @@ pub async fn get_bound_spec_id(pool: &Pool<Postgres>, map_uid: &str) -> Result<O
     let row = query!(r#"SELECT spec_id FROM map_listing_bind WHERE map_uid = $1"#, map_uid)
         .fetch_optional(pool)
         .await?;
-    Ok(row.and_then(|r| r.spec_id))
+    Ok(row.map(|r| r.spec_id))
 }
 
 pub async fn get_listed_map(pool: &Pool<Postgres>, map_uid: &str) -> Result<Option<DateTime<Utc>>, sqlx::Error> {
@@ -99,7 +249,30 @@ mod tests {
     use crate::queries::moderation::{apply_map_ban, upsert_map_meta};
     use serde_json::json;
     use sqlx::postgres::PgPoolOptions;
-    use std::sync::{Mutex, OnceLock};
+    use std::{
+        sync::{Arc, Mutex, OnceLock},
+        time::Duration,
+    };
+    use tokio::sync::{Barrier, Notify};
+
+    struct FakeAuthorVerifier {
+        author: Uuid,
+        barrier: Option<Arc<Barrier>>,
+    }
+
+    impl MapAuthorVerifier for FakeAuthorVerifier {
+        fn author_id_for_uid<'a>(
+            &'a self,
+            _map_uid: &'a str,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Uuid, String>> + Send + 'a>> {
+            Box::pin(async move {
+                if let Some(barrier) = &self.barrier {
+                    barrier.wait().await;
+                }
+                Ok(self.author)
+            })
+        }
+    }
 
     fn test_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -141,6 +314,13 @@ mod tests {
     }
 
     async fn cleanup_map(pool: &Pool<Postgres>, map_uid: &str) {
+        let _ = query!("DELETE FROM minigame_on_map WHERE map_uid = $1", map_uid)
+            .execute(pool)
+            .await;
+        let _ = query!("DELETE FROM collectible_on_map WHERE map_uid = $1", map_uid)
+            .execute(pool)
+            .await;
+        let _ = query!("DELETE FROM hat_on_map WHERE map_uid = $1", map_uid).execute(pool).await;
         let _ = query!("DELETE FROM listed_maps WHERE map_uid = $1", map_uid).execute(pool).await;
         let _ = query!("DELETE FROM map_listing_bind WHERE map_uid = $1", map_uid)
             .execute(pool)
@@ -260,6 +440,223 @@ mod tests {
         cleanup_map(&pool, &map_uid).await;
         cleanup_map(&pool, &other_uid).await;
         cleanup_user(&pool, &user).await;
+    }
+
+    #[tokio::test]
+    async fn authoritative_bind_rejects_two_user_spoofing() {
+        let _guard = test_lock();
+        let pool = test_pool().await;
+        let owner = seed_user(&pool, "bind-real-author").await;
+        let attacker = seed_user(&pool, "bind-attacker").await;
+        let map_uid = unique_map_uid("Spoof_");
+        let owner_spec = upsert_spec(&pool, &owner, "owner", &json!({"listingThreshold": 10}))
+            .await
+            .expect("owner spec");
+        let attacker_spec = upsert_spec(&pool, &attacker, "attacker", &json!({"listingThreshold": 10}))
+            .await
+            .expect("attacker spec");
+        let verifier = FakeAuthorVerifier {
+            author: owner,
+            barrier: None,
+        };
+
+        assert!(matches!(
+            bind_authoritative_spec(&pool, &verifier, &attacker, &map_uid, owner_spec).await,
+            Err(BindSpecError::SpecNotOwned)
+        ));
+        assert!(matches!(
+            bind_authoritative_spec(&pool, &verifier, &attacker, &map_uid, attacker_spec).await,
+            Err(BindSpecError::AuthorMismatch)
+        ));
+        assert_eq!(get_bound_spec_id(&pool, &map_uid).await.unwrap(), None);
+
+        cleanup_map(&pool, &map_uid).await;
+        cleanup_user(&pool, &attacker).await;
+        cleanup_user(&pool, &owner).await;
+    }
+
+    #[tokio::test]
+    async fn authoritative_binding_rejects_conflicting_rebind() {
+        let _guard = test_lock();
+        let pool = test_pool().await;
+        let owner = seed_user(&pool, "bind-conflict-owner").await;
+        let map_uid = unique_map_uid("Conflict");
+        let first = upsert_spec(&pool, &owner, "first", &json!({"listingThreshold": 10}))
+            .await
+            .expect("first spec");
+        let second = upsert_spec(&pool, &owner, "second", &json!({"listingThreshold": 20}))
+            .await
+            .expect("second spec");
+        let verifier = FakeAuthorVerifier {
+            author: owner,
+            barrier: None,
+        };
+
+        assert_eq!(
+            bind_authoritative_spec(&pool, &verifier, &owner, &map_uid, first)
+                .await
+                .expect("first bind"),
+            first
+        );
+        assert!(matches!(
+            bind_authoritative_spec(&pool, &verifier, &owner, &map_uid, second).await,
+            Err(BindSpecError::ConflictingBinding)
+        ));
+        assert_eq!(resolve_bound_spec(&pool, &map_uid, first).await.unwrap(), Some(first));
+        assert_eq!(resolve_bound_spec(&pool, &map_uid, second).await.unwrap(), None);
+
+        cleanup_map(&pool, &map_uid).await;
+        cleanup_user(&pool, &owner).await;
+    }
+
+    #[tokio::test]
+    async fn authoritative_binding_prevents_spec_deletion_and_rebinding() {
+        let _guard = test_lock();
+        let pool = test_pool().await;
+        let owner = seed_user(&pool, "bind-delete-owner").await;
+        let map_uid = unique_map_uid("BindDel_");
+        let spec_id = upsert_spec(&pool, &owner, "bound", &json!({"listingThreshold": 10}))
+            .await
+            .expect("spec");
+        let verifier = FakeAuthorVerifier {
+            author: owner,
+            barrier: None,
+        };
+        bind_authoritative_spec(&pool, &verifier, &owner, &map_uid, spec_id)
+            .await
+            .expect("bind");
+
+        let deletion = query!("DELETE FROM custom_map_aux_specs WHERE id = $1", spec_id)
+            .execute(&pool)
+            .await;
+        assert!(deletion.is_err(), "the authoritative spec FK must restrict deletion");
+        assert_eq!(resolve_bound_spec(&pool, &map_uid, spec_id).await.unwrap(), Some(spec_id));
+
+        cleanup_map(&pool, &map_uid).await;
+        cleanup_user(&pool, &owner).await;
+    }
+
+    #[tokio::test]
+    async fn concurrent_authoritative_first_bind_has_exactly_one_winner() {
+        let _guard = test_lock();
+        let pool = test_pool().await;
+        let owner = seed_user(&pool, "bind-race-owner").await;
+        let map_uid = unique_map_uid("BindRace");
+        let first = upsert_spec(&pool, &owner, "race-first", &json!({"listingThreshold": 10}))
+            .await
+            .expect("first spec");
+        let second = upsert_spec(&pool, &owner, "race-second", &json!({"listingThreshold": 20}))
+            .await
+            .expect("second spec");
+        let verifier = Arc::new(FakeAuthorVerifier {
+            author: owner,
+            barrier: Some(Arc::new(Barrier::new(2))),
+        });
+
+        let task = |spec_id| {
+            let pool = pool.clone();
+            let map_uid = map_uid.clone();
+            let verifier = verifier.clone();
+            tokio::spawn(async move { bind_authoritative_spec(&pool, verifier.as_ref(), &owner, &map_uid, spec_id).await })
+        };
+        let first_result = task(first);
+        let second_result = task(second);
+        let results = [first_result.await.unwrap(), second_result.await.unwrap()];
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(result, Err(BindSpecError::ConflictingBinding)))
+                .count(),
+            1
+        );
+        let winner = get_bound_spec_id(&pool, &map_uid).await.unwrap().expect("winner");
+        assert!(winner == first || winner == second);
+
+        cleanup_map(&pool, &map_uid).await;
+        cleanup_user(&pool, &owner).await;
+    }
+
+    #[tokio::test]
+    async fn unbound_legacy_and_mismatched_reports_fail_closed() {
+        let _guard = test_lock();
+        let pool = test_pool().await;
+        let owner = seed_user(&pool, "bind-legacy-owner").await;
+        let map_uid = unique_map_uid("Legacy_");
+        let spec_id = upsert_spec(&pool, &owner, "legacy", &json!({"listingThreshold": 10}))
+            .await
+            .expect("spec");
+        assert_eq!(resolve_bound_spec(&pool, &map_uid, spec_id).await.unwrap(), None);
+        query!("INSERT INTO map_listing_bind (map_uid, spec_id) VALUES ($1, $2)", map_uid, spec_id)
+            .execute(&pool)
+            .await
+            .expect("legacy bind");
+        assert_eq!(resolve_bound_spec(&pool, &map_uid, spec_id).await.unwrap(), None);
+
+        let verifier = FakeAuthorVerifier {
+            author: owner,
+            barrier: None,
+        };
+        bind_authoritative_spec(&pool, &verifier, &owner, &map_uid, spec_id)
+            .await
+            .expect("promote legacy bind");
+        assert_eq!(resolve_bound_spec(&pool, &map_uid, spec_id).await.unwrap(), Some(spec_id));
+        assert_eq!(resolve_bound_spec(&pool, &map_uid, spec_id + 1).await.unwrap(), None);
+
+        cleanup_map(&pool, &map_uid).await;
+        cleanup_user(&pool, &owner).await;
+    }
+
+    #[tokio::test]
+    async fn authoritative_catalog_replaces_stale_on_map_rows() {
+        let _guard = test_lock();
+        let pool = test_pool().await;
+        let owner = seed_user(&pool, "bind-catalog-owner").await;
+        let map_uid = unique_map_uid("Catalog_");
+        let authoritative_json = json!({"minigames":{"games":[{"slug":"race","name":"Authoritative","kind":"Sprint"}]}});
+        let stale_json = json!({"minigames":{"games":[{"slug":"race","name":"Spoofed","kind":"Survival"},{"slug":"extra","name":"Extra","kind":"Darts"}]}});
+        let authoritative = upsert_spec(&pool, &owner, "catalog-a", &authoritative_json)
+            .await
+            .expect("authoritative spec");
+        let stale = upsert_spec(&pool, &owner, "catalog-b", &stale_json).await.expect("stale spec");
+        crate::queries::minigames::replace_catalog(&pool, authoritative, &owner, "catalog-a", &authoritative_json)
+            .await
+            .expect("authoritative catalog");
+        crate::queries::minigames::replace_catalog(&pool, stale, &owner, "catalog-b", &stale_json)
+            .await
+            .expect("stale catalog");
+        crate::queries::minigames::bind_map_from_catalog(&pool, &map_uid, stale)
+            .await
+            .expect("seed stale rows");
+
+        let verifier = FakeAuthorVerifier {
+            author: owner,
+            barrier: None,
+        };
+        bind_authoritative_spec(&pool, &verifier, &owner, &map_uid, authoritative)
+            .await
+            .expect("authoritative bind");
+        crate::queries::minigames::bind_map_from_catalog(&pool, &map_uid, authoritative)
+            .await
+            .expect("authoritative rows");
+        assert!(matches!(
+            bind_authoritative_spec(&pool, &verifier, &owner, &map_uid, stale).await,
+            Err(BindSpecError::ConflictingBinding)
+        ));
+        let rows = query!(
+            "SELECT slug, name, kind FROM minigame_on_map WHERE map_uid = $1 ORDER BY slug",
+            map_uid
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("on-map rows");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].slug, "race");
+        assert_eq!(rows[0].name, "Authoritative");
+        assert_eq!(rows[0].kind, "Sprint");
+
+        cleanup_map(&pool, &map_uid).await;
+        cleanup_user(&pool, &owner).await;
     }
 
     #[tokio::test]
@@ -422,6 +819,77 @@ mod tests {
         cleanup_user(&pool, &shadowed).await;
         cleanup_user(&pool, &banned).await;
         cleanup_user(&pool, &author).await;
+    }
+
+    #[tokio::test]
+    async fn concurrent_threshold_crossing_is_serialized_per_map() {
+        let _guard = test_lock();
+        let pool = test_pool().await;
+        let author = seed_user(&pool, "listed-race-author").await;
+        let map_uid = unique_map_uid("RaceMap");
+        let spec_id = upsert_spec(&pool, &author, "race", &json!({"listingThreshold": 5}))
+            .await
+            .expect("spec");
+        bind_first_spec(&pool, &map_uid, spec_id).await.expect("bind");
+
+        let mut players = Vec::new();
+        for i in 0..3 {
+            let user = seed_user(&pool, &format!("listed-race-{i}")).await;
+            insert_lb(&pool, &map_uid, &user, i as f64).await;
+            players.push(user);
+        }
+        let fourth = seed_user(&pool, "listed-race-3").await;
+        let fifth = seed_user(&pool, "listed-race-4").await;
+
+        let mut first_tx = pool.begin().await.expect("first transaction");
+        query!(
+            "INSERT INTO map_leaderboard (map_uid, user_id, height, pos, race_time) VALUES ($1, $2, 3, $3, 1000)",
+            map_uid,
+            fourth,
+            &[1.0_f64, 3.0, 2.0] as &[f64]
+        )
+        .execute(&mut *first_tx)
+        .await
+        .expect("fourth insert");
+
+        let started = Arc::new(Notify::new());
+        let finished = Arc::new(Notify::new());
+        let second_pool = pool.clone();
+        let second_uid = map_uid.clone();
+        let second_started = started.clone();
+        let second_finished = finished.clone();
+        let second = tokio::spawn(async move {
+            let mut tx = second_pool.begin().await.expect("second transaction");
+            second_started.notify_one();
+            query!(
+                "INSERT INTO map_leaderboard (map_uid, user_id, height, pos, race_time) VALUES ($1, $2, 4, $3, 1000)",
+                second_uid,
+                fifth,
+                &[1.0_f64, 4.0, 2.0] as &[f64]
+            )
+            .execute(&mut *tx)
+            .await
+            .expect("fifth insert");
+            second_finished.notify_one();
+            tx.commit().await.expect("second commit");
+        });
+
+        started.notified().await;
+        // The fixed trigger waits on the first transaction's per-map advisory
+        // lock. The old trigger finishes here, having counted only four rows.
+        let second_finished_while_first_open = tokio::time::timeout(Duration::from_millis(500), finished.notified()).await.is_ok();
+        first_tx.commit().await.expect("first commit");
+        second.await.expect("second task");
+
+        assert!(
+            get_listed_map(&pool, &map_uid).await.expect("listed lookup").is_some(),
+            "the fifth unique concurrent insert must list the map (second finished early: {second_finished_while_first_open})"
+        );
+
+        cleanup_map(&pool, &map_uid).await;
+        for user in players.into_iter().chain([fourth, fifth, author]) {
+            cleanup_user(&pool, &user).await;
+        }
     }
 
     #[tokio::test]

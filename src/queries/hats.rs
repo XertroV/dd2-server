@@ -1,8 +1,10 @@
+use log::warn;
 use serde_json::{json, Value};
 use sqlx::{Pool, Postgres};
 use uuid::Uuid;
 
 use crate::consts::DD2_MAP_UID;
+use crate::nadeo::OfficialRecordVerifier;
 use crate::router::{HatMineItem, HatOnMapPlayer};
 
 /// Official DD2 finish-floor Y. Used only as a height analog when `extra.finish` is absent.
@@ -82,6 +84,10 @@ pub fn parse_catalog_hats(spec: &Value) -> Vec<CatalogHat> {
         let slug = slug.to_string();
         let name = item.get("name").and_then(|s| s.as_str()).unwrap_or("").to_string();
         let (finish_this_map, record_uids) = parse_unlock(item);
+        if !finish_this_map && record_uids.is_empty() {
+            warn!("Skipping unconditional hat catalog entry: {}", slug);
+            continue;
+        }
         if !last_by_slug.contains_key(&slug) {
             order.push(slug.clone());
         }
@@ -98,13 +104,7 @@ pub fn parse_catalog_hats(spec: &Value) -> Vec<CatalogHat> {
     order.into_iter().filter_map(|s| last_by_slug.remove(&s)).collect()
 }
 
-pub async fn replace_catalog(
-    pool: &Pool<Postgres>,
-    spec_id: i64,
-    user_id: &Uuid,
-    name_id: &str,
-    spec: &Value,
-) -> Result<(), sqlx::Error> {
+pub async fn replace_catalog(pool: &Pool<Postgres>, spec_id: i64, user_id: &Uuid, name_id: &str, spec: &Value) -> Result<(), sqlx::Error> {
     let items = parse_catalog_hats(spec);
     let mut tx = pool.begin().await?;
     sqlx::query!(
@@ -178,6 +178,10 @@ async fn ensure_catalog(pool: &Pool<Postgres>, spec_id: i64) -> Result<(), sqlx:
 
 pub async fn bind_map_from_catalog(pool: &Pool<Postgres>, map_uid: &str, spec_id: i64) -> Result<bool, sqlx::Error> {
     ensure_catalog(pool, spec_id).await?;
+    let mut tx = pool.begin().await?;
+    sqlx::query!("DELETE FROM hat_on_map WHERE map_uid = $1", map_uid)
+        .execute(&mut *tx)
+        .await?;
     let r = sqlx::query!(
         r#"--sql
         INSERT INTO hat_on_map (map_uid, slug, hat_key, name, finish_this_map, record_uids, spec_user, name_id)
@@ -196,8 +200,9 @@ pub async fn bind_map_from_catalog(pool: &Pool<Postgres>, map_uid: &str, spec_id
         spec_id,
         map_uid
     )
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(r.rows_affected() > 0)
 }
 
@@ -250,7 +255,11 @@ async fn bind_one(pool: &Pool<Postgres>, map_uid: &str, spec_id: i64, slug: &str
 fn json_finish_count(extra: Option<&Value>) -> i64 {
     extra
         .and_then(|e| e.get("finish"))
-        .and_then(|v| v.as_i64().or_else(|| v.as_u64().map(|u| u as i64)).or_else(|| v.as_f64().map(|f| f as i64)))
+        .and_then(|v| {
+            v.as_i64()
+                .or_else(|| v.as_u64().map(|u| u as i64))
+                .or_else(|| v.as_f64().map(|f| f as i64))
+        })
         .unwrap_or(0)
 }
 
@@ -298,37 +307,21 @@ pub async fn validate_finish_this_map(pool: &Pool<Postgres>, user_id: &Uuid, map
     Ok(json_finish_count(row.stats.get("extra")) > 0)
 }
 
-/// Official-record analog for a named UID. No Nadeo player-record API exists in this server:
-/// unknown UIDs with no local row fail closed. No ban filter.
-///
-/// Custom maps: a `map_leaderboard` row (height / race_time analog).
-/// Official DD2: a global `leaderboard` row.
-pub async fn validate_record_for_uid(pool: &Pool<Postgres>, user_id: &Uuid, uid: &str) -> Result<bool, sqlx::Error> {
-    if uid == DD2_MAP_UID {
-        let lb = sqlx::query!(
-            r#"--sql
-            SELECT 1 AS ok FROM leaderboard WHERE user_id = $1
-            "#,
-            user_id
-        )
-        .fetch_optional(pool)
-        .await?;
-        return Ok(lb.is_some());
+/// Validate a Nadeo PersonalBest record. Local height rows are deliberately not
+/// accepted as proof. API/auth failures fail closed and are logged.
+pub async fn validate_record_for_uid(verifier: &dyn OfficialRecordVerifier, user_id: &Uuid, uid: &str) -> bool {
+    match verifier.has_official_record(user_id, uid).await {
+        Ok(valid) => valid,
+        Err(error) => {
+            warn!("Official record validation failed closed for map {}: {}", uid, error);
+            false
+        }
     }
-    let row = sqlx::query!(
-        r#"--sql
-        SELECT 1 AS ok FROM map_leaderboard WHERE user_id = $1 AND map_uid = $2
-        "#,
-        user_id,
-        uid
-    )
-    .fetch_optional(pool)
-    .await?;
-    Ok(row.is_some())
 }
 
 async fn validate_hat_unlock(
     pool: &Pool<Postgres>,
+    verifier: &dyn OfficialRecordVerifier,
     user_id: &Uuid,
     map_uid: &str,
     row: &CatalogRow,
@@ -341,7 +334,7 @@ async fn validate_hat_unlock(
         return Ok(false);
     }
     for uid in &row.record_uids {
-        if !validate_record_for_uid(pool, user_id, uid).await? {
+        if !validate_record_for_uid(verifier, user_id, uid).await {
             return Ok(false);
         }
     }
@@ -366,6 +359,7 @@ async fn already_unlocked(pool: &Pool<Postgres>, user_id: &Uuid, map_uid: &str, 
 /// Sticky unlock. Unknown slug / failed validation: silent drop. Bans are ignored.
 pub async fn report_unlock(
     pool: &Pool<Postgres>,
+    verifier: &dyn OfficialRecordVerifier,
     user_id: &Uuid,
     map_uid: &str,
     slug: &str,
@@ -379,7 +373,11 @@ pub async fn report_unlock(
     if already_unlocked(pool, user_id, map_uid, slug).await? {
         return Ok(true);
     }
-    if !validate_hat_unlock(pool, user_id, map_uid, &row).await? {
+    if !verifier.allow_unlock_validation(user_id) {
+        warn!("Hat unlock validation throttled for user {}", user_id);
+        return Ok(false);
+    }
+    if !validate_hat_unlock(pool, verifier, user_id, map_uid, &row).await? {
         return Ok(false);
     }
     sqlx::query!(
@@ -411,12 +409,7 @@ async fn display_name(pool: &Pool<Postgres>, user_id: &Uuid) -> Result<String, s
 }
 
 /// Empty slug unequips. Non-empty requires a validated unlock. Returns the push entry when state changed.
-pub async fn report_equip(
-    pool: &Pool<Postgres>,
-    user_id: &Uuid,
-    map_uid: &str,
-    slug: &str,
-) -> Result<Option<HatOnMapPlayer>, sqlx::Error> {
+pub async fn report_equip(pool: &Pool<Postgres>, user_id: &Uuid, map_uid: &str, slug: &str) -> Result<Option<HatOnMapPlayer>, sqlx::Error> {
     let name = display_name(pool, user_id).await?;
     let wsid = user_id.to_string();
     if slug.is_empty() {
@@ -467,14 +460,14 @@ pub async fn report_equip(
     )
     .execute(pool)
     .await?;
-    Ok(Some(HatOnMapPlayer { wsid, name, slug: slug.to_string() }))
+    Ok(Some(HatOnMapPlayer {
+        wsid,
+        name,
+        slug: slug.to_string(),
+    }))
 }
 
-pub async fn get_hats_mine(
-    pool: &Pool<Postgres>,
-    map_uid: &str,
-    user_id: &Uuid,
-) -> Result<(String, Vec<HatMineItem>), sqlx::Error> {
+pub async fn get_hats_mine(pool: &Pool<Postgres>, map_uid: &str, user_id: &Uuid) -> Result<(String, Vec<HatMineItem>), sqlx::Error> {
     let equipped = sqlx::query!(
         r#"--sql
         SELECT slug FROM hat_equipped WHERE user_id = $1 AND map_uid = $2
@@ -543,11 +536,7 @@ pub async fn get_hats_on_map(pool: &Pool<Postgres>, map_uid: &str) -> Result<Vec
         .collect())
 }
 
-pub async fn equipped_push_entry(
-    pool: &Pool<Postgres>,
-    user_id: &Uuid,
-    map_uid: &str,
-) -> Result<Option<HatOnMapPlayer>, sqlx::Error> {
+pub async fn equipped_push_entry(pool: &Pool<Postgres>, user_id: &Uuid, map_uid: &str) -> Result<Option<HatOnMapPlayer>, sqlx::Error> {
     let row = sqlx::query!(
         r#"--sql
         SELECT e.slug, u.display_name
@@ -619,6 +608,12 @@ mod tests {
         assert!(h[0].finish_this_map);
         assert_eq!(h[0].record_uids, vec!["abc"]);
     }
+
+    #[test]
+    fn unconditional_hat_is_rejected_from_the_catalog() {
+        let spec = json!({"hats":[{"name":"Free","slug":"Hat-1"}]});
+        assert!(parse_catalog_hats(&spec).is_empty());
+    }
 }
 
 #[cfg(test)]
@@ -626,6 +621,34 @@ mod db_tests {
     use super::*;
     use serde_json::json;
     use sqlx::postgres::PgPoolOptions;
+    use std::{collections::HashSet, sync::Mutex};
+
+    #[derive(Default)]
+    struct FakeRecordVerifier {
+        records: Mutex<HashSet<(Uuid, String)>>,
+        error: Option<String>,
+    }
+
+    impl FakeRecordVerifier {
+        fn allow(&self, user_id: Uuid, map_uid: &str) {
+            self.records.lock().unwrap().insert((user_id, map_uid.to_string()));
+        }
+    }
+
+    impl OfficialRecordVerifier for FakeRecordVerifier {
+        fn has_official_record<'a>(
+            &'a self,
+            account_id: &'a Uuid,
+            map_uid: &'a str,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, String>> + Send + 'a>> {
+            Box::pin(async move {
+                if let Some(error) = &self.error {
+                    return Err(error.clone());
+                }
+                Ok(self.records.lock().unwrap().contains(&(*account_id, map_uid.to_string())))
+            })
+        }
+    }
 
     async fn test_pool() -> Pool<Postgres> {
         dotenv::dotenv().ok();
@@ -720,12 +743,15 @@ mod db_tests {
     #[tokio::test]
     async fn finish_this_map_unlocks_when_extra_finish_present() {
         let pool = test_pool().await;
+        let verifier = FakeRecordVerifier::default();
         let user_id = seed_user(&pool, "hat-finish-ok").await;
         let map_uid = test_map_uid("HatFin");
         seed_custom_finish(&pool, &user_id, &map_uid).await;
         let (spec_id, _) = seed_spec(&pool, &user_id, &hat_spec(true, vec![])).await;
 
-        assert!(report_unlock(&pool, &user_id, &map_uid, "Hat-1", spec_id).await.expect("unlock"));
+        assert!(report_unlock(&pool, &verifier, &user_id, &map_uid, "Hat-1", spec_id)
+            .await
+            .expect("unlock"));
         let n = sqlx::query!("SELECT COUNT(*) AS n FROM hat_unlock WHERE user_id = $1", user_id)
             .fetch_one(&pool)
             .await
@@ -740,12 +766,15 @@ mod db_tests {
     #[tokio::test]
     async fn finish_this_map_fail_closes_on_height_only() {
         let pool = test_pool().await;
+        let verifier = FakeRecordVerifier::default();
         let user_id = seed_user(&pool, "hat-finish-height").await;
         let map_uid = test_map_uid("HatHt");
         seed_map_lb(&pool, &user_id, &map_uid, 2000.0).await;
         let (spec_id, _) = seed_spec(&pool, &user_id, &hat_spec(true, vec![])).await;
 
-        assert!(!report_unlock(&pool, &user_id, &map_uid, "Hat-1", spec_id).await.expect("unlock"));
+        assert!(!report_unlock(&pool, &verifier, &user_id, &map_uid, "Hat-1", spec_id)
+            .await
+            .expect("unlock"));
         let n = sqlx::query!("SELECT COUNT(*) AS n FROM hat_unlock WHERE user_id = $1", user_id)
             .fetch_one(&pool)
             .await
@@ -758,33 +787,60 @@ mod db_tests {
     }
 
     #[tokio::test]
-    async fn record_uid_unknown_fail_closes() {
+    async fn local_climber_row_is_not_accepted_as_an_official_record() {
         let pool = test_pool().await;
+        let verifier = FakeRecordVerifier::default();
         let user_id = seed_user(&pool, "hat-rec-none").await;
         let map_uid = test_map_uid("HatRec");
         let other = test_map_uid("NoData");
         seed_custom_finish(&pool, &user_id, &map_uid).await;
+        seed_map_lb(&pool, &user_id, &other, 1234.0).await;
         let (spec_id, _) = seed_spec(&pool, &user_id, &hat_spec(false, vec![&other])).await;
 
-        assert!(!validate_record_for_uid(&pool, &user_id, &other).await.expect("validate"));
-        assert!(!report_unlock(&pool, &user_id, &map_uid, "Hat-1", spec_id).await.expect("unlock"));
+        assert!(!validate_record_for_uid(&verifier, &user_id, &other).await);
+        assert!(!report_unlock(&pool, &verifier, &user_id, &map_uid, "Hat-1", spec_id)
+            .await
+            .expect("unlock"));
 
+        cleanup(&pool, &user_id).await;
+    }
+
+    #[tokio::test]
+    async fn official_record_api_error_fails_closed() {
+        let pool = test_pool().await;
+        let verifier = FakeRecordVerifier {
+            records: Mutex::new(HashSet::new()),
+            error: Some("offline".into()),
+        };
+        let user_id = seed_user(&pool, "hat-rec-error").await;
+        let map_uid = test_map_uid("HatErr");
+        let record_uid = test_map_uid("RecErr");
+        let (spec_id, _) = seed_spec(&pool, &user_id, &hat_spec(false, vec![&record_uid])).await;
+
+        assert!(!report_unlock(&pool, &verifier, &user_id, &map_uid, "Hat-1", spec_id)
+            .await
+            .expect("fail closed"));
         cleanup(&pool, &user_id).await;
     }
 
     #[tokio::test]
     async fn record_uids_and_requires_every_uid() {
         let pool = test_pool().await;
+        let verifier = FakeRecordVerifier::default();
         let user_id = seed_user(&pool, "hat-and").await;
         let map_uid = test_map_uid("HatAnd");
         let a = test_map_uid("RecA");
         let b = test_map_uid("RecB");
-        seed_map_lb(&pool, &user_id, &a, 10.0).await;
+        verifier.allow(user_id, &a);
         let (spec_id, _) = seed_spec(&pool, &user_id, &hat_spec(false, vec![&a, &b])).await;
 
-        assert!(!report_unlock(&pool, &user_id, &map_uid, "Hat-1", spec_id).await.expect("partial and"));
-        seed_map_lb(&pool, &user_id, &b, 10.0).await;
-        assert!(report_unlock(&pool, &user_id, &map_uid, "Hat-1", spec_id).await.expect("full and"));
+        assert!(!report_unlock(&pool, &verifier, &user_id, &map_uid, "Hat-1", spec_id)
+            .await
+            .expect("partial and"));
+        verifier.allow(user_id, &b);
+        assert!(report_unlock(&pool, &verifier, &user_id, &map_uid, "Hat-1", spec_id)
+            .await
+            .expect("full and"));
 
         cleanup(&pool, &user_id).await;
     }
@@ -792,33 +848,42 @@ mod db_tests {
     #[tokio::test]
     async fn no_predicates_fail_closes() {
         let pool = test_pool().await;
+        let verifier = FakeRecordVerifier::default();
         let user_id = seed_user(&pool, "hat-nopred").await;
         let map_uid = test_map_uid("HatNoP");
         let spec = json!({"hats":[{"name":"Free","slug":"Hat-1"}]});
         let (spec_id, _) = seed_spec(&pool, &user_id, &spec).await;
-        assert!(!report_unlock(&pool, &user_id, &map_uid, "Hat-1", spec_id).await.expect("unlock"));
+        assert!(!report_unlock(&pool, &verifier, &user_id, &map_uid, "Hat-1", spec_id)
+            .await
+            .expect("unlock"));
         cleanup(&pool, &user_id).await;
     }
 
     #[tokio::test]
     async fn sticky_unlock_survives_lost_proof() {
         let pool = test_pool().await;
+        let verifier = FakeRecordVerifier::default();
         let user_id = seed_user(&pool, "hat-sticky").await;
         let map_uid = test_map_uid("HatStk");
         seed_custom_finish(&pool, &user_id, &map_uid).await;
         let (spec_id, _) = seed_spec(&pool, &user_id, &hat_spec(true, vec![])).await;
-        assert!(report_unlock(&pool, &user_id, &map_uid, "Hat-1", spec_id).await.expect("first"));
+        assert!(report_unlock(&pool, &verifier, &user_id, &map_uid, "Hat-1", spec_id)
+            .await
+            .expect("first"));
         sqlx::query!("DELETE FROM custom_map_stats WHERE user_id = $1", user_id)
             .execute(&pool)
             .await
             .unwrap();
-        assert!(report_unlock(&pool, &user_id, &map_uid, "Hat-1", spec_id).await.expect("sticky"));
+        assert!(report_unlock(&pool, &verifier, &user_id, &map_uid, "Hat-1", spec_id)
+            .await
+            .expect("sticky"));
         cleanup(&pool, &user_id).await;
     }
 
     #[tokio::test]
     async fn equip_requires_unlock_and_unequip_clears() {
         let pool = test_pool().await;
+        let verifier = FakeRecordVerifier::default();
         let user_id = seed_user(&pool, "hat-equip").await;
         let map_uid = test_map_uid("HatEq");
         seed_custom_finish(&pool, &user_id, &map_uid).await;
@@ -826,20 +891,19 @@ mod db_tests {
         bind_map_from_catalog(&pool, &map_uid, spec_id).await.expect("bind");
 
         assert!(report_equip(&pool, &user_id, &map_uid, "Hat-1").await.expect("no unlock").is_none());
-        assert!(report_unlock(&pool, &user_id, &map_uid, "Hat-1", spec_id).await.expect("unlock"));
+        assert!(report_unlock(&pool, &verifier, &user_id, &map_uid, "Hat-1", spec_id)
+            .await
+            .expect("unlock"));
         let on = report_equip(&pool, &user_id, &map_uid, "Hat-1").await.expect("equip");
         assert_eq!(on.unwrap().slug, "Hat-1");
         let off = report_equip(&pool, &user_id, &map_uid, "").await.expect("unequip");
         assert_eq!(off.unwrap().slug, "");
-        let n = sqlx::query!(
-            "SELECT COUNT(*) AS n FROM hat_equipped WHERE user_id = $1",
-            user_id
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap()
-        .n
-        .unwrap_or(0);
+        let n = sqlx::query!("SELECT COUNT(*) AS n FROM hat_equipped WHERE user_id = $1", user_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+            .n
+            .unwrap_or(0);
         assert_eq!(n, 0);
 
         cleanup(&pool, &user_id).await;
@@ -848,13 +912,16 @@ mod db_tests {
     #[tokio::test]
     async fn relay_skips_unvalidated_equip_row_and_ignores_ban() {
         let pool = test_pool().await;
+        let verifier = FakeRecordVerifier::default();
         let actor = seed_user(&pool, "hat-ban-actor").await;
         let user_id = seed_user(&pool, "hat-ban-target").await;
         let map_uid = test_map_uid("HatBan");
         seed_custom_finish(&pool, &user_id, &map_uid).await;
         seed_live(&pool, &user_id, &map_uid).await;
         let (spec_id, _) = seed_spec(&pool, &user_id, &hat_spec(true, vec![])).await;
-        assert!(report_unlock(&pool, &user_id, &map_uid, "Hat-1", spec_id).await.expect("unlock"));
+        assert!(report_unlock(&pool, &verifier, &user_id, &map_uid, "Hat-1", spec_id)
+            .await
+            .expect("unlock"));
         report_equip(&pool, &user_id, &map_uid, "Hat-1").await.expect("equip");
 
         crate::queries::moderation::apply_map_ban(&pool, &map_uid, &user_id, &actor, "private", "public", None)
@@ -884,12 +951,15 @@ mod db_tests {
     #[tokio::test]
     async fn hats_mine_lists_unlocked_and_equipped() {
         let pool = test_pool().await;
+        let verifier = FakeRecordVerifier::default();
         let user_id = seed_user(&pool, "hat-mine").await;
         let map_uid = test_map_uid("HatMine");
         seed_custom_finish(&pool, &user_id, &map_uid).await;
         let (spec_id, _) = seed_spec(&pool, &user_id, &hat_spec(true, vec![])).await;
         bind_map_from_catalog(&pool, &map_uid, spec_id).await.expect("bind");
-        assert!(report_unlock(&pool, &user_id, &map_uid, "Hat-1", spec_id).await.expect("unlock"));
+        assert!(report_unlock(&pool, &verifier, &user_id, &map_uid, "Hat-1", spec_id)
+            .await
+            .expect("unlock"));
         report_equip(&pool, &user_id, &map_uid, "Hat-1").await.expect("equip");
         let (equipped, items) = get_hats_mine(&pool, &map_uid, &user_id).await.expect("mine");
         assert_eq!(equipped, "Hat-1");
@@ -901,18 +971,22 @@ mod db_tests {
     #[tokio::test]
     async fn unknown_slug_is_silent() {
         let pool = test_pool().await;
+        let verifier = FakeRecordVerifier::default();
         let user_id = seed_user(&pool, "hat-unknown").await;
         let map_uid = test_map_uid("HatUnk");
         let (spec_id, _) = seed_spec(&pool, &user_id, &hat_spec(true, vec![])).await;
-        assert!(!report_unlock(&pool, &user_id, &map_uid, "no-such", spec_id).await.expect("unlock"));
+        assert!(!report_unlock(&pool, &verifier, &user_id, &map_uid, "no-such", spec_id)
+            .await
+            .expect("unlock"));
         cleanup(&pool, &user_id).await;
     }
 
     #[tokio::test]
     async fn dd2_record_fail_closes_without_leaderboard_row() {
         let pool = test_pool().await;
+        let verifier = FakeRecordVerifier::default();
         let user_id = seed_user(&pool, "hat-dd2-none").await;
-        assert!(!validate_record_for_uid(&pool, &user_id, DD2_MAP_UID).await.expect("dd2"));
+        assert!(!validate_record_for_uid(&verifier, &user_id, DD2_MAP_UID).await);
         assert!(!validate_finish_this_map(&pool, &user_id, DD2_MAP_UID).await.expect("dd2 finish"));
         cleanup(&pool, &user_id).await;
     }

@@ -70,6 +70,9 @@ const MAX_HEIGHT: f64 = 5000.0;
 lazy_static! {
     static ref CACHED_LB_INFO: AsyncCache<String, Vec<LeaderboardEntry2>> = Default::default();
     static ref CACHED_LIVE_INFO: AsyncCache<String, Vec<LeaderboardEntry2>> = Default::default();
+    static ref NADEO_CLIENT: Arc<nadeo::NadeoLiveClient> = nadeo::NadeoLiveClient::from_env();
+    static ref NADEO_RECORD_VERIFIER: Arc<nadeo::CachedOfficialRecordVerifier<nadeo::NadeoLiveClient>> =
+        nadeo::CachedOfficialRecordVerifier::new(NADEO_CLIENT.clone());
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 10)]
@@ -615,7 +618,7 @@ impl XPlayer {
                     elapsed_ms,
                     status,
                 } => XPlayer::report_minigame_attempt(&pool, user_id, uid, slug, spec_id, elapsed_ms, status).await,
-                Request::ReportMinigameMap { uid, spec_id } => XPlayer::report_minigame_map(&pool, uid, spec_id).await,
+                Request::ReportMinigameMap { uid, spec_id } => XPlayer::report_minigame_map(&pool, user_id, uid, spec_id).await,
                 Request::ReportCollectibleUnlock { uid, slug, spec_id } => {
                     XPlayer::report_collectible_unlock(&pool, user_id, uid, slug, spec_id).await
                 }
@@ -1688,12 +1691,16 @@ impl XPlayer {
         if status != "finish" && status != "cancel" {
             return Ok(());
         }
+        let Some(spec_id) = queries::listed_maps::resolve_bound_spec(pool, &map_uid, spec_id).await? else {
+            return Ok(());
+        };
         queries::minigames::report_attempt(pool, user_id, &map_uid, &slug, spec_id, elapsed_ms, &status).await?;
         Ok(())
     }
 
     pub async fn report_minigame_map(
         pool: &Pool<Postgres>,
+        user_id: &Uuid,
         map_uid: String,
         spec_id: i64,
     ) -> Result<(), api_error::Error> {
@@ -1703,10 +1710,12 @@ impl XPlayer {
         if spec_id <= 0 {
             return Ok(());
         }
+        let spec_id = queries::listed_maps::bind_authoritative_spec(pool, NADEO_CLIENT.as_ref(), user_id, &map_uid, spec_id)
+            .await
+            .map_err(|error| ApiError::StrErr(error.to_string()))?;
         let _ = queries::minigames::bind_map_from_catalog(pool, &map_uid, spec_id).await?;
         let _ = queries::collectibles::bind_map_from_catalog(pool, &map_uid, spec_id).await?;
         let _ = queries::hats::bind_map_from_catalog(pool, &map_uid, spec_id).await?;
-        queries::listed_maps::bind_first_spec(pool, &map_uid, spec_id).await?;
         Ok(())
     }
 
@@ -1720,6 +1729,9 @@ impl XPlayer {
         if map_uid.len() != 27 || spec_id <= 0 || slug.is_empty() {
             return Ok(());
         }
+        let Some(spec_id) = queries::listed_maps::resolve_bound_spec(pool, &map_uid, spec_id).await? else {
+            return Ok(());
+        };
         queries::collectibles::report_unlock(pool, user_id, &map_uid, &slug, spec_id).await?;
         Ok(())
     }
@@ -1741,6 +1753,9 @@ impl XPlayer {
         let Some(source) = queries::collectibles::collect_log_source(&source) else {
             return Ok(());
         };
+        let Some(spec_id) = queries::listed_maps::resolve_bound_spec(pool, &map_uid, spec_id).await? else {
+            return Ok(());
+        };
         queries::collectibles::report_collect(pool, user_id, &map_uid, &slug, spec_id, x, y, z, source).await?;
         Ok(())
     }
@@ -1755,7 +1770,18 @@ impl XPlayer {
         if map_uid.len() != 27 || spec_id <= 0 || slug.is_empty() {
             return Ok(());
         }
-        let _ = queries::hats::report_unlock(pool, user_id, &map_uid, &slug, spec_id).await?;
+        let Some(spec_id) = queries::listed_maps::resolve_bound_spec(pool, &map_uid, spec_id).await? else {
+            return Ok(());
+        };
+        let _ = queries::hats::report_unlock(
+            pool,
+            NADEO_RECORD_VERIFIER.as_ref(),
+            user_id,
+            &map_uid,
+            &slug,
+            spec_id,
+        )
+        .await?;
         Ok(())
     }
 
