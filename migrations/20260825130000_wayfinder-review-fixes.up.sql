@@ -1,8 +1,17 @@
 -- Canonical minigame/collectible contracts and race-free map listing.
 
 -- Upgrade the original best-effort listing hint into the single immutable
--- map -> spec authority used by every Wayfinder report. Existing rows remain
--- deliberately unverified until the owning mapper proves them through Nadeo.
+-- map -> spec authority used by every Wayfinder report.
+--
+-- DEPLOYMENT NOTE (see RELEASE.md, "Wayfinder: 20260825130000 disables every
+-- existing map binding"): the DELETE below is not restored by the down
+-- migration, and every surviving row is left unverified
+-- (`verified_author_id IS NULL`). `resolve_bound_spec` fails closed on an
+-- unverified binding, so until each map's *author* reloads that map -- which
+-- re-fires request 81 and runs the Nadeo ownership proof -- the server drops
+-- all of its minigame attempts, collectible unlocks/collects and hat unlocks
+-- and withholds its hat reads. Non-authors cannot heal it. Dump
+-- map_listing_bind before applying.
 DELETE FROM map_listing_bind b
 WHERE b.spec_id IS NULL
    OR NOT EXISTS (SELECT 1 FROM custom_map_aux_specs s WHERE s.id = b.spec_id);

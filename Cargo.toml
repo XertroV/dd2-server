@@ -45,6 +45,8 @@ warp = "0.3.7"
 lets-encrypt-warp = "0.3.0"
 rustls-acme = { version = "0.12.1", features = ["tokio"] }
 hex = "0.4.3"
+# Reproduces the plugin's `Crypto::MD5(EdChallengeId).SubStr(0, 30)` map-id obfuscation.
+md-5 = "0.10.6"
 tokio-graceful-shutdown = "0.15.0"
 miette = { version = "7.2.0", features = ["fancy"] }
 tokio-util = { version = "0.7", features = ["rt"] }

@@ -1,3 +1,4 @@
+use log::warn;
 use serde_json::Value;
 use sqlx::{Pool, Postgres, Transaction};
 use uuid::Uuid;
@@ -120,6 +121,7 @@ pub fn parse_catalog_collectibles(spec: &Value) -> Result<Vec<CatalogCollectible
         let name = item
             .get("name")
             .and_then(|s| s.as_str())
+            .map(str::trim)
             .filter(|name| !name.is_empty())
             .unwrap_or(&slug)
             .to_string();
@@ -136,6 +138,7 @@ pub fn parse_catalog_collectibles(spec: &Value) -> Result<Vec<CatalogCollectible
     Ok(parsed)
 }
 
+#[cfg(test)]
 pub async fn replace_catalog(pool: &Pool<Postgres>, spec_id: i64, user_id: &Uuid, name_id: &str, spec: &Value) -> Result<(), sqlx::Error> {
     let items = parse_catalog_collectibles(spec).map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
     let mut tx = pool.begin().await?;
@@ -196,6 +199,7 @@ pub async fn delete_catalog(pool: &Pool<Postgres>, user_id: &Uuid, name_id: &str
     Ok(())
 }
 
+#[cfg(test)]
 async fn ensure_catalog(pool: &Pool<Postgres>, spec_id: i64) -> Result<(), sqlx::Error> {
     let existing = sqlx::query!(
         r#"--sql
@@ -208,20 +212,13 @@ async fn ensure_catalog(pool: &Pool<Postgres>, spec_id: i64) -> Result<(), sqlx:
     if existing.is_some() {
         return Ok(());
     }
-    let row = sqlx::query!(
-        r#"--sql
-        SELECT user_id, name_id, spec FROM custom_map_aux_specs WHERE id = $1
-        "#,
-        spec_id
-    )
-    .fetch_optional(pool)
-    .await?;
-    let Some(row) = row else {
+    let Some(row) = crate::queries::custom_map_aux_specs::spec_source(pool, spec_id).await? else {
         return Ok(());
     };
     replace_catalog(pool, spec_id, &row.user_id, &row.name_id, &row.spec).await
 }
 
+#[cfg(test)]
 pub async fn bind_map_from_catalog(pool: &Pool<Postgres>, map_uid: &str, spec_id: i64) -> Result<bool, sqlx::Error> {
     ensure_catalog(pool, spec_id).await?;
     let mut tx = pool.begin().await?;
@@ -235,6 +232,8 @@ pub(crate) async fn bind_map_from_catalog_in_tx(
     map_uid: &str,
     spec_id: i64,
 ) -> Result<bool, sqlx::Error> {
+    // The delete makes a (map_uid, slug) conflict impossible below, so the
+    // insert deliberately carries no ON CONFLICT clause.
     sqlx::query!("DELETE FROM collectible_on_map WHERE map_uid = $1", map_uid)
         .execute(&mut **tx)
         .await?;
@@ -246,16 +245,6 @@ pub(crate) async fn bind_map_from_catalog_in_tx(
                c.name, c.pickup, c.collect_on_unlock, c.has_zone, c.gated_by, c.unlock_score, c.user_id, c.name_id
         FROM collectible_catalog c
         WHERE c.spec_id = $2
-        ON CONFLICT (map_uid, slug) DO UPDATE SET
-            collectible_key = EXCLUDED.collectible_key,
-            name = EXCLUDED.name,
-            pickup = EXCLUDED.pickup,
-            collect_on_unlock = EXCLUDED.collect_on_unlock,
-            has_zone = EXCLUDED.has_zone,
-            gated_by = EXCLUDED.gated_by,
-            unlock_score = EXCLUDED.unlock_score,
-            spec_user = EXCLUDED.spec_user,
-            name_id = EXCLUDED.name_id
         "#,
         map_uid,
         spec_id,
@@ -398,6 +387,16 @@ pub async fn report_unlock(pool: &Pool<Postgres>, user_id: &Uuid, map_uid: &str,
     Ok(())
 }
 
+/// Trackmania worlds are bounded well inside this; anything past it is a
+/// corrupt or hostile report and would only pollute the append-only audit log.
+const COLLECT_POSITION_LIMIT: f32 = 1.0e6;
+
+fn collect_position_is_plausible(x: f32, y: f32, z: f32) -> bool {
+    [x, y, z]
+        .iter()
+        .all(|value| value.is_finite() && value.abs() <= COLLECT_POSITION_LIMIT)
+}
+
 /// Sticky collect; also unlocks if not already (ungated zone pickup). Unknown slug: silent drop.
 /// First collect appends a log row; repeats do not.
 pub async fn report_collect(
@@ -414,7 +413,11 @@ pub async fn report_collect(
     let Some(source) = collect_log_source(source) else {
         return Ok(());
     };
-    if !x.is_finite() || !y.is_finite() || !z.is_finite() {
+    if !collect_position_is_plausible(x, y, z) {
+        warn!(
+            "Dropping collect log for user {} on map {} slug {}: implausible position ({}, {}, {})",
+            user_id, map_uid, slug, x, y, z
+        );
         return Ok(());
     }
     let mut tx = pool.begin().await?;
@@ -644,6 +647,26 @@ mod tests {
         assert!(collect_log_source("nope").is_none());
         assert!(collect_log_source("ZONE").is_none());
     }
+
+    #[test]
+    fn absurd_collect_positions_are_rejected() {
+        assert!(collect_position_is_plausible(0.0, 0.0, 0.0));
+        assert!(collect_position_is_plausible(-1234.5, 512.0, 9000.0));
+        assert!(collect_position_is_plausible(COLLECT_POSITION_LIMIT, 0.0, -COLLECT_POSITION_LIMIT));
+        assert!(!collect_position_is_plausible(1.0e38, 0.0, 0.0));
+        assert!(!collect_position_is_plausible(0.0, -1.0e38, 0.0));
+        assert!(!collect_position_is_plausible(0.0, 0.0, f32::INFINITY));
+        assert!(!collect_position_is_plausible(f32::NAN, 0.0, 0.0));
+    }
+
+    #[test]
+    fn blank_name_falls_back_to_the_trimmed_slug() {
+        let parsed = parse_catalog_collectibles(&json!({"collectibles":[
+            {"slug":"coin","name":"   ","pickup":"grant"}
+        ]}))
+        .expect("valid catalog");
+        assert_eq!(parsed[0].name, "coin");
+    }
 }
 
 #[cfg(test)]
@@ -698,7 +721,7 @@ mod db_tests {
             r#"INSERT INTO map_listing_bind
                    (map_uid, spec_id, verified_author_id, author_verified_at,
                     materialized_spec_updated_at, materialized_spec_hash)
-               SELECT $1, id, user_id, NOW(), updated_at, md5(spec::text)
+               SELECT $1, id, user_id, NOW(), updated_at, spec_hash
                FROM custom_map_aux_specs WHERE id = $2"#,
             map_uid,
             spec_id

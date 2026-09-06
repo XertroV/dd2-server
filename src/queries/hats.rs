@@ -46,39 +46,60 @@ impl HatEquipRateLimiter {
         }
     }
 
-    pub fn allow(&self, user_id: &Uuid) -> bool {
-        self.allow_at(user_id, Instant::now())
+    /// Why an equip was refused, so the caller can tell a player who is simply
+    /// spamming the hat picker (actionable, worth a client notice) apart from
+    /// server-wide overload (not the player's problem, log only).
+    pub fn check(&self, user_id: &Uuid) -> HatEquipRateVerdict {
+        self.check_at(user_id, Instant::now())
     }
 
-    fn allow_at(&self, user_id: &Uuid, now: Instant) -> bool {
+    fn check_at(&self, user_id: &Uuid, now: Instant) -> HatEquipRateVerdict {
         let mut state = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         if state
             .attempts
             .peek(user_id)
             .is_some_and(|previous| now.saturating_duration_since(*previous) < self.per_user_interval)
         {
-            return false;
+            return HatEquipRateVerdict::PerUser;
         }
         if now.saturating_duration_since(state.global_started) >= self.global_window {
             state.global_started = now;
             state.global_count = 0;
         }
         if state.global_count >= self.global_limit {
-            return false;
+            return HatEquipRateVerdict::Global;
         }
         state.attempts.put(*user_id, now);
         state.global_count += 1;
-        true
+        HatEquipRateVerdict::Allowed
+    }
+
+    #[cfg(test)]
+    fn allow_at(&self, user_id: &Uuid, now: Instant) -> bool {
+        self.check_at(user_id, now) == HatEquipRateVerdict::Allowed
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HatEquipRateVerdict {
+    Allowed,
+    /// This player changed hats again inside the per-user interval.
+    PerUser,
+    /// The server-wide equip budget for this window is exhausted.
+    Global,
+}
+
+/// Accepts the same container shapes as `collectible_array`: a bare array, or
+/// an object holding the entries under `items` or `games`.
 fn hats_array(spec: &Value) -> Option<&Vec<Value>> {
     let v = spec.get("hats")?;
     if let Some(arr) = v.as_array() {
         return Some(arr);
     }
-    if let Some(arr) = v.get("items").and_then(|x| x.as_array()) {
-        return Some(arr);
+    for key in ["items", "games"] {
+        if let Some(arr) = v.get(key).and_then(|x| x.as_array()) {
+            return Some(arr);
+        }
     }
     None
 }
@@ -139,7 +160,17 @@ pub fn parse_catalog_hats(spec: &Value) -> Result<Vec<CatalogHat>, CatalogValida
             continue;
         }
         let slug = match item.get("slug") {
-            None => format!("Hat-{next_default}"),
+            None => {
+                // `hat_key = MD5(mapUid || ':h:' || slug)`, so a positional
+                // default renumbers -- and orphans every existing unlock --
+                // as soon as a hat is inserted earlier in the list.
+                let slug = format!("Hat-{next_default}");
+                warn!(
+                    "Hat catalog entry has no explicit slug; positional default {} will orphan unlocks if hats are inserted before it",
+                    slug
+                );
+                slug
+            }
             Some(value) => {
                 let Some(slug) = value.as_str() else {
                     return Err(CatalogValidationError::BlankSlug { catalog: "hat" });
@@ -162,6 +193,7 @@ pub fn parse_catalog_hats(spec: &Value) -> Result<Vec<CatalogHat>, CatalogValida
         let name = item
             .get("name")
             .and_then(|s| s.as_str())
+            .map(str::trim)
             .filter(|name| !name.is_empty())
             .unwrap_or(&slug)
             .to_string();
@@ -180,6 +212,7 @@ pub fn parse_catalog_hats(spec: &Value) -> Result<Vec<CatalogHat>, CatalogValida
     Ok(parsed)
 }
 
+#[cfg(test)]
 pub async fn replace_catalog(pool: &Pool<Postgres>, spec_id: i64, user_id: &Uuid, name_id: &str, spec: &Value) -> Result<(), sqlx::Error> {
     let items = parse_catalog_hats(spec).map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
     let mut tx = pool.begin().await?;
@@ -237,6 +270,7 @@ pub async fn delete_catalog(pool: &Pool<Postgres>, user_id: &Uuid, name_id: &str
     Ok(())
 }
 
+#[cfg(test)]
 async fn ensure_catalog(pool: &Pool<Postgres>, spec_id: i64) -> Result<(), sqlx::Error> {
     let existing = sqlx::query!(
         r#"--sql
@@ -249,20 +283,13 @@ async fn ensure_catalog(pool: &Pool<Postgres>, spec_id: i64) -> Result<(), sqlx:
     if existing.is_some() {
         return Ok(());
     }
-    let row = sqlx::query!(
-        r#"--sql
-        SELECT user_id, name_id, spec FROM custom_map_aux_specs WHERE id = $1
-        "#,
-        spec_id
-    )
-    .fetch_optional(pool)
-    .await?;
-    let Some(row) = row else {
+    let Some(row) = crate::queries::custom_map_aux_specs::spec_source(pool, spec_id).await? else {
         return Ok(());
     };
     replace_catalog(pool, spec_id, &row.user_id, &row.name_id, &row.spec).await
 }
 
+#[cfg(test)]
 pub async fn bind_map_from_catalog(pool: &Pool<Postgres>, map_uid: &str, spec_id: i64) -> Result<bool, sqlx::Error> {
     ensure_catalog(pool, spec_id).await?;
     let mut tx = pool.begin().await?;
@@ -315,6 +342,8 @@ pub(crate) async fn bind_map_from_catalog_in_tx(
     map_uid: &str,
     spec_id: i64,
 ) -> Result<HatBindResult, sqlx::Error> {
+    // The delete makes a (map_uid, slug) conflict impossible below, so the
+    // insert deliberately carries no ON CONFLICT clause.
     sqlx::query!("DELETE FROM hat_on_map WHERE map_uid = $1", map_uid)
         .execute(&mut **tx)
         .await?;
@@ -324,13 +353,6 @@ pub(crate) async fn bind_map_from_catalog_in_tx(
         SELECT $1, c.slug, substring(md5($3 || ':h:' || c.slug) from 1 for 16), c.name, c.finish_this_map, c.record_uids, c.user_id, c.name_id
         FROM hat_catalog c
         WHERE c.spec_id = $2
-        ON CONFLICT (map_uid, slug) DO UPDATE SET
-            hat_key = EXCLUDED.hat_key,
-            name = EXCLUDED.name,
-            finish_this_map = EXCLUDED.finish_this_map,
-            record_uids = EXCLUDED.record_uids,
-            spec_user = EXCLUDED.spec_user,
-            name_id = EXCLUDED.name_id
         "#,
         map_uid,
         spec_id,
@@ -648,7 +670,21 @@ where
     Ok(Some(entry))
 }
 
-pub async fn get_hats_mine(pool: &Pool<Postgres>, map_uid: &str, user_id: &Uuid) -> Result<(String, Vec<HatMineItem>), sqlx::Error> {
+/// `None` means "this map has no verified, materialized binding", which the
+/// caller must answer with silence rather than an empty `HatsMine`. The client
+/// treats a well-formed empty response as authoritative: it relocks every hat,
+/// clears the local equip and persists that to disk, which is unrecoverable.
+pub async fn get_hats_mine(
+    pool: &Pool<Postgres>,
+    map_uid: &str,
+    user_id: &Uuid,
+) -> Result<Option<(String, Vec<HatMineItem>)>, sqlx::Error> {
+    if crate::queries::listed_maps::verified_binding_spec_id(pool, map_uid)
+        .await?
+        .is_none()
+    {
+        return Ok(None);
+    }
     let equipped = sqlx::query!(
         r#"--sql
         SELECT e.slug
@@ -661,7 +697,7 @@ pub async fn get_hats_mine(pool: &Pool<Postgres>, map_uid: &str, user_id: &Uuid)
           AND b.author_verified_at IS NOT NULL
           AND b.verified_author_id = s.user_id
           AND b.materialized_spec_updated_at = s.updated_at
-          AND b.materialized_spec_hash = md5(s.spec::text)
+          AND b.materialized_spec_hash = s.spec_hash
         "#,
         user_id,
         map_uid
@@ -681,7 +717,7 @@ pub async fn get_hats_mine(pool: &Pool<Postgres>, map_uid: &str, user_id: &Uuid)
           AND b.author_verified_at IS NOT NULL
           AND b.verified_author_id = s.user_id
           AND b.materialized_spec_updated_at = s.updated_at
-          AND b.materialized_spec_hash = md5(s.spec::text)
+          AND b.materialized_spec_hash = s.spec_hash
         ORDER BY m.slug
         "#,
         map_uid,
@@ -698,7 +734,7 @@ pub async fn get_hats_mine(pool: &Pool<Postgres>, map_uid: &str, user_id: &Uuid)
             unlocked_at: r.unlocked_at.map(|t| t.timestamp() as u32),
         })
         .collect();
-    Ok((equipped, items))
+    Ok(Some((equipped, items)))
 }
 
 /// Equipped hats for players currently on this map. Validated unlocks only. Bans are not applied.
@@ -722,7 +758,7 @@ pub async fn get_hats_on_map(pool: &Pool<Postgres>, map_uid: &str) -> Result<Vec
           AND b.author_verified_at IS NOT NULL
           AND b.verified_author_id = s.user_id
           AND b.materialized_spec_updated_at = s.updated_at
-          AND b.materialized_spec_hash = md5(s.spec::text)
+          AND b.materialized_spec_hash = s.spec_hash
         ORDER BY u.display_name, e.slug
         "#,
         map_uid
@@ -755,7 +791,7 @@ pub async fn equipped_push_entry(pool: &Pool<Postgres>, user_id: &Uuid, map_uid:
           AND b.author_verified_at IS NOT NULL
           AND b.verified_author_id = s.user_id
           AND b.materialized_spec_updated_at = s.updated_at
-          AND b.materialized_spec_hash = md5(s.spec::text)
+          AND b.materialized_spec_hash = s.spec_hash
         "#,
         user_id,
         map_uid
@@ -778,6 +814,29 @@ mod tests {
     fn missing_is_empty() {
         assert!(parse_catalog_hats(&json!({"info":{}})).expect("valid catalog").is_empty());
         assert!(parse_catalog_hats(&json!({"hats":[]})).expect("valid catalog").is_empty());
+    }
+
+    #[test]
+    fn container_shapes_match_the_collectible_parser() {
+        let entry = json!({"slug":"Hat-1","unlock":{"finishThisMap":true}});
+        for spec in [
+            json!({"hats": [entry.clone()]}),
+            json!({"hats": {"items": [entry.clone()]}}),
+            json!({"hats": {"games": [entry.clone()]}}),
+        ] {
+            let parsed = parse_catalog_hats(&spec).expect("valid catalog");
+            assert_eq!(parsed.len(), 1);
+            assert_eq!(parsed[0].slug, "Hat-1");
+        }
+    }
+
+    #[test]
+    fn blank_name_falls_back_to_the_trimmed_slug() {
+        let parsed = parse_catalog_hats(&json!({"hats":[
+            {"slug":"Hat-1","name":"   ","unlock":{"finishThisMap":true}}
+        ]}))
+        .expect("valid catalog");
+        assert_eq!(parsed[0].name, "Hat-1");
     }
 
     #[test]
@@ -990,7 +1049,7 @@ mod db_tests {
             r#"INSERT INTO map_listing_bind
                    (map_uid, spec_id, verified_author_id, author_verified_at,
                     materialized_spec_updated_at, materialized_spec_hash)
-               SELECT $1, id, user_id, NOW(), updated_at, md5(spec::text)
+               SELECT $1, id, user_id, NOW(), updated_at, spec_hash
                FROM custom_map_aux_specs WHERE id = $2"#,
             map_uid,
             spec_id
@@ -1472,7 +1531,10 @@ mod db_tests {
             .expect("no removed-hat broadcast")
             .iter()
             .all(|hat| hat.wsid != user_id.to_string()));
-        let (equipped, items) = get_hats_mine(&pool, &map_uid, &user_id).await.expect("current hats");
+        let (equipped, items) = get_hats_mine(&pool, &map_uid, &user_id)
+            .await
+            .expect("current hats")
+            .expect("verified binding still serves hats");
         assert!(equipped.is_empty());
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].slug, "Hat-2");
@@ -1548,7 +1610,10 @@ mod db_tests {
             .await
             .expect("unlock"));
         report_equip(&pool, &user_id, &map_uid, "Hat-1").await.expect("equip");
-        let (equipped, items) = get_hats_mine(&pool, &map_uid, &user_id).await.expect("mine");
+        let (equipped, items) = get_hats_mine(&pool, &map_uid, &user_id)
+            .await
+            .expect("mine")
+            .expect("verified binding still serves hats");
         assert_eq!(equipped, "Hat-1");
         assert_eq!(items.len(), 1);
         assert!(items[0].unlocked_at.is_some());
@@ -1580,9 +1645,10 @@ mod db_tests {
         .execute(&pool)
         .await
         .expect("mismatch verified author");
-        let (equipped, items) = get_hats_mine(&pool, &map_uid, &user_id).await.expect("wrong-author mine");
-        assert!(equipped.is_empty());
-        assert!(items.is_empty());
+        assert!(
+            get_hats_mine(&pool, &map_uid, &user_id).await.expect("wrong-author mine").is_none(),
+            "an unusable binding must be withheld, never answered with an empty list"
+        );
         assert!(get_hats_on_map(&pool, &map_uid).await.expect("wrong-author on-map").is_empty());
         assert!(equipped_push_entry(&pool, &user_id, &map_uid)
             .await
@@ -1598,9 +1664,10 @@ mod db_tests {
         .expect("restore verified author");
 
         let assert_hidden = async {
-            let (equipped, items) = get_hats_mine(&pool, &map_uid, &user_id).await.expect("mine");
-            assert!(equipped.is_empty());
-            assert!(items.is_empty());
+            assert!(
+                get_hats_mine(&pool, &map_uid, &user_id).await.expect("mine").is_none(),
+                "an unusable binding must be withheld, never answered with an empty list"
+            );
             assert!(get_hats_on_map(&pool, &map_uid).await.expect("on-map").is_empty());
             assert!(equipped_push_entry(&pool, &user_id, &map_uid).await.expect("join push").is_none());
         };
@@ -1637,9 +1704,10 @@ mod db_tests {
         .execute(&pool)
         .await
         .expect("make snapshot stale");
-        let (equipped, items) = get_hats_mine(&pool, &map_uid, &user_id).await.expect("stale mine");
-        assert!(equipped.is_empty());
-        assert!(items.is_empty());
+        assert!(
+            get_hats_mine(&pool, &map_uid, &user_id).await.expect("stale mine").is_none(),
+            "a stale snapshot must be withheld, never answered with an empty list"
+        );
         assert!(get_hats_on_map(&pool, &map_uid).await.expect("stale on-map").is_empty());
         assert!(equipped_push_entry(&pool, &user_id, &map_uid)
             .await

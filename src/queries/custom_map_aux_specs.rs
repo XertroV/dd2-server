@@ -167,6 +167,53 @@ pub async fn upsert_spec_and_catalogs(
     Ok(row.id)
 }
 
+/// The map bound to this spec, if any. `map_listing_bind.spec_id` is
+/// `ON DELETE RESTRICT`, so a bound spec cannot be deleted; callers use this to
+/// answer the mapper instead of raising a foreign key violation.
+pub async fn bound_map_uid(pool: &Pool<Postgres>, user_id: &Uuid, name_id: &str) -> Result<Option<String>, Error> {
+    let row = sqlx::query!(
+        r#"
+        SELECT b.map_uid
+        FROM map_listing_bind b
+        INNER JOIN custom_map_aux_specs s ON s.id = b.spec_id
+        WHERE s.user_id = $1 AND s.name_id = $2
+        ORDER BY b.map_uid
+        LIMIT 1
+        "#,
+        user_id,
+        name_id
+    )
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|row| row.map_uid))
+}
+
+/// Owner, name and JSON of one spec row. Shared by the three catalog modules'
+/// `ensure_catalog` helpers, which otherwise only differ by table name.
+#[cfg(test)]
+pub(crate) struct SpecSource {
+    pub user_id: Uuid,
+    pub name_id: String,
+    pub spec: Value,
+}
+
+#[cfg(test)]
+pub(crate) async fn spec_source(pool: &Pool<Postgres>, spec_id: i64) -> Result<Option<SpecSource>, sqlx::Error> {
+    let row = sqlx::query!(
+        r#"
+        SELECT user_id, name_id, spec FROM custom_map_aux_specs WHERE id = $1
+        "#,
+        spec_id
+    )
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|row| SpecSource {
+        user_id: row.user_id,
+        name_id: row.name_id,
+        spec: row.spec,
+    }))
+}
+
 pub async fn delete_spec(pool: &Pool<Postgres>, user_id: &Uuid, name_id: &str) -> Result<(), Error> {
     sqlx::query!(
         r#"

@@ -77,13 +77,58 @@ pub struct AuthoritativeBindResult {
     pub materialized: bool,
 }
 
-pub async fn bind_authoritative_spec(
+/// Everything a bind can decide before the per-map lock is taken, including the
+/// Nadeo author lookup. Performs no writes, so it is safe to run unlocked and
+/// safe to discard. Keeping the HTTP round trip out of the lock stops one
+/// mapper's verification from queueing every other player's report on that map.
+#[derive(Debug)]
+pub struct PreparedBind {
+    /// `Some` when Nadeo confirmed in this attempt that the reporter authored
+    /// the map. The transaction demands it whenever it finds the binding still
+    /// unverified, so an unprepared bind can never promote itself.
+    verified_author: Option<Uuid>,
+}
+
+/// Whether phase one will have to consult Nadeo, i.e. whether this report can
+/// block on HTTP. Callers use it to decide between running the bind inline and
+/// deferring it off the connection's request loop.
+pub async fn bind_requires_author_verification(
+    pool: &Pool<Postgres>,
+    reporter_id: &Uuid,
+    map_uid: &str,
+    requested_spec_id: i64,
+) -> Result<bool, sqlx::Error> {
+    let row = query!(
+        r#"
+        SELECT EXISTS (
+            SELECT 1
+            FROM map_listing_bind b
+            INNER JOIN custom_map_aux_specs s ON s.id = b.spec_id
+            WHERE b.map_uid = $1
+              AND b.spec_id = $2
+              AND b.author_verified_at IS NOT NULL
+              AND b.verified_author_id = s.user_id
+        ) AS "verified!",
+        EXISTS (
+            SELECT 1 FROM custom_map_aux_specs WHERE id = $2 AND user_id = $3
+        ) AS "owned!"
+        "#,
+        map_uid,
+        requested_spec_id,
+        reporter_id
+    )
+    .fetch_one(pool)
+    .await?;
+    Ok(!row.verified && row.owned)
+}
+
+pub async fn prepare_authoritative_bind(
     pool: &Pool<Postgres>,
     verifier: &dyn MapAuthorVerifier,
     reporter_id: &Uuid,
     map_uid: &str,
     requested_spec_id: i64,
-) -> Result<AuthoritativeBindResult, BindSpecError> {
+) -> Result<PreparedBind, BindSpecError> {
     let existing_binding = get_spec_binding(pool, map_uid).await?;
     if let Some(binding) = &existing_binding {
         if binding.verified && binding.spec_id != requested_spec_id {
@@ -95,24 +140,38 @@ pub async fn bind_authoritative_spec(
         .fetch_optional(pool)
         .await?
         .ok_or(BindSpecError::SpecNotFound)?;
-    let needs_verification = !existing_binding.is_some_and(|binding| binding.verified);
-    if needs_verification {
-        if spec.user_id != *reporter_id {
-            return Err(BindSpecError::SpecNotOwned);
-        }
-        let nadeo_author = verifier
-            .author_id_for_uid(reporter_id, map_uid)
-            .await
-            .map_err(BindSpecError::AuthorVerification)?;
-        if nadeo_author != spec.user_id {
-            return Err(BindSpecError::AuthorMismatch);
-        }
+    if existing_binding.is_some_and(|binding| binding.verified) {
+        return Ok(PreparedBind { verified_author: None });
     }
+    if spec.user_id != *reporter_id {
+        return Err(BindSpecError::SpecNotOwned);
+    }
+    let nadeo_author = verifier
+        .author_id_for_uid(reporter_id, map_uid)
+        .await
+        .map_err(BindSpecError::AuthorVerification)?;
+    if nadeo_author != spec.user_id {
+        return Err(BindSpecError::AuthorMismatch);
+    }
+    Ok(PreparedBind {
+        verified_author: Some(nadeo_author),
+    })
+}
 
+/// Materialize the binding. The caller holds the per-map operation lock; every
+/// authority decision is re-derived from the rows locked here rather than from
+/// the unlocked reads `prepare_authoritative_bind` made.
+pub async fn commit_authoritative_bind(
+    pool: &Pool<Postgres>,
+    prepared: &PreparedBind,
+    reporter_id: &Uuid,
+    map_uid: &str,
+    requested_spec_id: i64,
+) -> Result<AuthoritativeBindResult, BindSpecError> {
     let mut tx = pool.begin().await?;
     let locked_spec = query!(
         r#"
-        SELECT user_id, name_id, spec, updated_at, md5(spec::text) AS "spec_hash!"
+        SELECT user_id, name_id, spec, updated_at, spec_hash
         FROM custom_map_aux_specs
         WHERE id = $1
         FOR UPDATE
@@ -122,9 +181,6 @@ pub async fn bind_authoritative_spec(
     .fetch_optional(&mut *tx)
     .await?
     .ok_or(BindSpecError::SpecNotFound)?;
-    if needs_verification && locked_spec.user_id != *reporter_id {
-        return Err(BindSpecError::SpecNotOwned);
-    }
     let locked_binding = query!(
         r#"
         SELECT b.spec_id,
@@ -139,6 +195,19 @@ pub async fn bind_authoritative_spec(
     )
     .fetch_optional(&mut *tx)
     .await?;
+    // Decided from the locked binding, not from the earlier unlocked read, so
+    // the fail-closed property holds without relying on an invariant elsewhere.
+    let needs_verification = !locked_binding.as_ref().is_some_and(|binding| binding.verified);
+    if needs_verification {
+        if locked_spec.user_id != *reporter_id {
+            return Err(BindSpecError::SpecNotOwned);
+        }
+        if prepared.verified_author != Some(locked_spec.user_id) {
+            return Err(BindSpecError::AuthorVerification(
+                "map author was not verified for this binding attempt".to_string(),
+            ));
+        }
+    }
     let recovering_legacy = locked_binding.as_ref().is_some_and(|binding| !binding.verified);
     if let Some(binding) = &locked_binding {
         if binding.verified && binding.spec_id != requested_spec_id {
@@ -259,6 +328,42 @@ pub async fn bind_authoritative_spec(
     })
 }
 
+/// Both phases back to back. Production takes the per-map lock between them;
+/// this form exists for callers that do not need that separation.
+pub async fn bind_authoritative_spec(
+    pool: &Pool<Postgres>,
+    verifier: &dyn MapAuthorVerifier,
+    reporter_id: &Uuid,
+    map_uid: &str,
+    requested_spec_id: i64,
+) -> Result<AuthoritativeBindResult, BindSpecError> {
+    let prepared = prepare_authoritative_bind(pool, verifier, reporter_id, map_uid, requested_spec_id).await?;
+    commit_authoritative_bind(pool, &prepared, reporter_id, map_uid, requested_spec_id).await
+}
+
+/// Spec id of this map's verified, materialized binding, if it has one. Same
+/// predicate as `resolve_bound_spec`, without a client-supplied spec id to
+/// agree with; used to tell "you own no hats here" apart from "this map has no
+/// usable catalog", which the client must never be told with an empty list.
+pub async fn verified_binding_spec_id(pool: &Pool<Postgres>, map_uid: &str) -> Result<Option<i64>, sqlx::Error> {
+    let row = query!(
+        r#"
+        SELECT b.spec_id
+        FROM map_listing_bind b
+        INNER JOIN custom_map_aux_specs s ON s.id = b.spec_id
+        WHERE b.map_uid = $1
+          AND b.author_verified_at IS NOT NULL
+          AND b.verified_author_id = s.user_id
+          AND b.materialized_spec_updated_at = s.updated_at
+          AND b.materialized_spec_hash = s.spec_hash
+        "#,
+        map_uid
+    )
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|row| row.spec_id))
+}
+
 /// Resolve an already verified binding, treating the client spec id only as a
 /// consistency hint. Unbound, legacy-unverified, and mismatched reports fail
 /// closed without consulting client-selected catalog rows.
@@ -273,7 +378,7 @@ pub async fn resolve_bound_spec(pool: &Pool<Postgres>, map_uid: &str, client_spe
           AND b.author_verified_at IS NOT NULL
           AND b.verified_author_id = s.user_id
           AND b.materialized_spec_updated_at = s.updated_at
-          AND b.materialized_spec_hash = md5(s.spec::text)
+          AND b.materialized_spec_hash = s.spec_hash
         "#,
         map_uid,
         client_spec_id
@@ -295,7 +400,7 @@ pub(crate) async fn lock_materialized_spec(
 ) -> Result<bool, sqlx::Error> {
     let source = query!(
         r#"
-        SELECT user_id, updated_at, md5(spec::text) AS "spec_hash!"
+        SELECT user_id, updated_at, spec_hash
         FROM custom_map_aux_specs
         WHERE id = $1
         FOR SHARE
@@ -345,6 +450,7 @@ pub async fn bind_first_spec(pool: &Pool<Postgres>, map_uid: &str, spec_id: i64)
     Ok(())
 }
 
+#[cfg(test)]
 pub async fn get_bound_spec_id(pool: &Pool<Postgres>, map_uid: &str) -> Result<Option<i64>, sqlx::Error> {
     let row = query!(r#"SELECT spec_id FROM map_listing_bind WHERE map_uid = $1"#, map_uid)
         .fetch_optional(pool)
@@ -352,6 +458,7 @@ pub async fn get_bound_spec_id(pool: &Pool<Postgres>, map_uid: &str) -> Result<O
     Ok(row.map(|r| r.spec_id))
 }
 
+#[cfg(test)]
 pub async fn get_listed_map(pool: &Pool<Postgres>, map_uid: &str) -> Result<Option<DateTime<Utc>>, sqlx::Error> {
     let row = query!(r#"SELECT became_listed FROM listed_maps WHERE map_uid = $1 AND listed"#, map_uid)
         .fetch_optional(pool)
@@ -827,7 +934,7 @@ mod tests {
             r#"
             SELECT b.spec_id, b.verified_author_id,
                    b.materialized_spec_updated_at = s.updated_at AS "revision_matches!",
-                   b.materialized_spec_hash = md5(s.spec::text) AS "hash_matches!"
+                   b.materialized_spec_hash = s.spec_hash AS "hash_matches!"
             FROM map_listing_bind b
             JOIN custom_map_aux_specs s ON s.id = b.spec_id
             WHERE b.map_uid = $1

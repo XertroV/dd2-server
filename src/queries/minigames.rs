@@ -69,15 +69,18 @@ pub fn parse_catalog_games(spec: &Value) -> Result<Vec<CatalogGame>, CatalogVali
             continue;
         };
         let next = kind_counts.get(kind).copied().unwrap_or(0) + 1;
-        let slug = match g.get("slug").and_then(Value::as_str) {
-            Some(slug) => {
+        let slug = match g.get("slug") {
+            None => format!("{kind}-{next}"),
+            Some(value) => {
+                let Some(slug) = value.as_str() else {
+                    return Err(CatalogValidationError::BlankSlug { catalog: "minigame" });
+                };
                 let slug = slug.trim();
                 if slug.is_empty() {
                     return Err(CatalogValidationError::BlankSlug { catalog: "minigame" });
                 }
                 slug.to_string()
             }
-            None => format!("{kind}-{next}"),
         };
         if !seen.insert(slug.clone()) {
             return Err(CatalogValidationError::DuplicateSlug { catalog: "minigame", slug });
@@ -96,6 +99,7 @@ pub fn parse_catalog_games(spec: &Value) -> Result<Vec<CatalogGame>, CatalogVali
 
 /// Replace catalog for a spec row from `spec.minigames.games[]`.
 /// Missing/empty games → delete prior rows for this spec_id.
+#[cfg(test)]
 pub async fn replace_catalog(pool: &Pool<Postgres>, spec_id: i64, user_id: &Uuid, name_id: &str, spec: &Value) -> Result<(), sqlx::Error> {
     let games = parse_catalog_games(spec).map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
     let mut tx = pool.begin().await?;
@@ -152,6 +156,7 @@ pub async fn delete_catalog(pool: &Pool<Postgres>, user_id: &Uuid, name_id: &str
     Ok(())
 }
 
+#[cfg(test)]
 async fn ensure_catalog(pool: &Pool<Postgres>, spec_id: i64) -> Result<(), sqlx::Error> {
     let existing = sqlx::query!(
         r#"--sql
@@ -164,15 +169,7 @@ async fn ensure_catalog(pool: &Pool<Postgres>, spec_id: i64) -> Result<(), sqlx:
     if existing.is_some() {
         return Ok(());
     }
-    let row = sqlx::query!(
-        r#"--sql
-        SELECT user_id, name_id, spec FROM custom_map_aux_specs WHERE id = $1
-        "#,
-        spec_id
-    )
-    .fetch_optional(pool)
-    .await?;
-    let Some(row) = row else {
+    let Some(row) = crate::queries::custom_map_aux_specs::spec_source(pool, spec_id).await? else {
         return Ok(());
     };
     replace_catalog(pool, spec_id, &row.user_id, &row.name_id, &row.spec).await
@@ -180,6 +177,7 @@ async fn ensure_catalog(pool: &Pool<Postgres>, spec_id: i64) -> Result<(), sqlx:
 
 /// Copy all catalog rows for a spec onto `minigame_on_map` for this uid.
 /// Returns whether any rows were bound (unknown spec → false).
+#[cfg(test)]
 pub async fn bind_map_from_catalog(pool: &Pool<Postgres>, map_uid: &str, spec_id: i64) -> Result<bool, sqlx::Error> {
     ensure_catalog(pool, spec_id).await?;
     let mut tx = pool.begin().await?;
@@ -193,6 +191,8 @@ pub(crate) async fn bind_map_from_catalog_in_tx(
     map_uid: &str,
     spec_id: i64,
 ) -> Result<bool, sqlx::Error> {
+    // The delete makes a (map_uid, slug) conflict impossible below, so the
+    // insert deliberately carries no ON CONFLICT clause.
     sqlx::query!("DELETE FROM minigame_on_map WHERE map_uid = $1", map_uid)
         .execute(&mut **tx)
         .await?;
@@ -202,12 +202,6 @@ pub(crate) async fn bind_map_from_catalog_in_tx(
         SELECT $1, c.slug, substring(md5($3 || ':' || c.slug) from 1 for 16), c.kind, c.name, c.user_id, c.name_id
         FROM minigame_catalog c
         WHERE c.spec_id = $2
-        ON CONFLICT (map_uid, slug) DO UPDATE SET
-            minigame_key = EXCLUDED.minigame_key,
-            kind = EXCLUDED.kind,
-            name = EXCLUDED.name,
-            spec_user = EXCLUDED.spec_user,
-            name_id = EXCLUDED.name_id
         "#,
         map_uid,
         spec_id,
@@ -529,10 +523,10 @@ mod tests {
     fn defaults_are_canonical_per_kind_and_advance_for_every_recognized_row() {
         let spec = json!({"minigames":{"games":[
             {"kind":"Sprint"},
-            {"kind":"TimeTrial","slug":17},
+            {"kind":"TimeTrial"},
             {"kind":"PuzzleLocations"},
             {"kind":"Survival"},
-            {"kind":"TimeOffGround","slug":null},
+            {"kind":"TimeOffGround"},
             {"kind":"Darts"},
             {"kind":"JumpAccuracy"},
             {"kind":"HighJump"},
@@ -561,6 +555,22 @@ mod tests {
                 "MaxAvgSpeed-1",
             ]
         );
+    }
+
+    #[test]
+    fn explicit_non_string_slug_invalidates_entire_catalog() {
+        // A silently defaulted slug renames the minigame, which changes
+        // `MD5(mapUid || ':' || slug)` and orphans every PB on it.
+        for bad in [json!(17), json!(null), json!(true), json!([]), json!({})] {
+            let spec = json!({"minigames":{"games":[
+                {"kind":"Sprint","slug":"valid"},
+                {"kind":"TimeTrial","slug": bad}
+            ]}});
+            assert!(matches!(
+                parse_catalog_games(&spec),
+                Err(CatalogValidationError::BlankSlug { catalog: "minigame" })
+            ));
+        }
     }
 
     #[test]
@@ -688,7 +698,7 @@ mod db_tests {
             r#"INSERT INTO map_listing_bind
                    (map_uid, spec_id, verified_author_id, author_verified_at,
                     materialized_spec_updated_at, materialized_spec_hash)
-               SELECT $1, id, user_id, NOW(), updated_at, md5(spec::text)
+               SELECT $1, id, user_id, NOW(), updated_at, spec_hash
                FROM custom_map_aux_specs WHERE id = $2"#,
             map_uid,
             spec_id

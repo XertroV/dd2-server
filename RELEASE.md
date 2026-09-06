@@ -97,6 +97,57 @@ ssh DipsPP-server1 'set -a; source ~/plugin-server/.env; set +a; \
   psql "$DATABASE_URL" -c "SELECT version, description, installed_on FROM _sqlx_migrations ORDER BY version;"'
 ```
 
+## Wayfinder: `20260825130000` disables every existing map binding
+
+`migrations/20260825130000_wayfinder-review-fixes.up.sql` turns the old
+best-effort `map_listing_bind` hint into the single immutable map -> spec
+authority. Two deployment-visible consequences, neither of them a bug:
+
+1. **Rows are deleted, and the down migration cannot bring them back.** The up
+   starts with `DELETE FROM map_listing_bind WHERE spec_id IS NULL OR NOT
+   EXISTS (SELECT 1 FROM custom_map_aux_specs ...)`. Take a dump of
+   `map_listing_bind` before applying if you want any chance of a manual
+   restore.
+
+2. **Every surviving bind is left `verified_author_id IS NULL`, i.e.
+   unverified.** `resolve_bound_spec` fails closed on an unverified binding, so
+   until each map is re-verified the server silently drops *all* of that map's
+   minigame attempts, collectible unlocks/collects and hat unlocks, and
+   withholds the hat reads (213/214).
+
+   **Only the map's author can heal it**, by loading the map so the plugin
+   re-fires request 81: `bind_authoritative_spec` requires both spec ownership
+   and a matching Nadeo map author. Non-authors loading the map do nothing.
+
+   So after this release: tell mappers to load their own maps once. Until they
+   do, silence on those maps is expected, not a regression to debug.
+
+### Migration checksums touched by this release
+
+`20260825130000_wayfinder-review-fixes.up.sql` had its **header comment** edited (the warning above);
+`20260825120000_listed-maps.up.sql` had a `LEAST/GREATEST` -> `CASE` rewrite that is behaviourally
+identical. Both change the sqlx checksum, and sqlx compares checksums for already-applied versions.
+
+Production is unaffected: applied migrations there stop at `20260822163000`, so both versions are
+applied fresh. **Before deploying, confirm no other environment (staging, a colleague's box) already
+has `20260825120000` or `20260825130000` applied** — if one does, `sqlx migrate run` aborts there with
+a version-mismatch and the stored checksum has to be updated by hand:
+
+```bash
+S=$(sha384sum migrations/20260825130000_wayfinder-review-fixes.up.sql | cut -d' ' -f1)
+psql "$DATABASE_URL" -c "UPDATE _sqlx_migrations SET checksum = decode('$S','hex') \
+  WHERE version = 20260825130000;"
+```
+
+The local `dd2_dev` has already been updated this way.
+
+Check what is still unverified:
+
+```bash
+psql "$DATABASE_URL" -c "SELECT map_uid, spec_id FROM map_listing_bind \
+  WHERE author_verified_at IS NULL ORDER BY map_uid;"
+```
+
 ## Other footguns
 
 ### Wrong binary on the wrong host

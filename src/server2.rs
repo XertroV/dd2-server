@@ -17,7 +17,7 @@ use router::{AssetRef, LeaderboardEntry2, Map, PlayerCtx, Request, Response, Sta
 
 use sqlx::{postgres::PgPoolOptions, query, Pool, Postgres};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     error::Error,
     net::SocketAddr,
     str::FromStr,
@@ -189,7 +189,12 @@ pub struct PlayerMgr {
 #[derive(Clone)]
 struct PlayerDelivery {
     tx: UnboundedSender<ToPlayer>,
-    current_map_uid: Arc<Mutex<Option<String>>>,
+    /// Real 27-char UID of the Wayfinder map this connection is on, as reported
+    /// in the bodies of requests 81/213/214. Deliberately not the `ReportContext`
+    /// map id: the plugin only sends the true UID there for Deep Dip maps and
+    /// otherwise sends a 30-char MD5 prefix, so map-scoped hat delivery keyed on
+    /// it would never match on an ordinary Wayfinder map.
+    wayfinder_map_uid: Arc<Mutex<Option<String>>>,
 }
 
 fn delivery_matches_map(current: Option<&str>, target: &str) -> bool {
@@ -206,7 +211,7 @@ async fn deliver_player_mgr_message(players: &mut Vec<PlayerDelivery>, msg: ToPl
         }
         ToPlayerMgr::BroadcastToMap { map_uid, response } => {
             for player in players.iter() {
-                let current = player.current_map_uid.lock().await;
+                let current = player.wayfinder_map_uid.lock().await;
                 if delivery_matches_map(current.as_deref(), &map_uid) {
                     let _ = player.tx.send(ToPlayer::Send(response.clone()));
                 }
@@ -214,6 +219,147 @@ async fn deliver_player_mgr_message(players: &mut Vec<PlayerDelivery>, msg: ToPl
         }
         _ => {}
     }
+}
+
+/// The plugin's `ReportContext` map id for a map it does not consider Deep Dip:
+/// `Crypto::MD5(map.EdChallengeId).SubStr(0, 30)` (`PluginInfo.as:220-227`).
+fn obfuscated_map_uid(map_uid: &str) -> String {
+    use md5::Digest;
+    let mut hasher = md5::Md5::new();
+    hasher.update(map_uid.as_bytes());
+    let mut digest = hex::encode(hasher.finalize());
+    digest.truncate(30);
+    digest
+}
+
+/// Whether a `ReportContext` map id names the map we already track.
+///
+/// The context report and request 81 come from independent plugin coroutines
+/// (`WatchAndSendContextChanges` polls on a ~117ms sleep, `CheckMapChange` runs
+/// every frame), so on a map load either can land first. Treating "the context
+/// string changed" as "the player left the map" would clear the map request 81
+/// just adopted -- and broadcast a spurious leave push -- roughly half the time.
+/// The context id is the true UID on Deep Dip maps and the 30-char MD5 prefix
+/// everywhere else, so both forms have to be recognised.
+fn context_uid_refers_to_map(context_uid: Option<&str>, tracked_map_uid: &str) -> bool {
+    // Short-circuits on the cheap comparison; the hash only runs on an actual
+    // context change, which is at most once per map load per player.
+    // Case-insensitive on the hex: nothing in either repo pins the case of
+    // Openplanet's `Crypto::MD5`, and getting it wrong would silently un-fix
+    // this whole path.
+    matches!(context_uid, Some(uid) if uid == tracked_map_uid || uid.eq_ignore_ascii_case(&obfuscated_map_uid(tracked_map_uid)))
+}
+
+/// Per-connection bookkeeping for deferred hat-unlock validation.
+///
+/// Two separate jobs, deliberately not conflated:
+///
+/// - `owed` records every `(map_uid, slug)` whose 213 answer is still
+///   outstanding. Request 213 for a map with an outstanding entry is withheld
+///   (an inline answer would still read the pre-unlock state), and the
+///   validation that drains the last entry for that map pushes the answer.
+///   Duplicates coalesce. Its bound exists only to stop a client streaming 84s:
+///   the plugin's `RecomputeUnlocks` fires 84 for every newly-satisfied hat in
+///   one synchronous pass, so a batch as large as the map's hat count is
+///   ordinary traffic and must never be discarded.
+/// - `validation_permits` caps how much Nadeo work this connection has running
+///   at once. It is acquired *inside* the spawned task, so a batch that exceeds
+///   it queues instead of being dropped.
+pub struct PendingHatUnlocks {
+    owed: StdMutex<HashSet<(String, String)>>,
+    validation_permits: Arc<Semaphore>,
+}
+
+/// Generous: only a client streaming 84s at socket rate should ever reach it.
+/// Must stay comfortably above the number of hats one map can grant in a single
+/// `RecomputeUnlocks` pass.
+const MAX_PENDING_HAT_UNLOCKS: usize = 16;
+
+/// How many hat validations may touch Nadeo at once, per connection.
+const MAX_CONCURRENT_HAT_VALIDATIONS: usize = 2;
+
+impl Default for PendingHatUnlocks {
+    fn default() -> Self {
+        Self {
+            owed: Default::default(),
+            validation_permits: Arc::new(Semaphore::new(MAX_CONCURRENT_HAT_VALIDATIONS)),
+        }
+    }
+}
+
+impl PendingHatUnlocks {
+    /// `None` when an answer is already owed for this map+hat (the pending
+    /// validation will answer for both), or the connection is over the spam
+    /// bound.
+    fn begin(self: &Arc<Self>, map_uid: &str, slug: &str) -> Option<PendingHatUnlock> {
+        let key = (map_uid.to_string(), slug.to_string());
+        let mut owed = self.owed.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if owed.len() >= MAX_PENDING_HAT_UNLOCKS || !owed.insert(key.clone()) {
+            return None;
+        }
+        Some(PendingHatUnlock {
+            owner: self.clone(),
+            key: Some(key),
+        })
+    }
+
+    fn any_for_map(&self, map_uid: &str) -> bool {
+        self.owed
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .any(|(pending_map, _)| pending_map == map_uid)
+    }
+
+    fn remove(&self, key: &(String, String)) -> bool {
+        let mut owed = self.owed.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        owed.remove(key);
+        !owed.iter().any(|(pending_map, _)| pending_map == &key.0)
+    }
+}
+
+struct PendingHatUnlock {
+    owner: Arc<PendingHatUnlocks>,
+    /// `None` once released; `Drop` then has nothing to do.
+    key: Option<(String, String)>,
+}
+
+impl PendingHatUnlock {
+    /// Release this entry and report whether the map now has no answers owed.
+    ///
+    /// Only the release that drains the map should push the 213: a push issued
+    /// while a sibling validation is still running would report that sibling's
+    /// hat as locked, and the client persists what it is told.
+    fn release(&mut self) -> bool {
+        match self.key.take() {
+            Some(key) => self.owner.remove(&key),
+            None => false,
+        }
+    }
+}
+
+impl Drop for PendingHatUnlock {
+    fn drop(&mut self) {
+        // Covers the unwind path; the normal path has already released.
+        if let Some(key) = self.key.take() {
+            self.owner.remove(&key);
+        }
+    }
+}
+
+/// Spawn detached work whose failure would otherwise be invisible: a panic in a
+/// spawned task is swallowed with the dropped `JoinHandle`, so watch the handle
+/// and log it.
+fn spawn_logged<F>(what: &'static str, task: F)
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    let handle = tokio::spawn(task);
+    tokio::spawn(async move {
+        if let Err(error) = handle.await {
+            warn!("Deferred {} task panicked or was cancelled: {:?}", what, error);
+        }
+    });
 }
 
 fn update_last_map(last: &mut Option<String>, current: Option<&str>) -> bool {
@@ -345,12 +491,12 @@ impl PlayerMgr {
                     };
                     let (stream, permit, addr) = r;
                     let (p_tx, p_rx) = unbounded_channel();
-                    let current_map_uid = Arc::new(Mutex::new(None));
+                    let wayfinder_map_uid = Arc::new(Mutex::new(None));
                     subsys.start(SubsystemBuilder::new("Player", {
-                        let current_map_uid = current_map_uid.clone();
-                        move |a| XPlayer::new(stream, permit, addr, pool, tx, p_rx, current_map_uid).run(a)
+                        let wayfinder_map_uid = wayfinder_map_uid.clone();
+                        move |a| XPlayer::new(stream, permit, addr, pool, tx, p_rx, wayfinder_map_uid).run(a)
                     }));
-                    self.players.lock().await.push(PlayerDelivery { tx: p_tx, current_map_uid });
+                    self.players.lock().await.push(PlayerDelivery { tx: p_tx, wayfinder_map_uid });
                     // let player = Player::new(stream, permit, self.tx.clone());
                 },
             }
@@ -427,8 +573,13 @@ pub struct XPlayer {
     queue_rx: Option<UnboundedReceiver<Response>>,
     pub queue_tx: UnboundedSender<Response>,
 
-    /// The most recent successfully reported context, shared with map-scoped delivery.
-    current_map_uid: Arc<Mutex<Option<String>>>,
+    /// Real UID of the Wayfinder map this connection is on, shared with
+    /// map-scoped delivery. Adopted from the bodies of requests 81/213/214 and
+    /// cleared when a context report shows the player changed map.
+    wayfinder_map_uid: Arc<Mutex<Option<String>>>,
+    /// Hat unlock validations this connection has deferred; bounds the spawned
+    /// work and holds request 213 back until they answer it.
+    pending_hat_unlocks: Arc<PendingHatUnlocks>,
     /// Tracks map transitions for the on-ping automatic responses.
     last_ping_map_uid: Mutex<Option<String>>,
 }
@@ -441,7 +592,7 @@ impl XPlayer {
         pool: Arc<Pool<Postgres>>,
         mgr_tx: UnboundedSender<ToPlayerMgr>,
         p_rx: UnboundedReceiver<ToPlayer>,
-        current_map_uid: Arc<Mutex<Option<String>>>,
+        wayfinder_map_uid: Arc<Mutex<Option<String>>>,
     ) -> Self {
         info!("New player connected: {}", addr.ip().to_string());
         let (queue_tx, queue_rx) = unbounded_channel();
@@ -458,7 +609,8 @@ impl XPlayer {
             ip_address: addr.ip().to_string(),
             queue_rx: Some(queue_rx),
             queue_tx,
-            current_map_uid,
+            wayfinder_map_uid,
+            pending_hat_unlocks: Default::default(),
             last_ping_map_uid: Default::default(),
         }
     }
@@ -570,7 +722,13 @@ impl XPlayer {
         let mut previous_ctx_id = None;
         let session = self.session.get().unwrap().clone();
         let queue_tx = self.queue_tx.clone();
-        let current_map_uid = self.current_map_uid.clone();
+        let wayfinder_map_uid = self.wayfinder_map_uid.clone();
+        let pending_hat_unlocks = self.pending_hat_unlocks.clone();
+        // The `ReportContext` map id, kept only to notice that the player
+        // changed map. It is the true UID on Deep Dip maps and a 30-char MD5
+        // prefix everywhere else, so it can never be compared against a real
+        // Wayfinder UID -- only against its own previous value.
+        let mut context_map_uid: Option<String> = None;
         let user_id = session.user_id();
 
         let session_token = session.session_id();
@@ -619,23 +777,22 @@ impl XPlayer {
                             )
                             .await;
                             if result.is_ok() {
-                                let next_map_uid = map.as_ref().map(|map| map.uid.clone());
-                                let previous_map_uid = {
-                                    let mut tracked_map_uid = current_map_uid.lock().await;
-                                    if tracked_map_uid.as_deref() == next_map_uid.as_deref() {
-                                        None
-                                    } else {
-                                        Some(std::mem::replace(&mut *tracked_map_uid, next_map_uid.clone()))
-                                    }
-                                };
-                                if let Some(previous_map_uid) = previous_map_uid {
-                                    if let Err(error) = XPlayer::broadcast_hat_context_transition(
+                                // A context map change means the player left the
+                                // Wayfinder map they were on -- unless the new
+                                // context id names that same map. Request 81 and
+                                // the context report race on a map load, so a
+                                // context report that merely caught up with a
+                                // map 81 already adopted must not clear it and
+                                // broadcast a spurious leave push.
+                                let context_uid = map.as_ref().map(|map| map.uid.as_str());
+                                if update_last_map(&mut context_map_uid, context_uid) {
+                                    if let Err(error) = XPlayer::apply_context_map_change(
                                         &pool,
                                         &mgr_tx,
+                                        &wayfinder_map_uid,
                                         user_id,
                                         session.display_name(),
-                                        previous_map_uid.as_deref(),
-                                        next_map_uid.as_deref(),
+                                        context_uid,
                                     )
                                     .await
                                     {
@@ -711,7 +868,15 @@ impl XPlayer {
                     elapsed_ms,
                     status,
                 } => XPlayer::report_minigame_attempt(&pool, user_id, uid, slug, spec_id, elapsed_ms, status).await,
-                Request::ReportMinigameMap { uid, spec_id } => XPlayer::report_minigame_map(&pool, &mgr_tx, user_id, uid, spec_id).await,
+                Request::ReportMinigameMap { uid, spec_id } => {
+                    let result = XPlayer::report_minigame_map(&pool, &mgr_tx, user_id, uid.clone(), spec_id).await;
+                    if let Err(error) =
+                        XPlayer::adopt_wayfinder_map(&pool, &mgr_tx, &wayfinder_map_uid, user_id, session.display_name(), &uid).await
+                    {
+                        warn!("Failed to track Wayfinder map {} for user {}: {:?}", uid, user_id, error);
+                    }
+                    result
+                }
                 Request::ReportCollectibleUnlock { uid, slug, spec_id } => {
                     XPlayer::report_collectible_unlock(&pool, user_id, uid, slug, spec_id).await
                 }
@@ -724,10 +889,14 @@ impl XPlayer {
                     z,
                     source,
                 } => XPlayer::report_collectible_collect(&pool, user_id, uid, slug, spec_id, x, y, z, source).await,
-                Request::ReportHatUnlock { uid, slug, spec_id } => XPlayer::report_hat_unlock(&pool, user_id, uid, slug, spec_id).await,
+                Request::ReportHatUnlock { uid, slug, spec_id } => {
+                    XPlayer::report_hat_unlock(&pool, &queue_tx, &pending_hat_unlocks, user_id, uid, slug, spec_id).await
+                }
                 Request::ReportHatEquip { uid, slug } => {
-                    let current = current_map_uid.lock().await.clone();
-                    XPlayer::report_hat_equip(&pool, &mgr_tx, user_id, current.as_deref(), uid, slug).await
+                    // Equips never adopt a map: the player has to already be
+                    // tracked on it through 81/213/214.
+                    let current = wayfinder_map_uid.lock().await.clone();
+                    XPlayer::report_hat_equip(&pool, &mgr_tx, &queue_tx, user_id, current.as_deref(), uid, slug).await
                 }
 
                 // get requests
@@ -781,11 +950,17 @@ impl XPlayer {
                 Request::GetCollectibleList { uid } => XPlayer::send_collectible_list(&pool, &queue_tx, uid).await,
                 Request::GetCollectibleMine { uid } => XPlayer::send_collectible_mine(&pool, &queue_tx, uid, user_id).await,
                 Request::GetHatsMine { uid } => {
-                    let current = current_map_uid.lock().await.clone();
-                    XPlayer::send_hats_mine(&pool, &queue_tx, current.as_deref(), uid, user_id).await
+                    // A failed join push must not suppress the hat response:
+                    // the tracked map has already moved, so fall back to it.
+                    let current =
+                        XPlayer::adopt_wayfinder_map_or_tracked(&pool, &mgr_tx, &wayfinder_map_uid, user_id, session.display_name(), &uid)
+                            .await;
+                    XPlayer::send_hats_mine(&pool, &queue_tx, &pending_hat_unlocks, current.as_deref(), uid, user_id).await
                 }
                 Request::GetHatsOnMap { uid } => {
-                    let current = current_map_uid.lock().await.clone();
+                    let current =
+                        XPlayer::adopt_wayfinder_map_or_tracked(&pool, &mgr_tx, &wayfinder_map_uid, user_id, session.display_name(), &uid)
+                            .await;
                     XPlayer::send_hats_on_map(&pool, &queue_tx, current.as_deref(), uid).await
                 }
 
@@ -1094,7 +1269,10 @@ impl XPlayer {
 
 #[cfg(test)]
 mod wayfinder_delivery_tests {
-    use super::{deliver_player_mgr_message, delivery_matches_map, update_last_map, PlayerDelivery, XPlayer};
+    use super::{
+        context_uid_refers_to_map, deliver_player_mgr_message, delivery_matches_map, obfuscated_map_uid, update_last_map,
+        PendingHatUnlocks, PlayerDelivery, XPlayer, MAX_CONCURRENT_HAT_VALIDATIONS, MAX_PENDING_HAT_UNLOCKS,
+    };
     use crate::nadeo::MapAuthorVerifier;
     use crate::player::ToPlayer;
     use crate::router::{Response, ToPlayerMgr};
@@ -1119,8 +1297,18 @@ mod wayfinder_delivery_tests {
         }
     }
 
-    async fn seed_equipped_hat(pool: &Pool<Postgres>, user_id: &Uuid, map_uid: &str, name_id: &str) -> i64 {
-        let spec = json!({"hats":[{"slug":"Hat-1","unlock":{"finishThisMap":true}}]});
+    /// One `finishThisMap` hat, materialized against a verified binding. No
+    /// unlock: the hat is available but not yet earned.
+    async fn seed_hat_catalog(pool: &Pool<Postgres>, user_id: &Uuid, map_uid: &str, name_id: &str) -> i64 {
+        seed_hat_catalog_slugs(pool, user_id, map_uid, name_id, &["Hat-1"]).await
+    }
+
+    async fn seed_hat_catalog_slugs(pool: &Pool<Postgres>, user_id: &Uuid, map_uid: &str, name_id: &str, slugs: &[&str]) -> i64 {
+        let hats: Vec<_> = slugs
+            .iter()
+            .map(|slug| json!({"slug": slug, "unlock": {"finishThisMap": true}}))
+            .collect();
+        let spec = json!({ "hats": hats });
         let spec_id = crate::queries::custom_map_aux_specs::upsert_spec_and_catalogs(pool, user_id, name_id, &spec)
             .await
             .expect("insert join-broadcast spec");
@@ -1131,7 +1319,7 @@ mod wayfinder_delivery_tests {
             r#"INSERT INTO map_listing_bind
                    (map_uid, spec_id, verified_author_id, author_verified_at,
                     materialized_spec_updated_at, materialized_spec_hash)
-               SELECT $1, id, user_id, NOW(), updated_at, md5(spec::text)
+               SELECT $1, id, user_id, NOW(), updated_at, spec_hash
                FROM custom_map_aux_specs WHERE id = $2"#,
             map_uid,
             spec_id
@@ -1139,6 +1327,11 @@ mod wayfinder_delivery_tests {
         .execute(pool)
         .await
         .expect("mark join-broadcast snapshot materialized");
+        spec_id
+    }
+
+    async fn seed_unlocked_hat(pool: &Pool<Postgres>, user_id: &Uuid, map_uid: &str, name_id: &str) -> i64 {
+        let spec_id = seed_hat_catalog(pool, user_id, map_uid, name_id).await;
         sqlx::query!(
             r#"INSERT INTO hat_unlock (user_id, hat_key, map_uid, slug, unlocked_at)
                VALUES ($1, substring(md5($2 || ':h:Hat-1') from 1 for 16), $2, 'Hat-1', NOW())"#,
@@ -1148,11 +1341,873 @@ mod wayfinder_delivery_tests {
         .execute(pool)
         .await
         .expect("insert join-broadcast unlock");
+        spec_id
+    }
+
+    async fn seed_equipped_hat(pool: &Pool<Postgres>, user_id: &Uuid, map_uid: &str, name_id: &str) -> i64 {
+        let spec_id = seed_unlocked_hat(pool, user_id, map_uid, name_id).await;
         assert!(crate::queries::hats::report_equip(pool, user_id, map_uid, "Hat-1")
             .await
             .expect("persist equipped hat")
             .is_some());
         spec_id
+    }
+
+    async fn seed_user(pool: &Pool<Postgres>, display_name: &str) -> Uuid {
+        let user_id = Uuid::now_v7();
+        sqlx::query!(
+            "INSERT INTO users (web_services_user_id, display_name) VALUES ($1, $2)",
+            user_id,
+            display_name
+        )
+        .execute(pool)
+        .await
+        .expect("insert test user");
+        user_id
+    }
+
+    /// The plugin's `ReportContext` map id for any map not named like Deep Dip.
+    async fn context_uid_for(pool: &Pool<Postgres>, map_uid: &str) -> String {
+        sqlx::query!(r#"SELECT substring(md5($1) from 1 for 30) AS "prefix!""#, map_uid)
+            .fetch_one(pool)
+            .await
+            .expect("compute context uid")
+            .prefix
+    }
+
+    /// The plugin obfuscates the map id in `ReportContext` unless the map looks
+    /// like Deep Dip, so a context report naming the map already tracked can
+    /// arrive in either form. Both must read as "same map".
+    #[test]
+    fn context_uid_recognises_both_forms_of_the_tracked_map() {
+        let map_uid = "SomeWayfinderMapUid00000000";
+        let obfuscated = obfuscated_map_uid(map_uid);
+        assert_eq!(obfuscated.len(), 30);
+        assert!(context_uid_refers_to_map(Some(map_uid), map_uid), "true uid (Deep Dip maps)");
+        assert!(
+            context_uid_refers_to_map(Some(&obfuscated), map_uid),
+            "md5 prefix (every other map)"
+        );
+        assert!(
+            context_uid_refers_to_map(Some(&obfuscated.to_ascii_uppercase()), map_uid),
+            "Openplanet's Crypto::MD5 hex case is not pinned anywhere, so the compare is case-insensitive"
+        );
+        assert!(!context_uid_refers_to_map(Some("AnotherWayfinderMapUid00000"), map_uid));
+        assert!(
+            !context_uid_refers_to_map(Some(&obfuscated_map_uid("AnotherWayfinderMapUid00000")), map_uid),
+            "another map's md5 prefix is a real change"
+        );
+        assert!(!context_uid_refers_to_map(None, map_uid), "no map means the player left");
+    }
+
+    /// H2: request 81 and the context report race on a map load. A context
+    /// report that catches up with the map 81 already adopted must not clear
+    /// the tracked map or broadcast a leave push.
+    #[tokio::test]
+    async fn context_report_for_the_tracked_map_does_not_clear_it() {
+        dotenv::dotenv().ok();
+        let url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set for delivery tests");
+        let pool = PgPoolOptions::new().max_connections(3).connect(&url).await.expect("connect");
+        let user_id = seed_user(&pool, "context-race-player").await;
+        let suffix = Uuid::new_v4().simple().to_string();
+        let map_uid: String = format!("CtxRace{suffix}").chars().take(27).collect();
+        let other_map_uid: String = format!("CtxOther{suffix}").chars().take(27).collect();
+        let name_id = format!("ctx-race-{}", &suffix[..8]);
+        seed_equipped_hat(&pool, &user_id, &map_uid, &name_id).await;
+
+        let tracked: Arc<tokio::sync::Mutex<Option<String>>> = Arc::new(tokio::sync::Mutex::new(None));
+        let (mgr_tx, mut mgr_rx) = unbounded_channel();
+
+        // Request 81 lands first and adopts the real uid (join push).
+        XPlayer::adopt_wayfinder_map(&pool, &mgr_tx, &tracked, &user_id, "context-race-player", &map_uid)
+            .await
+            .expect("adopt from request 81");
+        assert!(mgr_rx.try_recv().is_ok(), "join push for the equipped hat");
+
+        // The context report for the same map arrives afterwards, obfuscated.
+        let obfuscated = obfuscated_map_uid(&map_uid);
+        assert_eq!(
+            obfuscated,
+            context_uid_for(&pool, &map_uid).await,
+            "server reproduces the plugin's obfuscation"
+        );
+        assert_eq!(
+            XPlayer::apply_context_map_change(&pool, &mgr_tx, &tracked, &user_id, "context-race-player", Some(&obfuscated))
+                .await
+                .expect("obfuscated context for the tracked map"),
+            Some(map_uid.clone())
+        );
+        assert!(
+            mgr_rx.try_recv().is_err(),
+            "a context report that caught up with request 81 must not broadcast a leave push"
+        );
+
+        // The unobfuscated form (Deep Dip named maps) is equally a no-op.
+        assert_eq!(
+            XPlayer::apply_context_map_change(&pool, &mgr_tx, &tracked, &user_id, "context-race-player", Some(&map_uid))
+                .await
+                .expect("true-uid context for the tracked map"),
+            Some(map_uid.clone())
+        );
+        assert!(mgr_rx.try_recv().is_err());
+        assert_eq!(tracked.lock().await.as_deref(), Some(map_uid.as_str()));
+
+        // A genuine map change still clears and pushes the leave event.
+        assert_eq!(
+            XPlayer::apply_context_map_change(
+                &pool,
+                &mgr_tx,
+                &tracked,
+                &user_id,
+                "context-race-player",
+                Some(&obfuscated_map_uid(&other_map_uid)),
+            )
+            .await
+            .expect("real map change"),
+            None
+        );
+        match mgr_rx.try_recv().expect("real map change emits the leave push") {
+            ToPlayerMgr::BroadcastToMap {
+                map_uid: target,
+                response: Response::HatsOnMapUpdate { hats, .. },
+            } => {
+                assert_eq!(target, map_uid);
+                assert!(hats[0].slug.is_empty(), "leave push unequips");
+            }
+            _ => panic!("unexpected broadcast"),
+        }
+        assert!(tracked.lock().await.is_none());
+
+        sqlx::query!("DELETE FROM map_listing_bind WHERE map_uid = $1", map_uid)
+            .execute(&pool)
+            .await
+            .expect("cleanup context-race binding");
+        sqlx::query!("DELETE FROM users WHERE web_services_user_id = $1", user_id)
+            .execute(&pool)
+            .await
+            .expect("cleanup context-race player");
+    }
+
+    struct SlowRecordVerifier {
+        delay: Duration,
+        started: Arc<Notify>,
+    }
+
+    impl crate::nadeo::OfficialRecordVerifier for SlowRecordVerifier {
+        fn has_official_record<'a>(
+            &'a self,
+            _account_id: &'a Uuid,
+            _map_uid: &'a str,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, String>> + Send + 'a>> {
+            Box::pin(async move {
+                self.started.notify_one();
+                sleep(self.delay).await;
+                Ok(true)
+            })
+        }
+    }
+
+    /// H1: the plugin pushes 84 and 213 back to back on one FIFO and treats the
+    /// 213 as authoritative, persisting anything it reports as locked. With the
+    /// validation deferred, the inline 213 would read the pre-unlock state, so
+    /// it is withheld and the validation answers it once the unlock commits.
+    #[tokio::test]
+    async fn deferred_unlock_answers_the_213_that_followed_it() {
+        dotenv::dotenv().ok();
+        let url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set for delivery tests");
+        let pool = PgPoolOptions::new().max_connections(4).connect(&url).await.expect("connect");
+        let user_id = seed_user(&pool, "deferred-unlock-player").await;
+        let suffix = Uuid::new_v4().simple().to_string();
+        let map_uid: String = format!("DeferUnlock{suffix}").chars().take(27).collect();
+        let name_id = format!("defer-{}", &suffix[..8]);
+        let spec_id = seed_hat_catalog(&pool, &user_id, &map_uid, &name_id).await;
+
+        let pending: Arc<PendingHatUnlocks> = Default::default();
+        let (queue_tx, mut queue_rx) = unbounded_channel();
+        let started = Arc::new(Notify::new());
+        let verifier: Arc<dyn crate::nadeo::OfficialRecordVerifier> = Arc::new(SlowRecordVerifier {
+            delay: Duration::from_millis(400),
+            started: started.clone(),
+        });
+
+        // Request 84.
+        XPlayer::report_hat_unlock_with_verifier(
+            &pool,
+            verifier,
+            &queue_tx,
+            &pending,
+            &user_id,
+            map_uid.clone(),
+            "Hat-1".into(),
+            spec_id,
+        )
+        .await
+        .expect("84 is accepted and deferred");
+        timeout(Duration::from_secs(5), started.notified())
+            .await
+            .expect("validation actually started");
+        assert!(pending.any_for_map(&map_uid), "the validation is registered as in flight");
+
+        // Request 213, dequeued while the validation is still running. Answering
+        // it now would tell the client the hat is locked and it would persist that.
+        XPlayer::send_hats_mine(&pool, &queue_tx, &pending, Some(&map_uid), map_uid.clone(), &user_id)
+            .await
+            .expect("213 is handled");
+        assert!(
+            queue_rx.try_recv().is_err(),
+            "213 must be withheld while its 84 is still being validated"
+        );
+
+        // The validation's completion push is the answer, and it reports the unlock.
+        match timeout(Duration::from_secs(10), queue_rx.recv())
+            .await
+            .expect("the deferred validation answers the 213")
+            .expect("channel stays open")
+        {
+            Response::HatsMine { uid, items, .. } => {
+                assert_eq!(uid, map_uid);
+                assert_eq!(items.len(), 1);
+                assert_eq!(items[0].slug, "Hat-1");
+                assert!(items[0].unlocked_at.is_some(), "the client must end up unlocked, not relocked");
+            }
+            other => panic!("unexpected response: {:?}", other.name()),
+        }
+        assert!(!pending.any_for_map(&map_uid), "the in-flight guard is released");
+
+        // With nothing pending, 213 is answered inline again.
+        XPlayer::send_hats_mine(&pool, &queue_tx, &pending, Some(&map_uid), map_uid.clone(), &user_id)
+            .await
+            .expect("213 is answered once nothing is pending");
+        assert!(matches!(
+            queue_rx.try_recv().expect("inline 213"),
+            Response::HatsMine { ref uid, .. } if uid == &map_uid
+        ));
+
+        sqlx::query!("DELETE FROM map_listing_bind WHERE map_uid = $1", map_uid)
+            .execute(&pool)
+            .await
+            .expect("cleanup deferred-unlock binding");
+        sqlx::query!("DELETE FROM users WHERE web_services_user_id = $1", user_id)
+            .execute(&pool)
+            .await
+            .expect("cleanup deferred-unlock player");
+    }
+
+    /// M1: a client streaming 84s must not be able to spawn unbounded work.
+    #[tokio::test]
+    async fn concurrent_unlock_validations_are_bounded_and_coalesced() {
+        dotenv::dotenv().ok();
+        let url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set for delivery tests");
+        let pool = PgPoolOptions::new().max_connections(4).connect(&url).await.expect("connect");
+        let user_id = seed_user(&pool, "unlock-flood-player").await;
+        let suffix = Uuid::new_v4().simple().to_string();
+        let map_uid: String = format!("Flood{suffix}").chars().take(27).collect();
+        let name_id = format!("flood-{}", &suffix[..8]);
+        let spec_id = seed_hat_catalog(&pool, &user_id, &map_uid, &name_id).await;
+
+        let pending: Arc<PendingHatUnlocks> = Default::default();
+        let (queue_tx, mut queue_rx) = unbounded_channel();
+        let started = Arc::new(Notify::new());
+        let verifier: Arc<dyn crate::nadeo::OfficialRecordVerifier> = Arc::new(SlowRecordVerifier {
+            delay: Duration::from_millis(300),
+            started: started.clone(),
+        });
+
+        for _ in 0..8 {
+            XPlayer::report_hat_unlock_with_verifier(
+                &pool,
+                verifier.clone(),
+                &queue_tx,
+                &pending,
+                &user_id,
+                map_uid.clone(),
+                "Hat-1".into(),
+                spec_id,
+            )
+            .await
+            .expect("84 flood is accepted");
+        }
+        assert_eq!(
+            pending.owed.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).len(),
+            1,
+            "repeats of the same map+hat coalesce onto the pending validation"
+        );
+
+        // Exactly one validation ran, so exactly one completion push arrives.
+        assert!(matches!(
+            timeout(Duration::from_secs(10), queue_rx.recv())
+                .await
+                .expect("the single validation answers")
+                .expect("channel stays open"),
+            Response::HatsMine { .. }
+        ));
+        timeout(Duration::from_secs(5), async {
+            while pending.any_for_map(&map_uid) {
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("in-flight guard released");
+        assert!(queue_rx.try_recv().is_err(), "coalesced 84s do not each push a 213");
+
+        sqlx::query!("DELETE FROM map_listing_bind WHERE map_uid = $1", map_uid)
+            .execute(&pool)
+            .await
+            .expect("cleanup flood binding");
+        sqlx::query!("DELETE FROM users WHERE web_services_user_id = $1", user_id)
+            .execute(&pool)
+            .await
+            .expect("cleanup flood player");
+    }
+
+    struct PanickingRecordVerifier;
+
+    impl crate::nadeo::OfficialRecordVerifier for PanickingRecordVerifier {
+        fn has_official_record<'a>(
+            &'a self,
+            _account_id: &'a Uuid,
+            _map_uid: &'a str,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, String>> + Send + 'a>> {
+            Box::pin(async move { panic!("deliberate validation panic") })
+        }
+    }
+
+    /// L5: a validation that panics still owes the 213 it caused to be
+    /// withheld. Without an answer the client keeps its optimistic state until
+    /// it happens to send another 213 -- next equip, unlock, or map load.
+    #[tokio::test]
+    async fn a_panicking_validation_still_answers_the_withheld_213() {
+        dotenv::dotenv().ok();
+        let url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set for delivery tests");
+        let pool = PgPoolOptions::new().max_connections(3).connect(&url).await.expect("connect");
+        let user_id = seed_user(&pool, "panicking-validation-player").await;
+        let suffix = Uuid::new_v4().simple().to_string();
+        let map_uid: String = format!("Panic{suffix}").chars().take(27).collect();
+        let name_id = format!("panic-{}", &suffix[..8]);
+        let spec_id = seed_hat_catalog(&pool, &user_id, &map_uid, &name_id).await;
+
+        let pending: Arc<PendingHatUnlocks> = Default::default();
+        let (queue_tx, mut queue_rx) = unbounded_channel();
+        let verifier: Arc<dyn crate::nadeo::OfficialRecordVerifier> = Arc::new(PanickingRecordVerifier);
+
+        XPlayer::report_hat_unlock_with_verifier(
+            &pool,
+            verifier,
+            &queue_tx,
+            &pending,
+            &user_id,
+            map_uid.clone(),
+            "Hat-1".into(),
+            spec_id,
+        )
+        .await
+        .expect("84 is accepted");
+
+        match timeout(Duration::from_secs(20), queue_rx.recv())
+            .await
+            .expect("a panicking validation still answers the withheld 213")
+            .expect("channel stays open")
+        {
+            Response::HatsMine { uid, items, .. } => {
+                assert_eq!(uid, map_uid);
+                assert_eq!(items.len(), 1);
+                assert!(items[0].unlocked_at.is_none(), "the panicking validation granted nothing");
+            }
+            other => panic!("unexpected response: {:?}", other.name()),
+        }
+        timeout(Duration::from_secs(5), async {
+            while pending.any_for_map(&map_uid) {
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the pending entry is released");
+
+        sqlx::query!("DELETE FROM map_listing_bind WHERE map_uid = $1", map_uid)
+            .execute(&pool)
+            .await
+            .expect("cleanup panic binding");
+        sqlx::query!("DELETE FROM users WHERE web_services_user_id = $1", user_id)
+            .execute(&pool)
+            .await
+            .expect("cleanup panic player");
+    }
+
+    /// H3/L4: the pending set is "an answer is owed", not a concurrency cap. A
+    /// normal multi-hat batch must never be refused, and only the release that
+    /// drains a map may push the answer.
+    #[test]
+    fn pending_hat_unlocks_dedupe_bound_and_drain() {
+        let pending: Arc<PendingHatUnlocks> = Default::default();
+        let mut owed: Vec<_> = (0..MAX_PENDING_HAT_UNLOCKS)
+            .map(|i| {
+                pending
+                    .begin("map-a", &format!("Hat-{i}"))
+                    .expect("a multi-hat batch is queued, never refused")
+            })
+            .collect();
+        assert!(
+            MAX_PENDING_HAT_UNLOCKS > MAX_CONCURRENT_HAT_VALIDATIONS,
+            "the spam bound must not double as the Nadeo concurrency cap"
+        );
+        assert!(pending.begin("map-a", "Hat-0").is_none(), "a repeat coalesces");
+        assert!(pending.begin("map-a", "Hat-spam").is_none(), "the spam bound still applies");
+        assert!(pending.any_for_map("map-a"));
+        assert!(!pending.any_for_map("map-b"));
+
+        // Only the final release drains the map, so only it pushes the 213.
+        let last = owed.len() - 1;
+        for (index, entry) in owed.iter_mut().enumerate() {
+            assert_eq!(
+                entry.release(),
+                index == last,
+                "a release with siblings still pending must not push"
+            );
+            assert!(!entry.release(), "releasing twice is a no-op");
+        }
+        assert!(!pending.any_for_map("map-a"));
+
+        // Dropping without releasing still clears the entry.
+        {
+            let _dropped = pending.begin("map-a", "Hat-0").expect("re-registers after draining");
+            assert!(pending.any_for_map("map-a"));
+        }
+        assert!(!pending.any_for_map("map-a"));
+    }
+
+    /// H3: `RecomputeUnlocks` fires 84 for every newly-satisfied hat in one
+    /// synchronous pass, so a map granting three hats at once is ordinary
+    /// traffic. None may be discarded, and no push may report one of them as
+    /// locked -- the client persists whatever the 213 says.
+    #[tokio::test]
+    async fn a_batch_of_distinct_hat_unlocks_is_queued_not_dropped() {
+        dotenv::dotenv().ok();
+        let url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set for delivery tests");
+        let pool = PgPoolOptions::new().max_connections(4).connect(&url).await.expect("connect");
+        let user_id = seed_user(&pool, "batch-unlock-player").await;
+        let suffix = Uuid::new_v4().simple().to_string();
+        let map_uid: String = format!("Batch{suffix}").chars().take(27).collect();
+        let name_id = format!("batch-{}", &suffix[..8]);
+        let slugs = ["Hat-1", "Hat-2", "Hat-3"];
+        assert!(
+            slugs.len() > MAX_CONCURRENT_HAT_VALIDATIONS,
+            "the batch has to exceed the Nadeo concurrency cap to be a regression test"
+        );
+        let spec_id = seed_hat_catalog_slugs(&pool, &user_id, &map_uid, &name_id, &slugs).await;
+
+        let pending: Arc<PendingHatUnlocks> = Default::default();
+        let (queue_tx, mut queue_rx) = unbounded_channel();
+        let verifier: Arc<dyn crate::nadeo::OfficialRecordVerifier> = Arc::new(SlowRecordVerifier {
+            delay: Duration::from_millis(150),
+            started: Arc::new(Notify::new()),
+        });
+
+        // What the plugin actually sends: 84 then 213, per newly-met hat.
+        for slug in slugs {
+            XPlayer::report_hat_unlock_with_verifier(
+                &pool,
+                verifier.clone(),
+                &queue_tx,
+                &pending,
+                &user_id,
+                map_uid.clone(),
+                slug.into(),
+                spec_id,
+            )
+            .await
+            .expect("84 is accepted");
+            XPlayer::send_hats_mine(&pool, &queue_tx, &pending, Some(&map_uid), map_uid.clone(), &user_id)
+                .await
+                .expect("213 is handled");
+        }
+        assert_eq!(
+            pending.owed.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).len(),
+            slugs.len(),
+            "every distinct hat in the batch is queued"
+        );
+
+        // The batch drains into exactly one push, and it must not report any of
+        // the three as locked.
+        let mut pushes = 0;
+        let first = timeout(Duration::from_secs(20), queue_rx.recv())
+            .await
+            .expect("the batch answers the withheld 213s")
+            .expect("channel stays open");
+        let mut check = |response: Response| match response {
+            Response::HatsMine { uid, items, .. } => {
+                assert_eq!(uid, map_uid);
+                assert_eq!(items.len(), slugs.len());
+                for item in &items {
+                    assert!(
+                        item.unlocked_at.is_some(),
+                        "a push reported {} as locked; the client would persist that",
+                        item.slug
+                    );
+                }
+                pushes += 1;
+            }
+            other => panic!("unexpected response: {:?}", other.name()),
+        };
+        check(first);
+        sleep(Duration::from_millis(400)).await;
+        while let Ok(response) = queue_rx.try_recv() {
+            check(response);
+        }
+        assert_eq!(pushes, 1, "only the release that drains the map pushes");
+
+        let unlocked = sqlx::query!(
+            "SELECT slug FROM hat_unlock WHERE user_id = $1 AND map_uid = $2 ORDER BY slug",
+            user_id,
+            map_uid
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("read unlocks");
+        assert_eq!(
+            unlocked.iter().map(|row| row.slug.as_str()).collect::<Vec<_>>(),
+            slugs,
+            "every hat in the batch is validated and written"
+        );
+
+        sqlx::query!("DELETE FROM map_listing_bind WHERE map_uid = $1", map_uid)
+            .execute(&pool)
+            .await
+            .expect("cleanup batch binding");
+        sqlx::query!("DELETE FROM users WHERE web_services_user_id = $1", user_id)
+            .execute(&pool)
+            .await
+            .expect("cleanup batch player");
+    }
+
+    /// M2: the deferred first-bind path (81 on a map that still needs Nadeo
+    /// author verification) has to actually land the binding.
+    #[tokio::test]
+    async fn deferred_first_bind_materializes_the_map() {
+        dotenv::dotenv().ok();
+        let url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set for delivery tests");
+        let pool = PgPoolOptions::new().max_connections(3).connect(&url).await.expect("connect");
+        let user_id = seed_user(&pool, "deferred-bind-author").await;
+        let suffix = Uuid::new_v4().simple().to_string();
+        let map_uid: String = format!("DeferBind{suffix}").chars().take(27).collect();
+        let name_id = format!("defer-bind-{}", &suffix[..8]);
+        let spec = json!({"hats":[{"slug":"Hat-1","unlock":{"finishThisMap":true}}]});
+        let spec_id = crate::queries::custom_map_aux_specs::upsert_spec_and_catalogs(&pool, &user_id, &name_id, &spec)
+            .await
+            .expect("insert deferred-bind spec");
+
+        assert!(
+            crate::queries::listed_maps::bind_requires_author_verification(&pool, &user_id, &map_uid, spec_id)
+                .await
+                .expect("verification is required for a first bind"),
+            "an unbound map owned by the reporter must take the deferred path"
+        );
+
+        let (mgr_tx, _mgr_rx) = unbounded_channel();
+        let verifier: Arc<dyn MapAuthorVerifier> = Arc::new(FixedAuthorVerifier(user_id));
+        XPlayer::report_minigame_map_deferring(&pool, &mgr_tx, verifier, &user_id, map_uid.clone(), spec_id)
+            .await
+            .expect("81 is accepted and deferred");
+
+        timeout(Duration::from_secs(10), async {
+            loop {
+                if crate::queries::listed_maps::verified_binding_spec_id(&pool, &map_uid)
+                    .await
+                    .expect("read binding")
+                    .is_some()
+                {
+                    return;
+                }
+                sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the deferred bind materializes the map");
+        assert_eq!(
+            crate::queries::listed_maps::verified_binding_spec_id(&pool, &map_uid)
+                .await
+                .expect("read binding"),
+            Some(spec_id)
+        );
+        assert!(
+            !crate::queries::listed_maps::bind_requires_author_verification(&pool, &user_id, &map_uid, spec_id)
+                .await
+                .expect("verification no longer required"),
+            "a verified binding takes the inline path on the next report"
+        );
+
+        sqlx::query!("DELETE FROM map_listing_bind WHERE map_uid = $1", map_uid)
+            .execute(&pool)
+            .await
+            .expect("cleanup deferred-bind binding");
+        sqlx::query!("DELETE FROM users WHERE web_services_user_id = $1", user_id)
+            .execute(&pool)
+            .await
+            .expect("cleanup deferred-bind author");
+    }
+
+    /// The whole hat surface used to be gated on the `ReportContext` map id,
+    /// which is a 30-char MD5 prefix on every map that is not Deep Dip. That
+    /// made hats dead on exactly the Wayfinder maps they target. The real UID
+    /// arrives in the bodies of 81/213/214, and that is what the gate, the
+    /// broadcasts and the leave push now key on.
+    #[tokio::test]
+    async fn hat_surface_works_when_the_context_uid_is_an_md5_prefix() {
+        dotenv::dotenv().ok();
+        let url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set for delivery tests");
+        let pool = PgPoolOptions::new().max_connections(3).connect(&url).await.expect("connect");
+        let user_id = seed_user(&pool, "md5-context-player").await;
+        let suffix = Uuid::new_v4().simple().to_string();
+        let map_uid: String = format!("HatMd5Ctx{suffix}").chars().take(27).collect();
+        let name_id = format!("hat-md5-{}", &suffix[..8]);
+        seed_unlocked_hat(&pool, &user_id, &map_uid, &name_id).await;
+        sqlx::query!(
+            r#"INSERT INTO map_curr_heights (map_uid, user_id, height, pos, race_time)
+               VALUES ($1, $2, 0.0, ARRAY[0.0, 0.0, 0.0], 0)"#,
+            map_uid,
+            user_id
+        )
+        .execute(&pool)
+        .await
+        .expect("mark player present on map");
+
+        let context_uid = context_uid_for(&pool, &map_uid).await;
+        assert_eq!(context_uid.len(), 30);
+        assert_ne!(context_uid, map_uid);
+
+        let tracked: Arc<tokio::sync::Mutex<Option<String>>> = Arc::new(tokio::sync::Mutex::new(None));
+        let pending: Arc<PendingHatUnlocks> = Default::default();
+        let (mgr_tx, mut mgr_rx) = unbounded_channel();
+        let (queue_tx, mut queue_rx) = unbounded_channel();
+
+        // A context report never supplies a real UID, so it must not be adopted.
+        assert_eq!(
+            XPlayer::adopt_wayfinder_map(&pool, &mgr_tx, &tracked, &user_id, "md5-context-player", &context_uid)
+                .await
+                .expect("context uid is ignored"),
+            None
+        );
+        assert!(mgr_rx.try_recv().is_err());
+
+        // Request 81 carries the true UID.
+        let current = XPlayer::adopt_wayfinder_map(&pool, &mgr_tx, &tracked, &user_id, "md5-context-player", &map_uid)
+            .await
+            .expect("adopt real map uid");
+        assert_eq!(current.as_deref(), Some(map_uid.as_str()));
+        assert!(mgr_rx.try_recv().is_err(), "nothing is equipped yet, so no join push");
+
+        // 213 is answered rather than silently dropped.
+        XPlayer::send_hats_mine(&pool, &queue_tx, &pending, current.as_deref(), map_uid.clone(), &user_id)
+            .await
+            .expect("send hats mine");
+        match queue_rx.try_recv().expect("213 is answered on an md5-context map") {
+            Response::HatsMine { uid, equipped, items } => {
+                assert_eq!(uid, map_uid);
+                assert!(equipped.is_empty());
+                assert_eq!(items.len(), 1);
+                assert_eq!(items[0].slug, "Hat-1");
+                assert!(items[0].unlocked_at.is_some());
+            }
+            other => panic!("unexpected 213 response: {:?}", other.name()),
+        }
+
+        // 85 equips and broadcasts to the real map uid.
+        XPlayer::report_hat_equip(
+            &pool,
+            &mgr_tx,
+            &queue_tx,
+            &user_id,
+            current.as_deref(),
+            map_uid.clone(),
+            "Hat-1".into(),
+        )
+        .await
+        .expect("equip on an md5-context map");
+        match mgr_rx.try_recv().expect("equip broadcasts") {
+            ToPlayerMgr::BroadcastToMap {
+                map_uid: target,
+                response: Response::HatsOnMapUpdate { uid, hats },
+            } => {
+                assert_eq!(target, map_uid);
+                assert_eq!(uid, map_uid);
+                assert_eq!(hats[0].slug, "Hat-1");
+            }
+            _ => panic!("unexpected equip broadcast"),
+        }
+
+        // 214 is answered too.
+        XPlayer::send_hats_on_map(&pool, &queue_tx, current.as_deref(), map_uid.clone())
+            .await
+            .expect("send hats on map");
+        match queue_rx.try_recv().expect("214 is answered on an md5-context map") {
+            Response::HatsOnMap { uid, hats } => {
+                assert_eq!(uid, map_uid);
+                assert_eq!(hats.len(), 1);
+                assert_eq!(hats[0].wsid, user_id.to_string());
+                assert_eq!(hats[0].slug, "Hat-1");
+            }
+            other => panic!("unexpected 214 response: {:?}", other.name()),
+        }
+
+        // A context map change clears the tracked map, which is what fires the
+        // leave push for the map the player actually left.
+        assert_eq!(
+            XPlayer::set_wayfinder_map(&pool, &mgr_tx, &tracked, &user_id, "md5-context-player", None)
+                .await
+                .expect("context change clears the tracked map"),
+            None
+        );
+        match mgr_rx.try_recv().expect("leave push fires") {
+            ToPlayerMgr::BroadcastToMap {
+                map_uid: target,
+                response: Response::HatsOnMapUpdate { uid, hats },
+            } => {
+                assert_eq!(target, map_uid);
+                assert_eq!(uid, map_uid);
+                assert!(hats[0].slug.is_empty(), "leave push unequips");
+            }
+            _ => panic!("unexpected leave broadcast"),
+        }
+        assert!(tracked.lock().await.is_none());
+
+        // An unbound map must be answered with silence, never an empty 213.
+        sqlx::query!("DELETE FROM map_listing_bind WHERE map_uid = $1", map_uid)
+            .execute(&pool)
+            .await
+            .expect("drop binding");
+        XPlayer::send_hats_mine(&pool, &queue_tx, &pending, Some(&map_uid), map_uid.clone(), &user_id)
+            .await
+            .expect("send hats mine without a binding");
+        assert!(
+            queue_rx.try_recv().is_err(),
+            "an unbound map must withhold 213, not answer it with an empty list"
+        );
+
+        sqlx::query!("DELETE FROM users WHERE web_services_user_id = $1", user_id)
+            .execute(&pool)
+            .await
+            .expect("cleanup md5-context player");
+    }
+
+    /// Catalog validation now rejects the whole spec. Without a failure
+    /// `TaskResponse` the editor's save never resolves.
+    #[tokio::test]
+    async fn invalid_catalog_answers_the_mapper_with_the_validation_error() {
+        dotenv::dotenv().ok();
+        let url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set for delivery tests");
+        let pool = PgPoolOptions::new().max_connections(2).connect(&url).await.expect("connect");
+        let user_id = seed_user(&pool, "spec-validation-mapper").await;
+        let name_id = format!("spec-invalid-{}", &Uuid::new_v4().simple().to_string()[..8]);
+        let (queue_tx, mut queue_rx) = unbounded_channel();
+
+        let good = json!({"hats":[{"slug":"Hat-1","unlock":{"finishThisMap":true}}]});
+        XPlayer::report_custom_map_aux_spec(&pool, 11, &user_id, &name_id, &good, &queue_tx)
+            .await
+            .expect("handler completes");
+        assert!(matches!(
+            queue_rx.try_recv().expect("save is acknowledged"),
+            Response::TaskResponse {
+                id: 11,
+                success: true,
+                error: None
+            }
+        ));
+
+        let duplicate = json!({"hats":[
+            {"slug":"Hat-1","unlock":{"finishThisMap":true}},
+            {"slug":" Hat-1 ","unlock":{"finishThisMap":true}}
+        ]});
+        XPlayer::report_custom_map_aux_spec(&pool, 12, &user_id, &name_id, &duplicate, &queue_tx)
+            .await
+            .expect("handler completes");
+        match queue_rx.try_recv().expect("a rejected save still answers the editor") {
+            Response::TaskResponse { id, success, error } => {
+                assert_eq!(id, 12);
+                assert!(!success);
+                let error = error.expect("rejection carries a reason");
+                assert!(error.contains("duplicate hat slug"), "unhelpful reason: {error}");
+            }
+            other => panic!("unexpected response: {:?}", other.name()),
+        }
+        let stored = sqlx::query!(
+            "SELECT spec FROM custom_map_aux_specs WHERE user_id = $1 AND name_id = $2",
+            user_id,
+            name_id
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("previous spec survives");
+        assert_eq!(stored.spec, good);
+
+        sqlx::query!("DELETE FROM users WHERE web_services_user_id = $1", user_id)
+            .execute(&pool)
+            .await
+            .expect("cleanup validation mapper");
+    }
+
+    /// `map_listing_bind.spec_id` is `ON DELETE RESTRICT`, so deleting a bound
+    /// spec used to raise a foreign key violation and return before any
+    /// `TaskResponse` was sent, hanging the editor on an undeletable spec.
+    #[tokio::test]
+    async fn deleting_a_bound_spec_answers_the_mapper_instead_of_hanging() {
+        dotenv::dotenv().ok();
+        let url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set for delivery tests");
+        let pool = PgPoolOptions::new().max_connections(2).connect(&url).await.expect("connect");
+        let user_id = seed_user(&pool, "bound-spec-mapper").await;
+        let suffix = Uuid::new_v4().simple().to_string();
+        let map_uid: String = format!("BoundSpec{suffix}").chars().take(27).collect();
+        let name_id = format!("bound-{}", &suffix[..8]);
+        let spec_id = seed_unlocked_hat(&pool, &user_id, &map_uid, &name_id).await;
+        let (queue_tx, mut queue_rx) = unbounded_channel();
+
+        XPlayer::delete_custom_map_aux_spec(&pool, 21, &user_id, &name_id, &queue_tx)
+            .await
+            .expect("handler completes instead of erroring out");
+        match queue_rx.try_recv().expect("a refused delete still answers the editor") {
+            Response::TaskResponse { id, success, error } => {
+                assert_eq!(id, 21);
+                assert!(!success);
+                let error = error.expect("refusal carries a reason");
+                assert!(error.contains(&map_uid), "reason should name the bound map: {error}");
+            }
+            other => panic!("unexpected response: {:?}", other.name()),
+        }
+        assert!(
+            sqlx::query!("SELECT id FROM custom_map_aux_specs WHERE id = $1", spec_id)
+                .fetch_optional(&pool)
+                .await
+                .expect("read spec")
+                .is_some(),
+            "a refused delete must leave the spec in place"
+        );
+
+        sqlx::query!("DELETE FROM map_listing_bind WHERE map_uid = $1", map_uid)
+            .execute(&pool)
+            .await
+            .expect("unbind");
+        XPlayer::delete_custom_map_aux_spec(&pool, 22, &user_id, &name_id, &queue_tx)
+            .await
+            .expect("handler completes");
+        assert!(matches!(
+            queue_rx.try_recv().expect("an unbound delete succeeds"),
+            Response::TaskResponse {
+                id: 22,
+                success: true,
+                error: None
+            }
+        ));
+        assert!(
+            sqlx::query!("SELECT id FROM custom_map_aux_specs WHERE id = $1", spec_id)
+                .fetch_optional(&pool)
+                .await
+                .expect("read spec")
+                .is_none(),
+            "an unbound spec is deleted"
+        );
+
+        sqlx::query!("DELETE FROM users WHERE web_services_user_id = $1", user_id)
+            .execute(&pool)
+            .await
+            .expect("cleanup bound-spec mapper");
     }
 
     #[test]
@@ -1224,15 +2279,15 @@ mod wayfinder_delivery_tests {
         let mut players = vec![
             PlayerDelivery {
                 tx: existing_tx,
-                current_map_uid: existing_map,
+                wayfinder_map_uid: existing_map,
             },
             PlayerDelivery {
                 tx: joining_tx,
-                current_map_uid: joining_map.clone(),
+                wayfinder_map_uid: joining_map.clone(),
             },
             PlayerDelivery {
                 tx: off_tx,
-                current_map_uid: off_map,
+                wayfinder_map_uid: off_map,
             },
         ];
         deliver_player_mgr_message(&mut players, join_event).await;
@@ -1333,7 +2388,7 @@ mod wayfinder_delivery_tests {
             r#"INSERT INTO map_listing_bind
                    (map_uid, spec_id, verified_author_id, author_verified_at,
                     materialized_spec_updated_at, materialized_spec_hash)
-               SELECT $1, id, user_id, NOW(), updated_at, md5(spec::text)
+               SELECT $1, id, user_id, NOW(), updated_at, spec_hash
                FROM custom_map_aux_specs WHERE id = $2"#,
             map_uid,
             spec_id
@@ -1352,9 +2407,19 @@ mod wayfinder_delivery_tests {
         .expect("insert unlock");
 
         let (mgr_tx, mut mgr_rx) = unbounded_channel();
-        XPlayer::report_hat_equip(&pool, &mgr_tx, &user_id, Some(&off_map_uid), map_uid.clone(), "Hat-1".into())
-            .await
-            .expect("off-map equip is ignored");
+        let (queue_tx, mut queue_rx) = unbounded_channel();
+        let pending: Arc<PendingHatUnlocks> = Default::default();
+        XPlayer::report_hat_equip(
+            &pool,
+            &mgr_tx,
+            &queue_tx,
+            &user_id,
+            Some(&off_map_uid),
+            map_uid.clone(),
+            "Hat-1".into(),
+        )
+        .await
+        .expect("off-map equip is ignored");
         assert!(mgr_rx.try_recv().is_err());
         assert_eq!(
             sqlx::query!("SELECT COUNT(*) AS count FROM hat_equipped WHERE user_id = $1", user_id)
@@ -1366,7 +2431,7 @@ mod wayfinder_delivery_tests {
             0
         );
 
-        XPlayer::report_hat_equip(&pool, &mgr_tx, &user_id, Some(&map_uid), map_uid.clone(), "Hat-1".into())
+        XPlayer::report_hat_equip(&pool, &mgr_tx, &queue_tx, &user_id, Some(&map_uid), map_uid.clone(), "Hat-1".into())
             .await
             .expect("equip");
         match mgr_rx.try_recv().expect("equip broadcast") {
@@ -1382,17 +2447,21 @@ mod wayfinder_delivery_tests {
             _ => panic!("unexpected equip broadcast"),
         }
 
-        XPlayer::report_hat_equip(&pool, &mgr_tx, &user_id, Some(&map_uid), map_uid.clone(), "Hat-1".into())
+        XPlayer::report_hat_equip(&pool, &mgr_tx, &queue_tx, &user_id, Some(&map_uid), map_uid.clone(), "Hat-1".into())
             .await
             .expect("rate-limited duplicate");
         assert!(mgr_rx.try_recv().is_err());
+        assert!(
+            matches!(queue_rx.try_recv(), Ok(Response::NonFatalErrorMsg { level: 2, .. })),
+            "a throttled equip must tell the client instead of vanishing"
+        );
         sleep(Duration::from_millis(260)).await;
-        XPlayer::report_hat_equip(&pool, &mgr_tx, &user_id, Some(&map_uid), map_uid.clone(), "Hat-1".into())
+        XPlayer::report_hat_equip(&pool, &mgr_tx, &queue_tx, &user_id, Some(&map_uid), map_uid.clone(), "Hat-1".into())
             .await
             .expect("unchanged duplicate");
         assert!(mgr_rx.try_recv().is_err());
+        assert!(queue_rx.try_recv().is_err(), "an accepted no-op equip must stay silent");
 
-        let (queue_tx, mut queue_rx) = unbounded_channel();
         XPlayer::send_hats_on_map(&pool, &queue_tx, Some(&off_map_uid), map_uid.clone())
             .await
             .expect("off-map read is ignored");
@@ -1406,11 +2475,11 @@ mod wayfinder_delivery_tests {
         ));
         assert!(mgr_rx.try_recv().is_err(), "request 214 must not emit a manager broadcast");
 
-        XPlayer::send_hats_mine(&pool, &queue_tx, Some(&off_map_uid), map_uid.clone(), &user_id)
+        XPlayer::send_hats_mine(&pool, &queue_tx, &pending, Some(&off_map_uid), map_uid.clone(), &user_id)
             .await
             .expect("off-map mine read is ignored");
         assert!(queue_rx.try_recv().is_err());
-        XPlayer::send_hats_mine(&pool, &queue_tx, Some(&map_uid), map_uid.clone(), &user_id)
+        XPlayer::send_hats_mine(&pool, &queue_tx, &pending, Some(&map_uid), map_uid.clone(), &user_id)
             .await
             .expect("current-map mine response");
         assert!(matches!(
@@ -1456,7 +2525,7 @@ mod wayfinder_delivery_tests {
             r#"INSERT INTO map_listing_bind
                    (map_uid, spec_id, verified_author_id, author_verified_at,
                     materialized_spec_updated_at, materialized_spec_hash)
-               SELECT $1, id, user_id, NOW(), updated_at, md5(spec::text)
+               SELECT $1, id, user_id, NOW(), updated_at, spec_hash
                FROM custom_map_aux_specs WHERE id = $2"#,
             map_uid,
             spec_id
@@ -1484,9 +2553,11 @@ mod wayfinder_delivery_tests {
         let equip_resume = resume_equip.clone();
         let equip = tokio::spawn(async move {
             let current_map_uid = equip_map_uid.clone();
+            let (equip_queue_tx, _equip_queue_rx) = unbounded_channel();
             XPlayer::report_hat_equip_with_post_commit(
                 &equip_pool,
                 &equip_tx,
+                &equip_queue_tx,
                 &user_id,
                 Some(&current_map_uid),
                 equip_map_uid,
@@ -2333,6 +3404,39 @@ impl XPlayer {
         Ok(())
     }
 
+    /// Turn a mapper-facing spec task outcome into the `TaskResponse` the
+    /// editor is waiting on. Without this the request id never resolves and
+    /// the editor's save/delete action hangs forever.
+    fn send_spec_task_result(
+        queue_tx: &UnboundedSender<Response>,
+        request_id: u32,
+        user_id: &Uuid,
+        name_id: &str,
+        action: &str,
+        outcome: Result<(), String>,
+    ) -> Result<(), ApiError> {
+        let error = match outcome {
+            Ok(()) => None,
+            Err(error) => {
+                warn!("Aux spec {} refused for user {} spec {}: {}", action, user_id, name_id, error);
+                Some(error)
+            }
+        };
+        queue_tx.send(Response::TaskResponse {
+            id: request_id,
+            success: error.is_none(),
+            error,
+        })?;
+        Ok(())
+    }
+
+    /// Never hand a raw driver/database error to the client; log it and return
+    /// a stable mapper-facing message instead.
+    fn spec_task_internal_error(action: &str, error: impl std::fmt::Debug) -> String {
+        warn!("Aux spec {} failed internally: {:?}", action, error);
+        format!("Server error while {action} the spec")
+    }
+
     pub async fn report_custom_map_aux_spec(
         pool: &Pool<Postgres>,
         request_id: u32,
@@ -2341,23 +3445,35 @@ impl XPlayer {
         spec: &serde_json::Value,
         queue_tx: &UnboundedSender<Response>,
     ) -> Result<(), ApiError> {
+        let outcome = Self::upsert_custom_map_aux_spec(pool, user_id, name_id, spec).await;
+        Self::send_spec_task_result(queue_tx, request_id, user_id, name_id, "save", outcome)
+    }
+
+    /// `Err` is the reason shown to the mapper. Catalog validation now rejects
+    /// the whole spec, so the reason has to reach the editor.
+    async fn upsert_custom_map_aux_spec(
+        pool: &Pool<Postgres>,
+        user_id: &Uuid,
+        name_id: &str,
+        spec: &serde_json::Value,
+    ) -> Result<(), String> {
         if !spec.is_object() || spec.as_object().unwrap().is_empty() {
-            return Err(ApiError::StrErr("Invalid spec: must be a non-empty object".to_string()));
+            return Err("Invalid spec: must be a non-empty object".to_string());
         }
-        let existing = queries::custom_map_aux_specs::get_spec(pool, user_id, name_id).await?;
+        let existing = queries::custom_map_aux_specs::get_spec(pool, user_id, name_id)
+            .await
+            .map_err(|error| Self::spec_task_internal_error("saving", error))?;
         if let Some(existing) = existing {
             if existing.created_at < chrono::Utc::now() - chrono::Duration::hours(24) {
-                return Err(ApiError::StrErr("Spec can no longer be modified".to_string()));
+                return Err("Spec can no longer be modified".to_string());
             }
         }
         queries::custom_map_aux_specs::upsert_spec_and_catalogs(pool, user_id, name_id, spec)
             .await
-            .map_err(|error| ApiError::StrErr(error.to_string()))?;
-        queue_tx.send(Response::TaskResponse {
-            id: request_id,
-            success: true,
-            error: None,
-        })?;
+            .map_err(|error| match error {
+                queries::custom_map_aux_specs::UpsertWayfinderSpecError::Validation(error) => error.to_string(),
+                error => Self::spec_task_internal_error("saving", error),
+            })?;
         Ok(())
     }
 
@@ -2368,21 +3484,41 @@ impl XPlayer {
         name_id: &str,
         queue_tx: &UnboundedSender<Response>,
     ) -> Result<(), ApiError> {
-        let existing = queries::custom_map_aux_specs::get_spec(pool, user_id, name_id).await?;
+        let outcome = Self::delete_custom_map_aux_spec_inner(pool, user_id, name_id).await;
+        Self::send_spec_task_result(queue_tx, request_id, user_id, name_id, "delete", outcome)
+    }
+
+    /// A spec a map is bound to cannot be deleted: the binding is that map's
+    /// immutable authority and `map_listing_bind.spec_id` is `ON DELETE
+    /// RESTRICT`, so the delete would raise a foreign key violation. Detect it
+    /// up front and tell the mapper which map holds the spec.
+    async fn delete_custom_map_aux_spec_inner(pool: &Pool<Postgres>, user_id: &Uuid, name_id: &str) -> Result<(), String> {
+        let existing = queries::custom_map_aux_specs::get_spec(pool, user_id, name_id)
+            .await
+            .map_err(|error| Self::spec_task_internal_error("deleting", error))?;
         if let Some(existing) = existing {
             if existing.created_at < chrono::Utc::now() - chrono::Duration::hours(24) {
-                return Err(ApiError::StrErr("Spec can no longer be deleted".to_string()));
+                return Err("Spec can no longer be deleted".to_string());
             }
         }
-        queries::custom_map_aux_specs::delete_spec(pool, user_id, name_id).await?;
-        queries::minigames::delete_catalog(pool, user_id, name_id).await?;
-        queries::collectibles::delete_catalog(pool, user_id, name_id).await?;
-        queries::hats::delete_catalog(pool, user_id, name_id).await?;
-        queue_tx.send(Response::TaskResponse {
-            id: request_id,
-            success: true,
-            error: None,
-        })?;
+        let bound_map = queries::custom_map_aux_specs::bound_map_uid(pool, user_id, name_id)
+            .await
+            .map_err(|error| Self::spec_task_internal_error("deleting", error))?;
+        if let Some(map_uid) = bound_map {
+            return Err(format!("Spec is bound to map {map_uid} and can no longer be deleted"));
+        }
+        queries::custom_map_aux_specs::delete_spec(pool, user_id, name_id)
+            .await
+            .map_err(|error| Self::spec_task_internal_error("deleting", error))?;
+        queries::minigames::delete_catalog(pool, user_id, name_id)
+            .await
+            .map_err(|error| Self::spec_task_internal_error("deleting", error))?;
+        queries::collectibles::delete_catalog(pool, user_id, name_id)
+            .await
+            .map_err(|error| Self::spec_task_internal_error("deleting", error))?;
+        queries::hats::delete_catalog(pool, user_id, name_id)
+            .await
+            .map_err(|error| Self::spec_task_internal_error("deleting", error))?;
         Ok(())
     }
 
@@ -2411,6 +3547,11 @@ impl XPlayer {
         Ok(())
     }
 
+    /// Map join / bind report. The steady-state path (an already verified
+    /// binding) runs inline so the 213/214 that follow it on the same FIFO
+    /// still see the binding. A first bind or a re-verification has to call
+    /// Nadeo, so it is deferred off the connection's request loop: the client
+    /// treats its hat cache as tentative until a 213 confirms it.
     pub async fn report_minigame_map(
         pool: &Pool<Postgres>,
         mgr_tx: &UnboundedSender<ToPlayerMgr>,
@@ -2418,9 +3559,135 @@ impl XPlayer {
         map_uid: String,
         spec_id: i64,
     ) -> Result<(), api_error::Error> {
-        Self::report_minigame_map_with_verifier(pool, mgr_tx, NADEO_MAP_AUTHOR_VERIFIER.as_ref(), user_id, map_uid, spec_id).await
+        Self::report_minigame_map_deferring(pool, mgr_tx, NADEO_MAP_AUTHOR_VERIFIER.clone(), user_id, map_uid, spec_id).await
     }
 
+    async fn report_minigame_map_deferring(
+        pool: &Pool<Postgres>,
+        mgr_tx: &UnboundedSender<ToPlayerMgr>,
+        verifier: Arc<dyn crate::nadeo::MapAuthorVerifier>,
+        user_id: &Uuid,
+        map_uid: String,
+        spec_id: i64,
+    ) -> Result<(), api_error::Error> {
+        if map_uid.len() != 27 || spec_id <= 0 {
+            return Ok(());
+        }
+        if queries::listed_maps::bind_requires_author_verification(pool, user_id, &map_uid, spec_id).await? {
+            let pool = pool.clone();
+            let mgr_tx = mgr_tx.clone();
+            let user_id = *user_id;
+            spawn_logged("Wayfinder bind", async move {
+                if let Err(error) =
+                    Self::report_minigame_map_with_verifier(&pool, &mgr_tx, verifier.as_ref(), &user_id, map_uid.clone(), spec_id).await
+                {
+                    warn!(
+                        "Deferred Wayfinder bind failed for player {} on map {} spec {}: {:?}",
+                        user_id, map_uid, spec_id, error
+                    );
+                }
+            });
+            return Ok(());
+        }
+        Self::report_minigame_map_with_verifier(pool, mgr_tx, verifier.as_ref(), user_id, map_uid, spec_id).await
+    }
+
+    /// Track the real Wayfinder map UID this connection is on, broadcasting the
+    /// leave/join hat pushes when it changes.
+    ///
+    /// The `ReportContext` map id cannot serve this purpose: the plugin sends
+    /// the true `EdChallengeId` only when the map is Deep Dip (by UID, or by a
+    /// name containing deep/dip/dd2) and otherwise sends the first 30 chars of
+    /// its MD5. Requests 81, 213 and 214 all carry the real 27-char UID in
+    /// their body, so that is what the hat gate and `BroadcastToMap` key on.
+    async fn set_wayfinder_map(
+        pool: &Pool<Postgres>,
+        mgr_tx: &UnboundedSender<ToPlayerMgr>,
+        tracked: &Arc<Mutex<Option<String>>>,
+        user_id: &Uuid,
+        display_name: &str,
+        next: Option<&str>,
+    ) -> Result<Option<String>, sqlx::Error> {
+        let previous = {
+            let mut tracked = tracked.lock().await;
+            if tracked.as_deref() == next {
+                return Ok(tracked.clone());
+            }
+            std::mem::replace(&mut *tracked, next.map(str::to_string))
+        };
+        Self::broadcast_hat_context_transition(pool, mgr_tx, user_id, display_name, previous.as_deref(), next).await?;
+        Ok(next.map(str::to_string))
+    }
+
+    /// Adopt the map UID carried by a request body, ignoring anything that is
+    /// not a real map UID so a malformed request cannot silently move the
+    /// player off the map they are on. Returns the tracked map either way.
+    async fn adopt_wayfinder_map(
+        pool: &Pool<Postgres>,
+        mgr_tx: &UnboundedSender<ToPlayerMgr>,
+        tracked: &Arc<Mutex<Option<String>>>,
+        user_id: &Uuid,
+        display_name: &str,
+        uid: &str,
+    ) -> Result<Option<String>, sqlx::Error> {
+        if uid.len() != 27 {
+            return Ok(tracked.lock().await.clone());
+        }
+        Self::set_wayfinder_map(pool, mgr_tx, tracked, user_id, display_name, Some(uid)).await
+    }
+
+    /// Apply a `ReportContext` map id to the tracked Wayfinder map.
+    ///
+    /// Clears it -- emitting the leave push -- only when the context genuinely
+    /// names some other map. A context report that has merely caught up with
+    /// the map request 81 already adopted names the same map, in either the
+    /// true-UID or the MD5-prefix form, and must be a no-op: the two arrive
+    /// from independent plugin coroutines and 81 wins the race about half the
+    /// time.
+    async fn apply_context_map_change(
+        pool: &Pool<Postgres>,
+        mgr_tx: &UnboundedSender<ToPlayerMgr>,
+        tracked: &Arc<Mutex<Option<String>>>,
+        user_id: &Uuid,
+        display_name: &str,
+        context_uid: Option<&str>,
+    ) -> Result<Option<String>, sqlx::Error> {
+        let current = tracked.lock().await.clone();
+        if current
+            .as_deref()
+            .is_some_and(|tracked_uid| context_uid_refers_to_map(context_uid, tracked_uid))
+        {
+            return Ok(current);
+        }
+        Self::set_wayfinder_map(pool, mgr_tx, tracked, user_id, display_name, None).await
+    }
+
+    /// `adopt_wayfinder_map`, but a failed leave/join push is logged rather than
+    /// propagated: requests 213/214 owe the client a response either way, and
+    /// the tracked map has already been updated by the time a push can fail.
+    async fn adopt_wayfinder_map_or_tracked(
+        pool: &Pool<Postgres>,
+        mgr_tx: &UnboundedSender<ToPlayerMgr>,
+        tracked: &Arc<Mutex<Option<String>>>,
+        user_id: &Uuid,
+        display_name: &str,
+        uid: &str,
+    ) -> Option<String> {
+        match Self::adopt_wayfinder_map(pool, mgr_tx, tracked, user_id, display_name, uid).await {
+            Ok(current) => current,
+            Err(error) => {
+                warn!(
+                    "Hat presence push failed for player {} on map {} (answering anyway): {:?}",
+                    user_id, uid, error
+                );
+                tracked.lock().await.clone()
+            }
+        }
+    }
+
+    /// Emit the leave push for the map the player was on and the join push for
+    /// the map they are now on. "Context" here means the tracked Wayfinder map
+    /// (see `set_wayfinder_map`), not the `ReportContext` map id.
     async fn broadcast_hat_context_transition(
         pool: &Pool<Postgres>,
         mgr_tx: &UnboundedSender<ToPlayerMgr>,
@@ -2504,9 +3771,15 @@ impl XPlayer {
         if spec_id <= 0 {
             return Ok(());
         }
+        // Nadeo I/O runs before the per-map lock is taken. Holding the lock
+        // across an HTTP round trip queues every other player's 81/85 on this
+        // map behind one mapper's verification.
+        let prepared = queries::listed_maps::prepare_authoritative_bind(pool, verifier, user_id, &map_uid, spec_id)
+            .await
+            .map_err(|error| ApiError::StrErr(error.to_string()))?;
         let map_operation = WAYFINDER_MAP_OPERATION_LOCKS.for_map(&map_uid);
         let _map_operation = map_operation.lock().await;
-        let binding = queries::listed_maps::bind_authoritative_spec(pool, verifier, user_id, &map_uid, spec_id)
+        let binding = queries::listed_maps::commit_authoritative_bind(pool, &prepared, user_id, &map_uid, spec_id)
             .await
             .map_err(|error| ApiError::StrErr(error.to_string()))?;
         if !binding.removed_hat_wearers.is_empty() {
@@ -2566,8 +3839,45 @@ impl XPlayer {
         Ok(())
     }
 
+    /// Hat unlock report. Validation calls Nadeo (up to two record lookups per
+    /// declared record uid, each retried), so it runs off the connection's
+    /// request loop and nothing else on the socket stalls behind that I/O.
+    ///
+    /// The plugin pushes 84 and 213 back to back on the same FIFO and treats
+    /// the 213 as the authoritative acknowledgement, relocking and persisting
+    /// any hat the answer reports as locked. Answering that 213 inline while
+    /// the validation is still running would therefore make the client persist
+    /// the pre-unlock state. So the request is registered as in flight, 213 for
+    /// that map is withheld while it is, and the validation pushes the 213
+    /// itself when it commits. `ApplyMine` is idempotent and keyed on the map
+    /// uid, so the late push reconciles with no plugin change.
     pub async fn report_hat_unlock(
         pool: &Pool<Postgres>,
+        queue_tx: &UnboundedSender<Response>,
+        pending: &Arc<PendingHatUnlocks>,
+        user_id: &Uuid,
+        map_uid: String,
+        slug: String,
+        spec_id: i64,
+    ) -> Result<(), api_error::Error> {
+        Self::report_hat_unlock_with_verifier(
+            pool,
+            NADEO_RECORD_VERIFIER.clone(),
+            queue_tx,
+            pending,
+            user_id,
+            map_uid,
+            slug,
+            spec_id,
+        )
+        .await
+    }
+
+    async fn report_hat_unlock_with_verifier(
+        pool: &Pool<Postgres>,
+        verifier: Arc<dyn crate::nadeo::OfficialRecordVerifier>,
+        queue_tx: &UnboundedSender<Response>,
+        pending: &Arc<PendingHatUnlocks>,
         user_id: &Uuid,
         map_uid: String,
         slug: String,
@@ -2576,27 +3886,126 @@ impl XPlayer {
         if map_uid.len() != 27 || spec_id <= 0 || slug.is_empty() {
             return Ok(());
         }
-        let Some(spec_id) = queries::listed_maps::resolve_bound_spec(pool, &map_uid, spec_id).await? else {
+        // Resolving the binding is one indexed query and never touches Nadeo,
+        // so it stays on the request path: an unbound map costs a query, not a
+        // spawned task.
+        let Some(bound_spec_id) = queries::listed_maps::resolve_bound_spec(pool, &map_uid, spec_id).await? else {
+            warn!(
+                "Hat unlock dropped for player {} on map {} hat {}: no verified binding for spec {}",
+                user_id, map_uid, slug, spec_id
+            );
             return Ok(());
         };
-        let _ = queries::hats::report_unlock(pool, NADEO_RECORD_VERIFIER.as_ref(), user_id, &map_uid, &slug, spec_id).await?;
+        // Records that a 213 answer is owed for this hat, and dedupes a repeat
+        // of the same map+hat onto the pending validation. Registered before
+        // the spawn so no 213 can slip in ahead of it.
+        let Some(mut owed) = pending.begin(&map_uid, &slug) else {
+            warn!(
+                "Hat unlock for player {} on map {} hat {} coalesced or refused: an answer is already owed for it, \
+                 or the connection is over its pending-unlock bound",
+                user_id, map_uid, slug
+            );
+            return Ok(());
+        };
+        let pool = pool.clone();
+        let queue_tx = queue_tx.clone();
+        let user_id = *user_id;
+        let permits = pending.validation_permits.clone();
+        let validation_pool = pool.clone();
+        let validation_map_uid = map_uid.clone();
+        spawn_logged("hat unlock validation", async move {
+            {
+                // Acquired here rather than in the handler so a batch larger
+                // than the cap queues instead of being discarded: the plugin
+                // fires 84 for every newly-satisfied hat in one pass, and a
+                // dropped unlock is later reported back to the client as
+                // locked and persisted to disk.
+                //
+                // Only closed at shutdown; running unthrottled beats leaving a
+                // withheld 213 unanswered.
+                let _permit = permits.acquire_owned().await.ok();
+                // Run the validation as its own task so a panic inside it
+                // surfaces here as an error rather than skipping the answer
+                // below.
+                let validation = tokio::spawn(async move {
+                    Self::run_hat_unlock_validation(&validation_pool, verifier.as_ref(), &user_id, &validation_map_uid, &slug, bound_spec_id)
+                        .await
+                });
+                if let Err(error) = validation.await {
+                    warn!(
+                        "Hat unlock validation for player {} on map {} panicked or was cancelled: {:?}",
+                        user_id, map_uid, error
+                    );
+                }
+            }
+            // The 213s the client sent behind its 84s were withheld, so answer
+            // them -- but only once the whole batch for this map has drained.
+            // Pushing while a sibling validation is still running would report
+            // that sibling's hat as locked, and the client persists that.
+            if owed.release() {
+                if let Err(error) = Self::push_hats_mine(&pool, &queue_tx, &map_uid, &user_id).await {
+                    warn!(
+                        "Failed to push post-validation HatsMine to player {} for map {}: {:?}",
+                        user_id, map_uid, error
+                    );
+                }
+            }
+        });
         Ok(())
+    }
+
+    /// Validate and log the verdict. There is no unlock response in the
+    /// protocol, so a denial has to be visible in the server log.
+    async fn run_hat_unlock_validation(
+        pool: &Pool<Postgres>,
+        verifier: &dyn crate::nadeo::OfficialRecordVerifier,
+        user_id: &Uuid,
+        map_uid: &str,
+        slug: &str,
+        bound_spec_id: i64,
+    ) -> bool {
+        match queries::hats::report_unlock(pool, verifier, user_id, map_uid, slug, bound_spec_id).await {
+            Ok(true) => true,
+            Ok(false) => {
+                warn!("Hat unlock denied for player {} on map {} hat {}", user_id, map_uid, slug);
+                false
+            }
+            Err(error) => {
+                warn!(
+                    "Hat unlock failed for player {} on map {} hat {}: {:?}",
+                    user_id, map_uid, slug, error
+                );
+                false
+            }
+        }
     }
 
     pub async fn report_hat_equip(
         pool: &Pool<Postgres>,
         mgr_tx: &UnboundedSender<ToPlayerMgr>,
+        queue_tx: &UnboundedSender<Response>,
         user_id: &Uuid,
         current_map_uid: Option<&str>,
         map_uid: String,
         slug: String,
     ) -> Result<(), api_error::Error> {
-        Self::report_hat_equip_with_post_commit(pool, mgr_tx, user_id, current_map_uid, map_uid, slug, std::future::ready(())).await
+        Self::report_hat_equip_with_post_commit(
+            pool,
+            mgr_tx,
+            queue_tx,
+            user_id,
+            current_map_uid,
+            map_uid,
+            slug,
+            std::future::ready(()),
+        )
+        .await
     }
 
     async fn report_hat_equip_with_post_commit<F>(
         pool: &Pool<Postgres>,
         mgr_tx: &UnboundedSender<ToPlayerMgr>,
+        queue_tx: &UnboundedSender<Response>,
         user_id: &Uuid,
         current_map_uid: Option<&str>,
         map_uid: String,
@@ -2607,10 +4016,33 @@ impl XPlayer {
         F: std::future::Future<Output = ()> + Send,
     {
         if map_uid.len() != 27 || !delivery_matches_map(current_map_uid, &map_uid) {
+            warn!(
+                "Hat equip dropped for player {}: reported map {} is not the tracked Wayfinder map {:?}",
+                user_id, map_uid, current_map_uid
+            );
             return Ok(());
         }
-        if !HAT_EQUIP_LIMITER.allow(user_id) {
-            return Ok(());
+        match HAT_EQUIP_LIMITER.check(user_id) {
+            queries::hats::HatEquipRateVerdict::Allowed => {}
+            queries::hats::HatEquipRateVerdict::PerUser => {
+                // The client applies the equip optimistically and reconciles
+                // from the next 213, so a silent drop looks like the UI
+                // snapping back for no reason. `NonFatalErrorMsg` is an
+                // existing response the plugin already handles.
+                warn!("Hat equip throttled for player {} on map {}", user_id, map_uid);
+                queue_tx.send(Response::NonFatalErrorMsg {
+                    level: 2,
+                    msg: "Hat change was too fast - try again in a moment.".to_string(),
+                })?;
+                return Ok(());
+            }
+            queries::hats::HatEquipRateVerdict::Global => {
+                warn!(
+                    "Hat equip dropped by the global rate limiter for player {} on map {}",
+                    user_id, map_uid
+                );
+                return Ok(());
+            }
         }
         let map_operation = WAYFINDER_MAP_OPERATION_LOCKS.for_map(&map_uid);
         let _map_operation = map_operation.lock().await;
@@ -2631,16 +4063,48 @@ impl XPlayer {
     pub async fn send_hats_mine(
         pool: &Pool<Postgres>,
         queue_tx: &UnboundedSender<Response>,
+        pending: &Arc<PendingHatUnlocks>,
         current_map_uid: Option<&str>,
         map_uid: String,
         user_id: &Uuid,
     ) -> Result<(), api_error::Error> {
         if !delivery_matches_map(current_map_uid, &map_uid) {
+            debug!(
+                "Withholding HatsMine for player {}: requested map {} is not the tracked Wayfinder map {:?}",
+                user_id, map_uid, current_map_uid
+            );
             return Ok(());
         }
-        let (equipped, items) = queries::hats::get_hats_mine(pool, &map_uid, user_id).await?;
+        // The client sends 213 immediately behind 84 and treats the answer as
+        // authoritative, relocking and persisting anything reported locked. An
+        // answer read now would still show the pre-unlock state, so leave it to
+        // the push that `report_hat_unlock`'s validation issues on completion.
+        if pending.any_for_map(&map_uid) {
+            debug!(
+                "Withholding HatsMine for player {} on map {}: an unlock validation is in flight and will answer it",
+                user_id, map_uid
+            );
+            return Ok(());
+        }
+        Self::push_hats_mine(pool, queue_tx, &map_uid, user_id).await
+    }
+
+    /// Send the 213 payload without the request-time gates. Used to answer a
+    /// 213 that was withheld while a hat unlock validation was in flight.
+    async fn push_hats_mine(
+        pool: &Pool<Postgres>,
+        queue_tx: &UnboundedSender<Response>,
+        map_uid: &str,
+        user_id: &Uuid,
+    ) -> Result<(), api_error::Error> {
+        // An empty `HatsMine` is authoritative to the client, so an unbound or
+        // unverified map is answered with silence, not an empty list.
+        let Some((equipped, items)) = queries::hats::get_hats_mine(pool, map_uid, user_id).await? else {
+            debug!("Withholding HatsMine for map {}: no verified Wayfinder binding", map_uid);
+            return Ok(());
+        };
         queue_tx.send(Response::HatsMine {
-            uid: map_uid,
+            uid: map_uid.to_string(),
             equipped,
             items,
         })?;
