@@ -9,18 +9,19 @@ use num_traits::ToPrimitive;
 use op_auth::check_token;
 use player::{parse_u64_str, LoginSession};
 use queries::{
-    context_mark_succeeded, create_session, get_global_lb, get_global_overview, get_user_in_lb,
-    get_user_stats, insert_context_packed, insert_finish, insert_respawn, insert_start_fall, register_or_login, resume_session,
-    update_fall_with_end, update_server_stats, update_user_color, update_users_stats, user_settings, PBUpdateRes,
+    context_mark_succeeded, create_session, get_global_lb, get_global_overview, get_user_in_lb, get_user_stats, insert_context_packed,
+    insert_finish, insert_respawn, insert_start_fall, register_or_login, resume_session, update_fall_with_end, update_server_stats,
+    update_user_color, update_users_stats, user_settings, PBUpdateRes,
 };
 use router::{AssetRef, LeaderboardEntry2, Map, PlayerCtx, Request, Response, Stats, ToPlayerMgr};
 
 use sqlx::{postgres::PgPoolOptions, query, Pool, Postgres};
 use std::{
+    collections::HashMap,
     error::Error,
     net::SocketAddr,
     str::FromStr,
-    sync::Arc,
+    sync::{Arc, Mutex as StdMutex, Weak},
     time::{self, Duration},
 };
 use thiserror::Error;
@@ -40,7 +41,7 @@ use tokio_graceful_shutdown::{FutureExt, SubsystemBuilder, SubsystemHandle, Topl
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use uuid::Uuid;
 
-    use crate::{
+use crate::{
     cache_util::AsyncCache,
     consts::DD2_MAP_UID,
     op_auth::init_op_config,
@@ -67,12 +68,38 @@ const MAX_CONNECTIONS: u32 = 4096;
 const MIN_PLUGIN_VERSION: [u32; 3] = [0, 4, 15];
 const MAX_HEIGHT: f64 = 5000.0;
 
+/// Exact per-map locks whose registry holds only weak references. Dead entries
+/// are pruned on each lookup, so retained state is bounded by peak in-flight
+/// Wayfinder operations rather than attacker-controlled map history.
+#[derive(Default)]
+struct WayfinderMapOperationLocks {
+    locks: StdMutex<HashMap<String, Weak<Mutex<()>>>>,
+}
+
+impl WayfinderMapOperationLocks {
+    fn for_map(&self, map_uid: &str) -> Arc<Mutex<()>> {
+        let mut locks = self.locks.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        if let Some(lock) = locks.get(map_uid).and_then(Weak::upgrade) {
+            return lock;
+        }
+        let lock = Arc::new(Mutex::new(()));
+        locks.insert(map_uid.to_string(), Arc::downgrade(&lock));
+        lock
+    }
+}
+
 lazy_static! {
     static ref CACHED_LB_INFO: AsyncCache<String, Vec<LeaderboardEntry2>> = Default::default();
     static ref CACHED_LIVE_INFO: AsyncCache<String, Vec<LeaderboardEntry2>> = Default::default();
     static ref NADEO_CLIENT: Arc<nadeo::NadeoLiveClient> = nadeo::NadeoLiveClient::from_env();
+    static ref NADEO_MAP_AUTHOR_VERIFIER: Arc<nadeo::CachedMapAuthorVerifier<nadeo::NadeoLiveClient>> =
+        nadeo::CachedMapAuthorVerifier::new(NADEO_CLIENT.clone());
     static ref NADEO_RECORD_VERIFIER: Arc<nadeo::CachedOfficialRecordVerifier<nadeo::NadeoLiveClient>> =
         nadeo::CachedOfficialRecordVerifier::new(NADEO_CLIENT.clone());
+    static ref HAT_EQUIP_LIMITER: queries::hats::HatEquipRateLimiter =
+        queries::hats::HatEquipRateLimiter::new(4096, Duration::from_millis(250), Duration::from_secs(1), 2048);
+    static ref WAYFINDER_MAP_OPERATION_LOCKS: WayfinderMapOperationLocks = Default::default();
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 10)]
@@ -150,13 +177,51 @@ async fn accept_conns(subsys: SubsystemHandle, db: Arc<Pool<Postgres>>) -> miett
 
 pub struct PlayerMgr {
     // players: Mutex<Vec<Arc<Player>>>,
-    players: Arc<Mutex<Vec<UnboundedSender<ToPlayer>>>>,
+    players: Arc<Mutex<Vec<PlayerDelivery>>>,
     rx: Option<UnboundedReceiver<ToPlayerMgr>>,
     tx: UnboundedSender<ToPlayerMgr>,
     // state: Mutex<PlayerMgrState>,
     pool: Arc<Pool<Postgres>>,
     limit_conns: Arc<Semaphore>,
     listener: TcpListener,
+}
+
+#[derive(Clone)]
+struct PlayerDelivery {
+    tx: UnboundedSender<ToPlayer>,
+    current_map_uid: Arc<Mutex<Option<String>>>,
+}
+
+fn delivery_matches_map(current: Option<&str>, target: &str) -> bool {
+    current == Some(target)
+}
+
+async fn deliver_player_mgr_message(players: &mut Vec<PlayerDelivery>, msg: ToPlayerMgr) {
+    players.retain(|player| !player.tx.is_closed());
+    match msg {
+        ToPlayerMgr::Broadcast(response) => {
+            for player in players.iter() {
+                let _ = player.tx.send(ToPlayer::Send(response.clone()));
+            }
+        }
+        ToPlayerMgr::BroadcastToMap { map_uid, response } => {
+            for player in players.iter() {
+                let current = player.current_map_uid.lock().await;
+                if delivery_matches_map(current.as_deref(), &map_uid) {
+                    let _ = player.tx.send(ToPlayer::Send(response.clone()));
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn update_last_map(last: &mut Option<String>, current: Option<&str>) -> bool {
+    if last.as_deref() == current {
+        return false;
+    }
+    *last = current.map(str::to_string);
+    true
 }
 
 impl PlayerMgr {
@@ -177,7 +242,7 @@ impl PlayerMgr {
 
     async fn top_3_loop(
         pool: Arc<Pool<Postgres>>,
-        players: Arc<Mutex<Vec<UnboundedSender<ToPlayer>>>>,
+        players: Arc<Mutex<Vec<PlayerDelivery>>>,
         subsys: SubsystemHandle,
     ) -> miette::Result<()> {
         // offset the count by some random amount [0, 9] to stagger server stats updates between servers
@@ -204,7 +269,7 @@ impl PlayerMgr {
             let to_rem: Vec<_> = ps
                 .iter()
                 .enumerate()
-                .filter_map(|(i, p)| if p.is_closed() { Some(i) } else { None })
+                .filter_map(|(i, p)| if p.tx.is_closed() { Some(i) } else { None })
                 .collect();
 
             to_rem.iter().rev().for_each(|i| {
@@ -221,10 +286,10 @@ impl PlayerMgr {
                     let overview = get_global_overview(&pool).await;
                     ps.iter()
                         .map(|p| {
-                            let _ = p.send(ToPlayer::Top3(top3.clone()));
-                            let _ = p.send(ToPlayer::Send(server_info.clone()));
+                            let _ = p.tx.send(ToPlayer::Top3(top3.clone()));
+                            let _ = p.tx.send(ToPlayer::Send(server_info.clone()));
                             if let Ok(j) = &overview {
-                                let _ = p.send(ToPlayer::Send(router::Response::GlobalOverview { j: j.clone() }));
+                                let _ = p.tx.send(ToPlayer::Send(router::Response::GlobalOverview { j: j.clone() }));
                             }
                         })
                         .for_each(drop);
@@ -250,13 +315,8 @@ impl PlayerMgr {
                     _ = a.on_shutdown_requested() => break,
                     msg = inbox.recv() => {
                         let Some(msg) = msg else { break };
-                        if let ToPlayerMgr::Broadcast(resp) = msg {
-                            let mut ps = players.lock().await;
-                            ps.retain(|p| !p.is_closed());
-                            for p in ps.iter() {
-                                let _ = p.send(ToPlayer::Send(resp.clone()));
-                            }
-                        }
+                        let mut players = players.lock().await;
+                        deliver_player_mgr_message(&mut players, msg).await;
                     }
                 }
             }
@@ -271,7 +331,7 @@ impl PlayerMgr {
                 _ = cancel_t.cancelled() => {
                     info!("PlayerMgr shutdown requested");
                     let mut ps = self.players.lock().await;
-                    ps.iter().map(|p| p.send(ToPlayer::Shutdown())).for_each(drop);
+                    ps.iter().map(|p| p.tx.send(ToPlayer::Shutdown())).for_each(drop);
                     ps.clear();
                     break;
                 },
@@ -285,10 +345,12 @@ impl PlayerMgr {
                     };
                     let (stream, permit, addr) = r;
                     let (p_tx, p_rx) = unbounded_channel();
+                    let current_map_uid = Arc::new(Mutex::new(None));
                     subsys.start(SubsystemBuilder::new("Player", {
-                        move |a| XPlayer::new(stream, permit, addr, pool, tx, p_rx).run(a)
+                        let current_map_uid = current_map_uid.clone();
+                        move |a| XPlayer::new(stream, permit, addr, pool, tx, p_rx, current_map_uid).run(a)
                     }));
-                    self.players.lock().await.push(p_tx);
+                    self.players.lock().await.push(PlayerDelivery { tx: p_tx, current_map_uid });
                     // let player = Player::new(stream, permit, self.tx.clone());
                 },
             }
@@ -365,8 +427,10 @@ pub struct XPlayer {
     queue_rx: Option<UnboundedReceiver<Response>>,
     pub queue_tx: UnboundedSender<Response>,
 
-    /// to keep track of when we enter a new map for on-ping auto msgs
-    last_map: Mutex<Option<String>>,
+    /// The most recent successfully reported context, shared with map-scoped delivery.
+    current_map_uid: Arc<Mutex<Option<String>>>,
+    /// Tracks map transitions for the on-ping automatic responses.
+    last_ping_map_uid: Mutex<Option<String>>,
 }
 
 impl XPlayer {
@@ -377,6 +441,7 @@ impl XPlayer {
         pool: Arc<Pool<Postgres>>,
         mgr_tx: UnboundedSender<ToPlayerMgr>,
         p_rx: UnboundedReceiver<ToPlayer>,
+        current_map_uid: Arc<Mutex<Option<String>>>,
     ) -> Self {
         info!("New player connected: {}", addr.ip().to_string());
         let (queue_tx, queue_rx) = unbounded_channel();
@@ -393,7 +458,8 @@ impl XPlayer {
             ip_address: addr.ip().to_string(),
             queue_rx: Some(queue_rx),
             queue_tx,
-            last_map: Default::default(),
+            current_map_uid,
+            last_ping_map_uid: Default::default(),
         }
     }
 
@@ -504,6 +570,7 @@ impl XPlayer {
         let mut previous_ctx_id = None;
         let session = self.session.get().unwrap().clone();
         let queue_tx = self.queue_tx.clone();
+        let current_map_uid = self.current_map_uid.clone();
         let user_id = session.user_id();
 
         let session_token = session.session_id();
@@ -537,7 +604,7 @@ impl XPlayer {
                     debug!("Report context: sf/mi/map/i/bi/e: {}/{}/{:?}/{:?}/{:?}/{:?}", sf, mi, map, i, bi, e);
                     match (parse_u64_str(&sf), parse_u64_str(&mi)) {
                         (Ok(sf), Ok(mi)) => {
-                            XPlayer::update_context(
+                            let result = XPlayer::update_context(
                                 &pool,
                                 session_token,
                                 &mut ctx,
@@ -550,7 +617,33 @@ impl XPlayer {
                                 bi,
                                 e,
                             )
-                            .await
+                            .await;
+                            if result.is_ok() {
+                                let next_map_uid = map.as_ref().map(|map| map.uid.clone());
+                                let previous_map_uid = {
+                                    let mut tracked_map_uid = current_map_uid.lock().await;
+                                    if tracked_map_uid.as_deref() == next_map_uid.as_deref() {
+                                        None
+                                    } else {
+                                        Some(std::mem::replace(&mut *tracked_map_uid, next_map_uid.clone()))
+                                    }
+                                };
+                                if let Some(previous_map_uid) = previous_map_uid {
+                                    if let Err(error) = XPlayer::broadcast_hat_context_transition(
+                                        &pool,
+                                        &mgr_tx,
+                                        user_id,
+                                        session.display_name(),
+                                        previous_map_uid.as_deref(),
+                                        next_map_uid.as_deref(),
+                                    )
+                                    .await
+                                    {
+                                        warn!("Failed to broadcast hat context transition for user {}: {:?}", user_id, error);
+                                    }
+                                }
+                            }
+                            result
                         }
                         _ => Err(format!("Invalid sf/mi: {}/{}", sf, mi).into()),
                     }
@@ -618,7 +711,7 @@ impl XPlayer {
                     elapsed_ms,
                     status,
                 } => XPlayer::report_minigame_attempt(&pool, user_id, uid, slug, spec_id, elapsed_ms, status).await,
-                Request::ReportMinigameMap { uid, spec_id } => XPlayer::report_minigame_map(&pool, user_id, uid, spec_id).await,
+                Request::ReportMinigameMap { uid, spec_id } => XPlayer::report_minigame_map(&pool, &mgr_tx, user_id, uid, spec_id).await,
                 Request::ReportCollectibleUnlock { uid, slug, spec_id } => {
                     XPlayer::report_collectible_unlock(&pool, user_id, uid, slug, spec_id).await
                 }
@@ -631,11 +724,10 @@ impl XPlayer {
                     z,
                     source,
                 } => XPlayer::report_collectible_collect(&pool, user_id, uid, slug, spec_id, x, y, z, source).await,
-                Request::ReportHatUnlock { uid, slug, spec_id } => {
-                    XPlayer::report_hat_unlock(&pool, user_id, uid, slug, spec_id).await
-                }
+                Request::ReportHatUnlock { uid, slug, spec_id } => XPlayer::report_hat_unlock(&pool, user_id, uid, slug, spec_id).await,
                 Request::ReportHatEquip { uid, slug } => {
-                    XPlayer::report_hat_equip(&pool, &mgr_tx, user_id, uid, slug).await
+                    let current = current_map_uid.lock().await.clone();
+                    XPlayer::report_hat_equip(&pool, &mgr_tx, user_id, current.as_deref(), uid, slug).await
                 }
 
                 // get requests
@@ -684,17 +776,17 @@ impl XPlayer {
                 Request::GetMinigameLB { uid, slug, start, end } => {
                     XPlayer::send_minigame_lb(&pool, &queue_tx, uid, slug, start as i64, end as i64).await
                 }
-                Request::GetMinigameMyRank { uid, slug } => {
-                    XPlayer::get_minigame_my_rank(&pool, uid, slug, user_id, &queue_tx).await
-                }
+                Request::GetMinigameMyRank { uid, slug } => XPlayer::get_minigame_my_rank(&pool, uid, slug, user_id, &queue_tx).await,
                 Request::GetMinigameList { uid } => XPlayer::send_minigame_list(&pool, &queue_tx, uid).await,
                 Request::GetCollectibleList { uid } => XPlayer::send_collectible_list(&pool, &queue_tx, uid).await,
-                Request::GetCollectibleMine { uid } => {
-                    XPlayer::send_collectible_mine(&pool, &queue_tx, uid, user_id).await
+                Request::GetCollectibleMine { uid } => XPlayer::send_collectible_mine(&pool, &queue_tx, uid, user_id).await,
+                Request::GetHatsMine { uid } => {
+                    let current = current_map_uid.lock().await.clone();
+                    XPlayer::send_hats_mine(&pool, &queue_tx, current.as_deref(), uid, user_id).await
                 }
-                Request::GetHatsMine { uid } => XPlayer::send_hats_mine(&pool, &queue_tx, uid, user_id).await,
                 Request::GetHatsOnMap { uid } => {
-                    XPlayer::send_hats_on_map(&pool, &mgr_tx, &queue_tx, uid, user_id).await
+                    let current = current_map_uid.lock().await.clone();
+                    XPlayer::send_hats_on_map(&pool, &queue_tx, current.as_deref(), uid).await
                 }
 
                 Request::GetSecretAssets {} => XPlayer::get_secret_assets(&pool, user_id, &queue_tx).await,
@@ -966,20 +1058,8 @@ impl XPlayer {
     }
 
     async fn on_ping_check_update_last_map(&self, map: Option<&Map>) -> bool {
-        let mut last_map = self.last_map.lock().await;
-        let map_changed = match (map, last_map.as_ref()) {
-            (Some(m), Some(lm)) => m.uid != *lm,
-            (Some(m), None) => {
-                *last_map = Some(m.uid.clone());
-                true
-            }
-            (None, Some(_)) => {
-                *last_map = None;
-                true
-            }
-            (None, None) => false,
-        };
-        map_changed
+        let mut last_map = self.last_ping_map_uid.lock().await;
+        update_last_map(&mut last_map, map.map(|map| map.uid.as_str()))
     }
 
     async fn report_map_stats(pool: &Pool<Postgres>, user_id: &Uuid, uid: String, stats: serde_json::Value) -> Result<(), ApiError> {
@@ -1009,6 +1089,640 @@ impl XPlayer {
             now_ts,
         })?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod wayfinder_delivery_tests {
+    use super::{deliver_player_mgr_message, delivery_matches_map, update_last_map, PlayerDelivery, XPlayer};
+    use crate::nadeo::MapAuthorVerifier;
+    use crate::player::ToPlayer;
+    use crate::router::{Response, ToPlayerMgr};
+    use serde_json::json;
+    use sqlx::{postgres::PgPoolOptions, Pool, Postgres};
+    use std::{sync::Arc, time::Duration};
+    use tokio::{
+        sync::{mpsc::unbounded_channel, Notify},
+        time::{sleep, timeout},
+    };
+    use uuid::Uuid;
+
+    struct FixedAuthorVerifier(Uuid);
+
+    impl MapAuthorVerifier for FixedAuthorVerifier {
+        fn author_id_for_uid<'a>(
+            &'a self,
+            _account_id: &'a Uuid,
+            _map_uid: &'a str,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Uuid, String>> + Send + 'a>> {
+            Box::pin(async move { Ok(self.0) })
+        }
+    }
+
+    async fn seed_equipped_hat(pool: &Pool<Postgres>, user_id: &Uuid, map_uid: &str, name_id: &str) -> i64 {
+        let spec = json!({"hats":[{"slug":"Hat-1","unlock":{"finishThisMap":true}}]});
+        let spec_id = crate::queries::custom_map_aux_specs::upsert_spec_and_catalogs(pool, user_id, name_id, &spec)
+            .await
+            .expect("insert join-broadcast spec");
+        crate::queries::hats::bind_map_from_catalog(pool, map_uid, spec_id)
+            .await
+            .expect("bind join-broadcast hats");
+        sqlx::query!(
+            r#"INSERT INTO map_listing_bind
+                   (map_uid, spec_id, verified_author_id, author_verified_at,
+                    materialized_spec_updated_at, materialized_spec_hash)
+               SELECT $1, id, user_id, NOW(), updated_at, md5(spec::text)
+               FROM custom_map_aux_specs WHERE id = $2"#,
+            map_uid,
+            spec_id
+        )
+        .execute(pool)
+        .await
+        .expect("mark join-broadcast snapshot materialized");
+        sqlx::query!(
+            r#"INSERT INTO hat_unlock (user_id, hat_key, map_uid, slug, unlocked_at)
+               VALUES ($1, substring(md5($2 || ':h:Hat-1') from 1 for 16), $2, 'Hat-1', NOW())"#,
+            user_id,
+            map_uid
+        )
+        .execute(pool)
+        .await
+        .expect("insert join-broadcast unlock");
+        assert!(crate::queries::hats::report_equip(pool, user_id, map_uid, "Hat-1")
+            .await
+            .expect("persist equipped hat")
+            .is_some());
+        spec_id
+    }
+
+    #[test]
+    fn hat_updates_are_delivered_only_to_the_target_map() {
+        assert!(delivery_matches_map(Some("map-a"), "map-a"));
+        assert!(!delivery_matches_map(Some("map-b"), "map-a"));
+        assert!(!delivery_matches_map(None, "map-a"));
+    }
+
+    #[test]
+    fn ping_map_tracker_updates_across_every_transition() {
+        let mut last = None;
+        assert!(update_last_map(&mut last, Some("map-a")));
+        assert_eq!(last.as_deref(), Some("map-a"));
+        assert!(!update_last_map(&mut last, Some("map-a")));
+        assert!(update_last_map(&mut last, Some("map-b")));
+        assert_eq!(last.as_deref(), Some("map-b"));
+        assert!(update_last_map(&mut last, None));
+        assert_eq!(last, None);
+        assert!(!update_last_map(&mut last, None));
+    }
+
+    #[tokio::test]
+    async fn persisted_equipped_player_join_is_delivered_to_current_map_only() {
+        dotenv::dotenv().ok();
+        let url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set for delivery tests");
+        let pool = PgPoolOptions::new().max_connections(3).connect(&url).await.expect("connect");
+        let user_id = Uuid::now_v7();
+        let suffix = Uuid::new_v4().simple().to_string();
+        let map_uid: String = format!("HatJoin{suffix}").chars().take(27).collect();
+        let other_map_uid: String = format!("HatOther{suffix}").chars().take(27).collect();
+        let name_id = format!("hat-join-{}", &suffix[..8]);
+        sqlx::query!(
+            "INSERT INTO users (web_services_user_id, display_name) VALUES ($1, $2)",
+            user_id,
+            "persisted-hat-joiner"
+        )
+        .execute(&pool)
+        .await
+        .expect("insert joining user");
+        seed_equipped_hat(&pool, &user_id, &map_uid, &name_id).await;
+
+        let (mgr_tx, mut mgr_rx) = unbounded_channel();
+        XPlayer::broadcast_hat_context_transition(&pool, &mgr_tx, &user_id, "persisted-hat-joiner", None, Some(&map_uid))
+            .await
+            .expect("broadcast persisted hat on join");
+        let join_event = mgr_rx.try_recv().expect("join emits one manager event");
+        match &join_event {
+            ToPlayerMgr::BroadcastToMap {
+                map_uid: target,
+                response: Response::HatsOnMapUpdate { uid, hats },
+            } => {
+                assert_eq!(target, &map_uid);
+                assert_eq!(uid, &map_uid);
+                assert_eq!(hats.len(), 1);
+                assert_eq!(hats[0].wsid, user_id.to_string());
+                assert_eq!(hats[0].slug, "Hat-1");
+            }
+            _ => panic!("unexpected join manager event"),
+        }
+        assert!(mgr_rx.try_recv().is_err());
+
+        let existing_map = Arc::new(tokio::sync::Mutex::new(Some(map_uid.clone())));
+        let joining_map = Arc::new(tokio::sync::Mutex::new(Some(map_uid.clone())));
+        let off_map = Arc::new(tokio::sync::Mutex::new(Some(other_map_uid.clone())));
+        let (existing_tx, mut existing_rx) = unbounded_channel();
+        let (joining_tx, mut joining_rx) = unbounded_channel();
+        let (off_tx, mut off_rx) = unbounded_channel();
+        let mut players = vec![
+            PlayerDelivery {
+                tx: existing_tx,
+                current_map_uid: existing_map,
+            },
+            PlayerDelivery {
+                tx: joining_tx,
+                current_map_uid: joining_map.clone(),
+            },
+            PlayerDelivery {
+                tx: off_tx,
+                current_map_uid: off_map,
+            },
+        ];
+        deliver_player_mgr_message(&mut players, join_event).await;
+        for delivered in [
+            existing_rx.try_recv().expect("existing player receives joining hat"),
+            joining_rx.try_recv().expect("joining player receives current-map hat state"),
+        ] {
+            assert!(matches!(
+                delivered,
+                ToPlayer::Send(Response::HatsOnMapUpdate { uid, hats })
+                    if uid == map_uid && hats.len() == 1 && hats[0].slug == "Hat-1"
+            ));
+        }
+        assert!(off_rx.try_recv().is_err(), "off-map player must not receive join update");
+
+        XPlayer::broadcast_hat_context_transition(&pool, &mgr_tx, &user_id, "persisted-hat-joiner", Some(&map_uid), Some(&map_uid))
+            .await
+            .expect("same-map context is a no-op");
+        assert!(mgr_rx.try_recv().is_err(), "unchanged same-map contexts must not spam updates");
+
+        *joining_map.lock().await = Some(other_map_uid.clone());
+        XPlayer::broadcast_hat_context_transition(
+            &pool,
+            &mgr_tx,
+            &user_id,
+            "persisted-hat-joiner",
+            Some(&map_uid),
+            Some(&other_map_uid),
+        )
+        .await
+        .expect("map transition broadcasts old-map removal");
+        let transition_event = mgr_rx.try_recv().expect("map transition emits old-map removal");
+        assert!(mgr_rx.try_recv().is_err(), "no equipped hat exists on the destination map");
+        deliver_player_mgr_message(&mut players, transition_event).await;
+        assert!(matches!(
+            existing_rx.try_recv(),
+            Ok(ToPlayer::Send(Response::HatsOnMapUpdate { uid, hats }))
+                if uid == map_uid && hats.len() == 1 && hats[0].slug.is_empty()
+        ));
+        assert!(joining_rx.try_recv().is_err(), "transitioned player is no longer on the old map");
+        assert!(
+            off_rx.try_recv().is_err(),
+            "destination-map player must not receive old-map removal"
+        );
+
+        *joining_map.lock().await = None;
+        XPlayer::broadcast_hat_context_transition(&pool, &mgr_tx, &user_id, "persisted-hat-joiner", Some(&other_map_uid), None)
+            .await
+            .expect("leave emits destination-map removal");
+        let leave_event = mgr_rx.try_recv().expect("leave emits one removal");
+        deliver_player_mgr_message(&mut players, leave_event).await;
+        assert!(
+            joining_rx.try_recv().is_err(),
+            "leaving player must not receive its old-map removal"
+        );
+        assert!(matches!(
+            off_rx.try_recv(),
+            Ok(ToPlayer::Send(Response::HatsOnMapUpdate { uid, hats }))
+                if uid == other_map_uid && hats.len() == 1 && hats[0].slug.is_empty()
+        ));
+
+        sqlx::query!("DELETE FROM map_listing_bind WHERE map_uid = $1", map_uid)
+            .execute(&pool)
+            .await
+            .expect("cleanup join-broadcast binding");
+        sqlx::query!("DELETE FROM users WHERE web_services_user_id = $1", user_id)
+            .execute(&pool)
+            .await
+            .expect("cleanup joining user");
+    }
+
+    #[tokio::test]
+    async fn equip_handler_broadcasts_only_changes_and_hats_on_map_is_direct_only() {
+        dotenv::dotenv().ok();
+        let url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set for delivery tests");
+        let pool = PgPoolOptions::new().max_connections(2).connect(&url).await.expect("connect");
+        let user_id = Uuid::now_v7();
+        let suffix = Uuid::new_v4().simple().to_string();
+        let map_uid: String = format!("Equip{suffix}").chars().take(27).collect();
+        let off_map_uid: String = format!("Other{suffix}").chars().take(27).collect();
+        let name_id = format!("equip-{}", &suffix[..8]);
+        sqlx::query!(
+            "INSERT INTO users (web_services_user_id, display_name) VALUES ($1, $2)",
+            user_id,
+            "equip-broadcast-test"
+        )
+        .execute(&pool)
+        .await
+        .expect("insert user");
+        let spec = json!({"hats":[{"slug":"Hat-1","unlock":{"finishThisMap":true}}]});
+        let spec_id = crate::queries::custom_map_aux_specs::upsert_spec_and_catalogs(&pool, &user_id, &name_id, &spec)
+            .await
+            .expect("insert spec");
+        crate::queries::hats::bind_map_from_catalog(&pool, &map_uid, spec_id)
+            .await
+            .expect("bind hats");
+        sqlx::query!(
+            r#"INSERT INTO map_listing_bind
+                   (map_uid, spec_id, verified_author_id, author_verified_at,
+                    materialized_spec_updated_at, materialized_spec_hash)
+               SELECT $1, id, user_id, NOW(), updated_at, md5(spec::text)
+               FROM custom_map_aux_specs WHERE id = $2"#,
+            map_uid,
+            spec_id
+        )
+        .execute(&pool)
+        .await
+        .expect("mark handler test snapshot materialized");
+        sqlx::query!(
+            r#"INSERT INTO hat_unlock (user_id, hat_key, map_uid, slug, unlocked_at)
+               VALUES ($1, substring(md5($2 || ':h:Hat-1') from 1 for 16), $2, 'Hat-1', NOW())"#,
+            user_id,
+            map_uid
+        )
+        .execute(&pool)
+        .await
+        .expect("insert unlock");
+
+        let (mgr_tx, mut mgr_rx) = unbounded_channel();
+        XPlayer::report_hat_equip(&pool, &mgr_tx, &user_id, Some(&off_map_uid), map_uid.clone(), "Hat-1".into())
+            .await
+            .expect("off-map equip is ignored");
+        assert!(mgr_rx.try_recv().is_err());
+        assert_eq!(
+            sqlx::query!("SELECT COUNT(*) AS count FROM hat_equipped WHERE user_id = $1", user_id)
+                .fetch_one(&pool)
+                .await
+                .expect("count equipment")
+                .count
+                .unwrap_or(0),
+            0
+        );
+
+        XPlayer::report_hat_equip(&pool, &mgr_tx, &user_id, Some(&map_uid), map_uid.clone(), "Hat-1".into())
+            .await
+            .expect("equip");
+        match mgr_rx.try_recv().expect("equip broadcast") {
+            ToPlayerMgr::BroadcastToMap {
+                map_uid: target,
+                response: Response::HatsOnMapUpdate { uid, hats },
+            } => {
+                assert_eq!(target, map_uid);
+                assert_eq!(uid, map_uid);
+                assert_eq!(hats.len(), 1);
+                assert_eq!(hats[0].slug, "Hat-1");
+            }
+            _ => panic!("unexpected equip broadcast"),
+        }
+
+        XPlayer::report_hat_equip(&pool, &mgr_tx, &user_id, Some(&map_uid), map_uid.clone(), "Hat-1".into())
+            .await
+            .expect("rate-limited duplicate");
+        assert!(mgr_rx.try_recv().is_err());
+        sleep(Duration::from_millis(260)).await;
+        XPlayer::report_hat_equip(&pool, &mgr_tx, &user_id, Some(&map_uid), map_uid.clone(), "Hat-1".into())
+            .await
+            .expect("unchanged duplicate");
+        assert!(mgr_rx.try_recv().is_err());
+
+        let (queue_tx, mut queue_rx) = unbounded_channel();
+        XPlayer::send_hats_on_map(&pool, &queue_tx, Some(&off_map_uid), map_uid.clone())
+            .await
+            .expect("off-map read is ignored");
+        assert!(queue_rx.try_recv().is_err());
+        XPlayer::send_hats_on_map(&pool, &queue_tx, Some(&map_uid), map_uid.clone())
+            .await
+            .expect("direct hats response");
+        assert!(matches!(
+            queue_rx.try_recv(),
+            Ok(Response::HatsOnMap { uid, .. }) if uid == map_uid
+        ));
+        assert!(mgr_rx.try_recv().is_err(), "request 214 must not emit a manager broadcast");
+
+        XPlayer::send_hats_mine(&pool, &queue_tx, Some(&off_map_uid), map_uid.clone(), &user_id)
+            .await
+            .expect("off-map mine read is ignored");
+        assert!(queue_rx.try_recv().is_err());
+        XPlayer::send_hats_mine(&pool, &queue_tx, Some(&map_uid), map_uid.clone(), &user_id)
+            .await
+            .expect("current-map mine response");
+        assert!(matches!(
+            queue_rx.try_recv(),
+            Ok(Response::HatsMine { uid, .. }) if uid == map_uid
+        ));
+
+        sqlx::query!("DELETE FROM map_listing_bind WHERE map_uid = $1", map_uid)
+            .execute(&pool)
+            .await
+            .expect("cleanup handler test binding");
+        sqlx::query!("DELETE FROM users WHERE web_services_user_id = $1", user_id)
+            .execute(&pool)
+            .await
+            .expect("cleanup user");
+    }
+
+    #[tokio::test]
+    async fn equip_event_cannot_overtake_request_81_removal_event() {
+        dotenv::dotenv().ok();
+        let url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set for delivery tests");
+        let pool = PgPoolOptions::new().max_connections(2).connect(&url).await.expect("connect");
+        let user_id = Uuid::now_v7();
+        let suffix = Uuid::new_v4().simple().to_string();
+        let map_uid: String = format!("EquipRace{suffix}").chars().take(27).collect();
+        let name_id = format!("equip-race-{}", &suffix[..8]);
+        sqlx::query!(
+            "INSERT INTO users (web_services_user_id, display_name) VALUES ($1, $2)",
+            user_id,
+            "equip-event-order-test"
+        )
+        .execute(&pool)
+        .await
+        .expect("insert user");
+        let initial_spec = json!({"hats":[{"slug":"Hat-1","unlock":{"finishThisMap":true}}]});
+        let spec_id = crate::queries::custom_map_aux_specs::upsert_spec_and_catalogs(&pool, &user_id, &name_id, &initial_spec)
+            .await
+            .expect("insert initial spec");
+        crate::queries::hats::bind_map_from_catalog(&pool, &map_uid, spec_id)
+            .await
+            .expect("bind initial hats");
+        sqlx::query!(
+            r#"INSERT INTO map_listing_bind
+                   (map_uid, spec_id, verified_author_id, author_verified_at,
+                    materialized_spec_updated_at, materialized_spec_hash)
+               SELECT $1, id, user_id, NOW(), updated_at, md5(spec::text)
+               FROM custom_map_aux_specs WHERE id = $2"#,
+            map_uid,
+            spec_id
+        )
+        .execute(&pool)
+        .await
+        .expect("mark initial snapshot materialized");
+        sqlx::query!(
+            r#"INSERT INTO hat_unlock (user_id, hat_key, map_uid, slug, unlocked_at)
+               VALUES ($1, substring(md5($2 || ':h:Hat-1') from 1 for 16), $2, 'Hat-1', NOW())"#,
+            user_id,
+            map_uid
+        )
+        .execute(&pool)
+        .await
+        .expect("insert unlock");
+
+        let (mgr_tx, mut mgr_rx) = unbounded_channel();
+        let post_commit_reached = Arc::new(Notify::new());
+        let resume_equip = Arc::new(Notify::new());
+        let equip_pool = pool.clone();
+        let equip_tx = mgr_tx.clone();
+        let equip_map_uid = map_uid.clone();
+        let equip_reached = post_commit_reached.clone();
+        let equip_resume = resume_equip.clone();
+        let equip = tokio::spawn(async move {
+            let current_map_uid = equip_map_uid.clone();
+            XPlayer::report_hat_equip_with_post_commit(
+                &equip_pool,
+                &equip_tx,
+                &user_id,
+                Some(&current_map_uid),
+                equip_map_uid,
+                "Hat-1".into(),
+                async move {
+                    equip_reached.notify_one();
+                    equip_resume.notified().await;
+                },
+            )
+            .await
+        });
+        timeout(Duration::from_secs(5), post_commit_reached.notified())
+            .await
+            .expect("equip reaches post-commit pause");
+        assert_eq!(
+            sqlx::query!(
+                "SELECT COUNT(*) AS count FROM hat_equipped WHERE user_id = $1 AND map_uid = $2 AND slug = 'Hat-1'",
+                user_id,
+                map_uid
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("equip committed before pause")
+            .count
+            .unwrap_or(0),
+            1
+        );
+
+        let replacement_spec = json!({"hats":[{"slug":"Hat-2","unlock":{"finishThisMap":true}}]});
+        assert_eq!(
+            crate::queries::custom_map_aux_specs::upsert_spec_and_catalogs(&pool, &user_id, &name_id, &replacement_spec)
+                .await
+                .expect("replace source spec while equip is paused"),
+            spec_id
+        );
+
+        let rebuild_pool = pool.clone();
+        let rebuild_tx = mgr_tx.clone();
+        let rebuild_map_uid = map_uid.clone();
+        let mut rebuild = tokio::spawn(async move {
+            let verifier = FixedAuthorVerifier(user_id);
+            XPlayer::report_minigame_map_with_verifier(&rebuild_pool, &rebuild_tx, &verifier, &user_id, rebuild_map_uid, spec_id).await
+        });
+        assert!(
+            timeout(Duration::from_millis(150), &mut rebuild).await.is_err(),
+            "request 81 must wait until the older equip event is enqueued"
+        );
+
+        resume_equip.notify_one();
+        timeout(Duration::from_secs(5), equip)
+            .await
+            .expect("equip resumes")
+            .expect("equip task joins")
+            .expect("equip handler succeeds");
+        timeout(Duration::from_secs(5), rebuild)
+            .await
+            .expect("request 81 resumes")
+            .expect("request-81 task joins")
+            .expect("request-81 handler succeeds");
+
+        match timeout(Duration::from_secs(5), mgr_rx.recv())
+            .await
+            .expect("equip event arrives")
+            .expect("equip event channel remains open")
+        {
+            ToPlayerMgr::BroadcastToMap {
+                map_uid: target,
+                response: Response::HatsOnMapUpdate { uid, hats },
+            } => {
+                assert_eq!(target, map_uid);
+                assert_eq!(uid, map_uid);
+                assert_eq!(hats.len(), 1);
+                assert_eq!(hats[0].slug, "Hat-1");
+            }
+            _ => panic!("unexpected first event"),
+        }
+        match timeout(Duration::from_secs(5), mgr_rx.recv())
+            .await
+            .expect("request-81 removal event arrives")
+            .expect("request-81 event channel remains open")
+        {
+            ToPlayerMgr::BroadcastToMap {
+                map_uid: target,
+                response: Response::HatsOnMapUpdate { uid, hats },
+            } => {
+                assert_eq!(target, map_uid);
+                assert_eq!(uid, map_uid);
+                assert_eq!(hats.len(), 1);
+                assert_eq!(hats[0].slug, "", "final delivered state must be unequipped");
+            }
+            _ => panic!("unexpected second event"),
+        }
+        assert!(mgr_rx.try_recv().is_err());
+        assert_eq!(
+            sqlx::query!(
+                "SELECT COUNT(*) AS count FROM hat_equipped WHERE user_id = $1 AND map_uid = $2",
+                user_id,
+                map_uid
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("request 81 clears stale equipment")
+            .count
+            .unwrap_or(0),
+            0
+        );
+
+        sqlx::query!("DELETE FROM map_listing_bind WHERE map_uid = $1", map_uid)
+            .execute(&pool)
+            .await
+            .expect("cleanup ordering test binding");
+        sqlx::query!("DELETE FROM users WHERE web_services_user_id = $1", user_id)
+            .execute(&pool)
+            .await
+            .expect("cleanup ordering test user");
+    }
+
+    #[tokio::test]
+    async fn join_event_cannot_overtake_request_81_removal_event() {
+        dotenv::dotenv().ok();
+        let url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set for delivery tests");
+        let pool = PgPoolOptions::new().max_connections(3).connect(&url).await.expect("connect");
+        let user_id = Uuid::now_v7();
+        let suffix = Uuid::new_v4().simple().to_string();
+        let map_uid: String = format!("JoinRace{suffix}").chars().take(27).collect();
+        let name_id = format!("join-race-{}", &suffix[..8]);
+        sqlx::query!(
+            "INSERT INTO users (web_services_user_id, display_name) VALUES ($1, $2)",
+            user_id,
+            "join-event-order-test"
+        )
+        .execute(&pool)
+        .await
+        .expect("insert joining user");
+        let spec_id = seed_equipped_hat(&pool, &user_id, &map_uid, &name_id).await;
+
+        let (mgr_tx, mut mgr_rx) = unbounded_channel();
+        let join_ready = Arc::new(Notify::new());
+        let resume_join = Arc::new(Notify::new());
+        let join_pool = pool.clone();
+        let join_tx = mgr_tx.clone();
+        let join_map_uid = map_uid.clone();
+        let reached = join_ready.clone();
+        let resume = resume_join.clone();
+        let join = tokio::spawn(async move {
+            XPlayer::broadcast_hat_context_transition_with_join_ready(
+                &join_pool,
+                &join_tx,
+                &user_id,
+                "join-event-order-test",
+                None,
+                Some(&join_map_uid),
+                async move {
+                    reached.notify_one();
+                    resume.notified().await;
+                },
+            )
+            .await
+        });
+        timeout(Duration::from_secs(5), join_ready.notified())
+            .await
+            .expect("join fetches the valid equipped hat and pauses before enqueue");
+
+        let replacement_spec = json!({"hats":[{"slug":"Hat-2","unlock":{"finishThisMap":true}}]});
+        assert_eq!(
+            crate::queries::custom_map_aux_specs::upsert_spec_and_catalogs(&pool, &user_id, &name_id, &replacement_spec)
+                .await
+                .expect("replace source spec while join is paused"),
+            spec_id
+        );
+
+        let rebuild_pool = pool.clone();
+        let rebuild_tx = mgr_tx.clone();
+        let rebuild_map_uid = map_uid.clone();
+        let mut rebuild = tokio::spawn(async move {
+            let verifier = FixedAuthorVerifier(user_id);
+            XPlayer::report_minigame_map_with_verifier(&rebuild_pool, &rebuild_tx, &verifier, &user_id, rebuild_map_uid, spec_id).await
+        });
+        assert!(
+            timeout(Duration::from_millis(150), &mut rebuild).await.is_err(),
+            "request 81 must wait until the older join event is enqueued"
+        );
+
+        resume_join.notify_one();
+        timeout(Duration::from_secs(5), join)
+            .await
+            .expect("join resumes")
+            .expect("join task joins")
+            .expect("join broadcast succeeds");
+        timeout(Duration::from_secs(5), rebuild)
+            .await
+            .expect("request 81 resumes")
+            .expect("request-81 task joins")
+            .expect("request-81 handler succeeds");
+
+        for expected_slug in ["Hat-1", ""] {
+            match timeout(Duration::from_secs(5), mgr_rx.recv())
+                .await
+                .expect("ordered event arrives")
+                .expect("manager channel remains open")
+            {
+                ToPlayerMgr::BroadcastToMap {
+                    map_uid: target,
+                    response: Response::HatsOnMapUpdate { uid, hats },
+                } => {
+                    assert_eq!(target, map_uid);
+                    assert_eq!(uid, map_uid);
+                    assert_eq!(hats.len(), 1);
+                    assert_eq!(hats[0].slug, expected_slug);
+                }
+                _ => panic!("unexpected join/request-81 event"),
+            }
+        }
+        assert!(mgr_rx.try_recv().is_err());
+        assert_eq!(
+            sqlx::query!(
+                "SELECT COUNT(*) AS count FROM hat_equipped WHERE user_id = $1 AND map_uid = $2",
+                user_id,
+                map_uid
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("request 81 clears joined stale equipment")
+            .count
+            .unwrap_or(0),
+            0
+        );
+
+        sqlx::query!("DELETE FROM map_listing_bind WHERE map_uid = $1", map_uid)
+            .execute(&pool)
+            .await
+            .expect("cleanup join-order binding");
+        sqlx::query!("DELETE FROM users WHERE web_services_user_id = $1", user_id)
+            .execute(&pool)
+            .await
+            .expect("cleanup join-order user");
     }
 }
 
@@ -1636,10 +2350,9 @@ impl XPlayer {
                 return Err(ApiError::StrErr("Spec can no longer be modified".to_string()));
             }
         }
-        let spec_id = queries::custom_map_aux_specs::upsert_spec(pool, user_id, name_id, spec).await?;
-        queries::minigames::replace_catalog(pool, spec_id, user_id, name_id, spec).await?;
-        queries::collectibles::replace_catalog(pool, spec_id, user_id, name_id, spec).await?;
-        queries::hats::replace_catalog(pool, spec_id, user_id, name_id, spec).await?;
+        queries::custom_map_aux_specs::upsert_spec_and_catalogs(pool, user_id, name_id, spec)
+            .await
+            .map_err(|error| ApiError::StrErr(error.to_string()))?;
         queue_tx.send(Response::TaskResponse {
             id: request_id,
             success: true,
@@ -1700,6 +2413,87 @@ impl XPlayer {
 
     pub async fn report_minigame_map(
         pool: &Pool<Postgres>,
+        mgr_tx: &UnboundedSender<ToPlayerMgr>,
+        user_id: &Uuid,
+        map_uid: String,
+        spec_id: i64,
+    ) -> Result<(), api_error::Error> {
+        Self::report_minigame_map_with_verifier(pool, mgr_tx, NADEO_MAP_AUTHOR_VERIFIER.as_ref(), user_id, map_uid, spec_id).await
+    }
+
+    async fn broadcast_hat_context_transition(
+        pool: &Pool<Postgres>,
+        mgr_tx: &UnboundedSender<ToPlayerMgr>,
+        user_id: &Uuid,
+        display_name: &str,
+        previous_map_uid: Option<&str>,
+        current_map_uid: Option<&str>,
+    ) -> Result<(), sqlx::Error> {
+        Self::broadcast_hat_context_transition_with_join_ready(
+            pool,
+            mgr_tx,
+            user_id,
+            display_name,
+            previous_map_uid,
+            current_map_uid,
+            std::future::ready(()),
+        )
+        .await
+    }
+
+    async fn broadcast_hat_context_transition_with_join_ready<F>(
+        pool: &Pool<Postgres>,
+        mgr_tx: &UnboundedSender<ToPlayerMgr>,
+        user_id: &Uuid,
+        display_name: &str,
+        previous_map_uid: Option<&str>,
+        current_map_uid: Option<&str>,
+        join_ready: F,
+    ) -> Result<(), sqlx::Error>
+    where
+        F: std::future::Future<Output = ()> + Send,
+    {
+        if previous_map_uid == current_map_uid {
+            return Ok(());
+        }
+
+        if let Some(previous_map_uid) = previous_map_uid.filter(|uid| uid.len() == 27) {
+            let map_operation = WAYFINDER_MAP_OPERATION_LOCKS.for_map(previous_map_uid);
+            let _map_operation = map_operation.lock().await;
+            let _ = mgr_tx.send(ToPlayerMgr::BroadcastToMap {
+                map_uid: previous_map_uid.to_string(),
+                response: Response::HatsOnMapUpdate {
+                    uid: previous_map_uid.to_string(),
+                    hats: vec![crate::router::HatOnMapPlayer {
+                        wsid: user_id.to_string(),
+                        name: display_name.to_string(),
+                        slug: String::new(),
+                    }],
+                },
+            });
+        }
+
+        if let Some(current_map_uid) = current_map_uid.filter(|uid| uid.len() == 27) {
+            let map_operation = WAYFINDER_MAP_OPERATION_LOCKS.for_map(current_map_uid);
+            let _map_operation = map_operation.lock().await;
+            if let Some(entry) = queries::hats::equipped_push_entry(pool, user_id, current_map_uid).await? {
+                join_ready.await;
+                let _ = mgr_tx.send(ToPlayerMgr::BroadcastToMap {
+                    map_uid: current_map_uid.to_string(),
+                    response: Response::HatsOnMapUpdate {
+                        uid: current_map_uid.to_string(),
+                        hats: vec![entry],
+                    },
+                });
+            }
+        }
+        Ok(())
+    }
+
+    async fn report_minigame_map_with_verifier(
+        pool: &Pool<Postgres>,
+        mgr_tx: &UnboundedSender<ToPlayerMgr>,
+        verifier: &dyn crate::nadeo::MapAuthorVerifier,
         user_id: &Uuid,
         map_uid: String,
         spec_id: i64,
@@ -1710,12 +2504,24 @@ impl XPlayer {
         if spec_id <= 0 {
             return Ok(());
         }
-        let spec_id = queries::listed_maps::bind_authoritative_spec(pool, NADEO_CLIENT.as_ref(), user_id, &map_uid, spec_id)
+        let map_operation = WAYFINDER_MAP_OPERATION_LOCKS.for_map(&map_uid);
+        let _map_operation = map_operation.lock().await;
+        let binding = queries::listed_maps::bind_authoritative_spec(pool, verifier, user_id, &map_uid, spec_id)
             .await
             .map_err(|error| ApiError::StrErr(error.to_string()))?;
-        let _ = queries::minigames::bind_map_from_catalog(pool, &map_uid, spec_id).await?;
-        let _ = queries::collectibles::bind_map_from_catalog(pool, &map_uid, spec_id).await?;
-        let _ = queries::hats::bind_map_from_catalog(pool, &map_uid, spec_id).await?;
+        if !binding.removed_hat_wearers.is_empty() {
+            let _ = mgr_tx.send(ToPlayerMgr::BroadcastToMap {
+                map_uid: map_uid.clone(),
+                response: Response::HatsOnMapUpdate {
+                    uid: map_uid.clone(),
+                    hats: binding.removed_hat_wearers,
+                },
+            });
+        }
+        debug!(
+            "Authoritative Wayfinder spec {} for map {} materialized={}",
+            binding.spec_id, map_uid, binding.materialized
+        );
         Ok(())
     }
 
@@ -1773,15 +2579,7 @@ impl XPlayer {
         let Some(spec_id) = queries::listed_maps::resolve_bound_spec(pool, &map_uid, spec_id).await? else {
             return Ok(());
         };
-        let _ = queries::hats::report_unlock(
-            pool,
-            NADEO_RECORD_VERIFIER.as_ref(),
-            user_id,
-            &map_uid,
-            &slug,
-            spec_id,
-        )
-        .await?;
+        let _ = queries::hats::report_unlock(pool, NADEO_RECORD_VERIFIER.as_ref(), user_id, &map_uid, &slug, spec_id).await?;
         Ok(())
     }
 
@@ -1789,28 +2587,57 @@ impl XPlayer {
         pool: &Pool<Postgres>,
         mgr_tx: &UnboundedSender<ToPlayerMgr>,
         user_id: &Uuid,
+        current_map_uid: Option<&str>,
         map_uid: String,
         slug: String,
     ) -> Result<(), api_error::Error> {
-        if map_uid.len() != 27 {
+        Self::report_hat_equip_with_post_commit(pool, mgr_tx, user_id, current_map_uid, map_uid, slug, std::future::ready(())).await
+    }
+
+    async fn report_hat_equip_with_post_commit<F>(
+        pool: &Pool<Postgres>,
+        mgr_tx: &UnboundedSender<ToPlayerMgr>,
+        user_id: &Uuid,
+        current_map_uid: Option<&str>,
+        map_uid: String,
+        slug: String,
+        post_commit: F,
+    ) -> Result<(), api_error::Error>
+    where
+        F: std::future::Future<Output = ()> + Send,
+    {
+        if map_uid.len() != 27 || !delivery_matches_map(current_map_uid, &map_uid) {
             return Ok(());
         }
+        if !HAT_EQUIP_LIMITER.allow(user_id) {
+            return Ok(());
+        }
+        let map_operation = WAYFINDER_MAP_OPERATION_LOCKS.for_map(&map_uid);
+        let _map_operation = map_operation.lock().await;
         let Some(entry) = queries::hats::report_equip(pool, user_id, &map_uid, &slug).await? else {
             return Ok(());
         };
-        let _ = mgr_tx.send(ToPlayerMgr::Broadcast(Response::HatsOnMapUpdate {
-            uid: map_uid,
-            hats: vec![entry],
-        }));
+        post_commit.await;
+        let _ = mgr_tx.send(ToPlayerMgr::BroadcastToMap {
+            map_uid: map_uid.clone(),
+            response: Response::HatsOnMapUpdate {
+                uid: map_uid,
+                hats: vec![entry],
+            },
+        });
         Ok(())
     }
 
     pub async fn send_hats_mine(
         pool: &Pool<Postgres>,
         queue_tx: &UnboundedSender<Response>,
+        current_map_uid: Option<&str>,
         map_uid: String,
         user_id: &Uuid,
     ) -> Result<(), api_error::Error> {
+        if !delivery_matches_map(current_map_uid, &map_uid) {
+            return Ok(());
+        }
         let (equipped, items) = queries::hats::get_hats_mine(pool, &map_uid, user_id).await?;
         queue_tx.send(Response::HatsMine {
             uid: map_uid,
@@ -1822,22 +2649,18 @@ impl XPlayer {
 
     pub async fn send_hats_on_map(
         pool: &Pool<Postgres>,
-        mgr_tx: &UnboundedSender<ToPlayerMgr>,
         queue_tx: &UnboundedSender<Response>,
+        current_map_uid: Option<&str>,
         map_uid: String,
-        user_id: &Uuid,
     ) -> Result<(), api_error::Error> {
+        if !delivery_matches_map(current_map_uid, &map_uid) {
+            return Ok(());
+        }
         let hats = queries::hats::get_hats_on_map(pool, &map_uid).await?;
         queue_tx.send(Response::HatsOnMap {
             uid: map_uid.clone(),
             hats,
         })?;
-        if let Some(entry) = queries::hats::equipped_push_entry(pool, user_id, &map_uid).await? {
-            let _ = mgr_tx.send(ToPlayerMgr::Broadcast(Response::HatsOnMapUpdate {
-                uid: map_uid,
-                hats: vec![entry],
-            }));
-        }
         Ok(())
     }
 

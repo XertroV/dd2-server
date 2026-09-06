@@ -289,9 +289,7 @@ pub async fn run_http_server(
     let get_map_uid_minigames = warp::path!("map" / String / "minigames")
         .and(warp::path::end())
         .map(move |uid| (uid, req_pool.clone()))
-        .and_then(
-            |(uid, pool): (String, Arc<Pool<Postgres>>)| async move { api::handle_get_map_uid_minigames(pool.as_ref(), uid).await },
-        );
+        .and_then(|(uid, pool): (String, Arc<Pool<Postgres>>)| async move { api::handle_get_map_uid_minigames(pool.as_ref(), uid).await });
     let req_pool = pool.clone();
 
     let get_map_uid_minigame_lb = warp::path!("map" / String / "minigame" / String / "leaderboard")
@@ -341,9 +339,7 @@ pub async fn run_http_server(
     let get_listed_maps_page = warp::path!("maps" / "listed" / u32)
         .and(warp::path::end())
         .map(move |page| (page, req_pool.clone()))
-        .and_then(|(page, pool): (u32, Arc<Pool<Postgres>>)| async move {
-            api::handle_get_listed_maps(pool.as_ref(), page).await
-        });
+        .and_then(|(page, pool): (u32, Arc<Pool<Postgres>>)| async move { api::handle_get_listed_maps(pool.as_ref(), page).await });
     let req_pool = pool.clone();
 
     let mod_state = ModerationState {
@@ -401,10 +397,7 @@ pub async fn run_http_server(
         .or(get_map_uid_minigame_lb_page)
         .or(get_map_uid_collectibles)
         .boxed();
-    let listed_routes = get_listed_maps
-        .or(get_listed_maps_len)
-        .or(get_listed_maps_page)
-        .boxed();
+    let listed_routes = get_listed_maps.or(get_listed_maps_len).or(get_listed_maps_page).boxed();
     let site = core_routes
         .or(map_routes)
         .or(listed_routes)

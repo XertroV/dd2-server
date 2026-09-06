@@ -47,6 +47,7 @@ pub enum ToPlayerMgr {
     SocketError(),
     NewTop3(),
     Broadcast(Response),
+    BroadcastToMap { map_uid: String, response: Response },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

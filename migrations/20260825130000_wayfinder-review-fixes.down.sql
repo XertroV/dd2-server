@@ -1,6 +1,9 @@
 ALTER TABLE map_listing_bind
+    DROP CONSTRAINT IF EXISTS map_listing_bind_materialization_pair_check,
     DROP CONSTRAINT IF EXISTS map_listing_bind_verification_pair_check,
     DROP CONSTRAINT IF EXISTS map_listing_bind_spec_id_fkey,
+    DROP COLUMN IF EXISTS materialized_spec_updated_at,
+    DROP COLUMN IF EXISTS materialized_spec_hash,
     DROP COLUMN IF EXISTS verified_author_id,
     DROP COLUMN IF EXISTS author_verified_at,
     ALTER COLUMN spec_id DROP NOT NULL,
@@ -57,6 +60,26 @@ ALTER TABLE collectible_catalog
     DROP COLUMN IF EXISTS has_zone;
 ALTER TABLE minigame_on_map
     DROP CONSTRAINT IF EXISTS minigame_on_map_canonical_kind_check;
+ALTER TABLE minigame_attempt
+    DROP CONSTRAINT IF EXISTS minigame_attempt_finish_score_nonnegative_check;
+ALTER TABLE minigame_pb
+    DROP CONSTRAINT IF EXISTS minigame_pb_score_nonnegative_check;
 ALTER TABLE minigame_catalog
     DROP CONSTRAINT IF EXISTS minigame_catalog_sort_direction_check,
     DROP CONSTRAINT IF EXISTS minigame_catalog_canonical_kind_check;
+
+-- Restore the legacy kind names and sort rule expected by the prior server
+-- binary instead of leaving canonical values that it cannot interpret.
+UPDATE minigame_catalog
+SET kind = CASE kind
+        WHEN 'Sprint' THEN 'TimeTrial'
+        WHEN 'Survival' THEN 'KingOfTheHill'
+        ELSE kind
+    END,
+    lower_is_better = (kind = 'Sprint');
+UPDATE minigame_on_map
+SET kind = CASE kind
+    WHEN 'Sprint' THEN 'TimeTrial'
+    WHEN 'Survival' THEN 'KingOfTheHill'
+    ELSE kind
+END;

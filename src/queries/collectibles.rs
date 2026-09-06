@@ -1,7 +1,8 @@
 use serde_json::Value;
-use sqlx::{Pool, Postgres};
+use sqlx::{Pool, Postgres, Transaction};
 use uuid::Uuid;
 
+use super::CatalogValidationError;
 use crate::router::{CollectibleListItem, CollectibleMineItem};
 
 pub struct CatalogCollectible {
@@ -76,13 +77,15 @@ fn parse_gated_by(item: &Value) -> Option<String> {
 }
 
 /// Replace catalog from `spec.collectibles` / `spec.collectables`.
-/// Missing/empty → no rows. Empty slug skipped. Duplicate slug: last wins.
-pub fn parse_catalog_collectibles(spec: &Value) -> Vec<CatalogCollectible> {
+/// Missing/empty → no rows. Missing slugs get stable sequential defaults;
+/// explicit invalid/blank slugs and canonical duplicates reject the spec.
+pub fn parse_catalog_collectibles(spec: &Value) -> Result<Vec<CatalogCollectible>, CatalogValidationError> {
     let Some(items) = collectible_array(spec) else {
-        return vec![];
+        return Ok(vec![]);
     };
-    let mut last_by_slug = std::collections::HashMap::new();
-    let mut order: Vec<String> = Vec::new();
+    let mut parsed = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut next_default = 1_u32;
     for item in items {
         if !item.is_object() {
             continue;
@@ -90,41 +93,71 @@ pub fn parse_catalog_collectibles(spec: &Value) -> Vec<CatalogCollectible> {
         let Some((collect_on_unlock, has_zone, pickup)) = parse_collect_paths(item) else {
             continue;
         };
-        let slug = item.get("slug").and_then(|s| s.as_str()).unwrap_or("").trim();
-        if slug.is_empty() {
-            continue;
+        let slug = match item.get("slug") {
+            None => format!("Collectible-{next_default}"),
+            Some(value) => {
+                let Some(slug) = value.as_str() else {
+                    return Err(CatalogValidationError::BlankSlug { catalog: "collectible" });
+                };
+                let slug = slug.trim();
+                if slug.is_empty() {
+                    return Err(CatalogValidationError::BlankSlug { catalog: "collectible" });
+                }
+                slug.to_string()
+            }
+        };
+        if let Some(number) = slug.strip_prefix("Collectible-").and_then(|suffix| suffix.parse::<u32>().ok()) {
+            if number >= next_default {
+                next_default = number.saturating_add(1);
+            }
         }
-        let slug = slug.to_string();
-        let name = item.get("name").and_then(|s| s.as_str()).unwrap_or("").to_string();
-        if !last_by_slug.contains_key(&slug) {
-            order.push(slug.clone());
-        }
-        last_by_slug.insert(
-            slug.clone(),
-            CatalogCollectible {
+        if !seen.insert(slug.clone()) {
+            return Err(CatalogValidationError::DuplicateSlug {
+                catalog: "collectible",
                 slug,
-                name,
-                pickup: pickup.to_string(),
-                collect_on_unlock,
-                has_zone,
-                gated_by: parse_gated_by(item),
-                unlock_score: parse_unlock_score(item),
-            },
-        );
+            });
+        }
+        let name = item
+            .get("name")
+            .and_then(|s| s.as_str())
+            .filter(|name| !name.is_empty())
+            .unwrap_or(&slug)
+            .to_string();
+        parsed.push(CatalogCollectible {
+            slug,
+            name,
+            pickup: pickup.to_string(),
+            collect_on_unlock,
+            has_zone,
+            gated_by: parse_gated_by(item),
+            unlock_score: parse_unlock_score(item),
+        });
     }
-    order.into_iter().filter_map(|s| last_by_slug.remove(&s)).collect()
+    Ok(parsed)
 }
 
 pub async fn replace_catalog(pool: &Pool<Postgres>, spec_id: i64, user_id: &Uuid, name_id: &str, spec: &Value) -> Result<(), sqlx::Error> {
-    let items = parse_catalog_collectibles(spec);
+    let items = parse_catalog_collectibles(spec).map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
     let mut tx = pool.begin().await?;
+    replace_catalog_in_tx(&mut tx, spec_id, user_id, name_id, &items).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+pub(crate) async fn replace_catalog_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    spec_id: i64,
+    user_id: &Uuid,
+    name_id: &str,
+    items: &[CatalogCollectible],
+) -> Result<(), sqlx::Error> {
     sqlx::query!(
         r#"--sql
         DELETE FROM collectible_catalog WHERE spec_id = $1
         "#,
         spec_id
     )
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await?;
     for c in items {
         sqlx::query!(
@@ -144,10 +177,9 @@ pub async fn replace_catalog(pool: &Pool<Postgres>, spec_id: i64, user_id: &Uuid
             c.gated_by.as_deref(),
             c.unlock_score
         )
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
     }
-    tx.commit().await?;
     Ok(())
 }
 
@@ -193,8 +225,18 @@ async fn ensure_catalog(pool: &Pool<Postgres>, spec_id: i64) -> Result<(), sqlx:
 pub async fn bind_map_from_catalog(pool: &Pool<Postgres>, map_uid: &str, spec_id: i64) -> Result<bool, sqlx::Error> {
     ensure_catalog(pool, spec_id).await?;
     let mut tx = pool.begin().await?;
+    let bound = bind_map_from_catalog_in_tx(&mut tx, map_uid, spec_id).await?;
+    tx.commit().await?;
+    Ok(bound)
+}
+
+pub(crate) async fn bind_map_from_catalog_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    map_uid: &str,
+    spec_id: i64,
+) -> Result<bool, sqlx::Error> {
     sqlx::query!("DELETE FROM collectible_on_map WHERE map_uid = $1", map_uid)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
     let r = sqlx::query!(
         r#"--sql
@@ -219,61 +261,43 @@ pub async fn bind_map_from_catalog(pool: &Pool<Postgres>, map_uid: &str, spec_id
         spec_id,
         map_uid
     )
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await?;
-    tx.commit().await?;
     Ok(r.rows_affected() > 0)
 }
 
-struct CatalogRow {
+struct OnMapRow {
+    collectible_key: String,
     collect_on_unlock: bool,
     has_zone: bool,
 }
 
-async fn catalog_row(pool: &Pool<Postgres>, spec_id: i64, slug: &str) -> Result<Option<CatalogRow>, sqlx::Error> {
+async fn lock_materialized_row(
+    tx: &mut Transaction<'_, Postgres>,
+    map_uid: &str,
+    spec_id: i64,
+    slug: &str,
+) -> Result<Option<OnMapRow>, sqlx::Error> {
+    if !crate::queries::listed_maps::lock_materialized_spec(tx, map_uid, spec_id).await? {
+        return Ok(None);
+    }
     let r = sqlx::query!(
         r#"--sql
-        SELECT collect_on_unlock, has_zone FROM collectible_catalog WHERE spec_id = $1 AND slug = $2
+        SELECT collectible_key, collect_on_unlock, has_zone
+        FROM collectible_on_map
+        WHERE map_uid = $1 AND slug = $2
+        FOR SHARE
         "#,
-        spec_id,
+        map_uid,
         slug
     )
-    .fetch_optional(pool)
+    .fetch_optional(&mut **tx)
     .await?;
-    Ok(r.map(|row| CatalogRow {
+    Ok(r.map(|row| OnMapRow {
+        collectible_key: row.collectible_key,
         collect_on_unlock: row.collect_on_unlock,
         has_zone: row.has_zone,
     }))
-}
-
-async fn bind_one(pool: &Pool<Postgres>, map_uid: &str, spec_id: i64, slug: &str) -> Result<(), sqlx::Error> {
-    sqlx::query!(
-        r#"--sql
-        INSERT INTO collectible_on_map
-            (map_uid, slug, collectible_key, name, pickup, collect_on_unlock, has_zone, gated_by, unlock_score, spec_user, name_id)
-        SELECT $1, c.slug, substring(md5($4 || ':c:' || c.slug) from 1 for 16),
-               c.name, c.pickup, c.collect_on_unlock, c.has_zone, c.gated_by, c.unlock_score, c.user_id, c.name_id
-        FROM collectible_catalog c
-        WHERE c.spec_id = $2 AND c.slug = $3
-        ON CONFLICT (map_uid, slug) DO UPDATE SET
-            collectible_key = EXCLUDED.collectible_key,
-            name = EXCLUDED.name,
-            pickup = EXCLUDED.pickup,
-            collect_on_unlock = EXCLUDED.collect_on_unlock,
-            has_zone = EXCLUDED.has_zone,
-            gated_by = EXCLUDED.gated_by,
-            unlock_score = EXCLUDED.unlock_score,
-            spec_user = EXCLUDED.spec_user,
-            name_id = EXCLUDED.name_id
-        "#,
-        map_uid,
-        spec_id,
-        slug,
-        map_uid
-    )
-    .execute(pool)
-    .await?;
-    Ok(())
 }
 
 /// Exact `zone` or `grant` only. Anything else is a silent drop (no progress, no log).
@@ -287,8 +311,9 @@ pub(crate) fn collect_log_source(raw: &str) -> Option<&str> {
 /// Atomically establish sticky unlock+collection and append the first-collect
 /// audit event. Any audit failure rolls the progress transition back.
 async fn record_collect_transition(
-    pool: &Pool<Postgres>,
+    tx: &mut Transaction<'_, Postgres>,
     user_id: &Uuid,
+    collectible_key: &str,
     map_uid: &str,
     slug: &str,
     pos_x: f64,
@@ -296,34 +321,33 @@ async fn record_collect_transition(
     pos_z: f64,
     source: &str,
 ) -> Result<(), sqlx::Error> {
-    let mut tx = pool.begin().await?;
     let previous = sqlx::query!(
         r#"--sql
         SELECT collected_at FROM collectible_progress
         WHERE user_id = $1
-          AND collectible_key = substring(md5($2 || ':c:' || $3) from 1 for 16)
+          AND collectible_key = $2
         FOR UPDATE
         "#,
         user_id,
-        map_uid,
-        slug
+        collectible_key
     )
-    .fetch_optional(&mut *tx)
+    .fetch_optional(&mut **tx)
     .await?;
 
     sqlx::query!(
         r#"--sql
         INSERT INTO collectible_progress (user_id, collectible_key, map_uid, slug, unlocked_at, collected_at)
-        VALUES ($1, substring(md5($2 || ':c:' || $3) from 1 for 16), $2, $3, now(), now())
+        VALUES ($1, $2, $3, $4, now(), now())
         ON CONFLICT (user_id, collectible_key) DO UPDATE SET
             unlocked_at = COALESCE(collectible_progress.unlocked_at, now()),
             collected_at = COALESCE(collectible_progress.collected_at, now())
         "#,
         user_id,
+        collectible_key,
         map_uid,
         slug
     )
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await?;
 
     if previous.as_ref().map_or(true, |row| row.collected_at.is_none()) {
@@ -331,46 +355,46 @@ async fn record_collect_transition(
             r#"--sql
             INSERT INTO collectible_collect_log
                 (user_id, map_uid, slug, collectible_key, collected_at, pos_x, pos_y, pos_z, source)
-            VALUES ($1, $2, $3, substring(md5($8 || ':c:' || $3) from 1 for 16), now(), $4, $5, $6, $7)
+            VALUES ($1, $2, $3, $4, now(), $5, $6, $7, $8)
             ON CONFLICT (user_id, collectible_key) DO NOTHING
             "#,
             user_id,
             map_uid,
             slug,
+            collectible_key,
             pos_x,
             pos_y,
             pos_z,
-            source,
-            map_uid
+            source
         )
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
     }
-    tx.commit().await?;
     Ok(())
 }
 
 /// Sticky unlock only. Collection is exclusively report 83 so its audit event
 /// always carries the authoritative position.
 pub async fn report_unlock(pool: &Pool<Postgres>, user_id: &Uuid, map_uid: &str, slug: &str, spec_id: i64) -> Result<(), sqlx::Error> {
-    ensure_catalog(pool, spec_id).await?;
-    let Some(_) = catalog_row(pool, spec_id, slug).await? else {
+    let mut tx = pool.begin().await?;
+    let Some(row) = lock_materialized_row(&mut tx, map_uid, spec_id, slug).await? else {
         return Ok(());
     };
-    bind_one(pool, map_uid, spec_id, slug).await?;
     sqlx::query!(
         r#"--sql
         INSERT INTO collectible_progress (user_id, collectible_key, map_uid, slug, unlocked_at, collected_at)
-        VALUES ($1, substring(md5($2 || ':c:' || $3) from 1 for 16), $2, $3, now(), NULL)
+        VALUES ($1, $2, $3, $4, now(), NULL)
         ON CONFLICT (user_id, collectible_key) DO UPDATE SET
             unlocked_at = COALESCE(collectible_progress.unlocked_at, now())
         "#,
         user_id,
+        row.collectible_key,
         map_uid,
         slug
     )
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(())
 }
 
@@ -393,8 +417,8 @@ pub async fn report_collect(
     if !x.is_finite() || !y.is_finite() || !z.is_finite() {
         return Ok(());
     }
-    ensure_catalog(pool, spec_id).await?;
-    let Some(row) = catalog_row(pool, spec_id, slug).await? else {
+    let mut tx = pool.begin().await?;
+    let Some(row) = lock_materialized_row(&mut tx, map_uid, spec_id, slug).await? else {
         return Ok(());
     };
     let source_allowed = match source {
@@ -405,8 +429,19 @@ pub async fn report_collect(
     if !source_allowed {
         return Ok(());
     }
-    bind_one(pool, map_uid, spec_id, slug).await?;
-    record_collect_transition(pool, user_id, map_uid, slug, x as f64, y as f64, z as f64, source).await?;
+    record_collect_transition(
+        &mut tx,
+        user_id,
+        &row.collectible_key,
+        map_uid,
+        slug,
+        x as f64,
+        y as f64,
+        z as f64,
+        source,
+    )
+    .await?;
+    tx.commit().await?;
     Ok(())
 }
 
@@ -478,18 +513,25 @@ mod tests {
 
     #[test]
     fn missing_is_empty() {
-        assert!(parse_catalog_collectibles(&json!({"info":{}})).is_empty());
-        assert!(parse_catalog_collectibles(&json!({"collectibles":[]})).is_empty());
-        assert!(parse_catalog_collectibles(&json!({"collectables":{"items":[]}})).is_empty());
+        assert!(parse_catalog_collectibles(&json!({"info":{}})).expect("valid catalog").is_empty());
+        assert!(parse_catalog_collectibles(&json!({"collectibles":[]}))
+            .expect("valid catalog")
+            .is_empty());
+        assert!(parse_catalog_collectibles(&json!({"collectables":{"items":[]}}))
+            .expect("valid catalog")
+            .is_empty());
     }
 
     #[test]
-    fn skips_empty_slug_and_unknown_pickup() {
+    fn explicit_blank_slug_invalidates_catalog() {
         let spec = json!({"collectibles":[
             {"name":"a","slug":"","pickup":"zone"},
             {"name":"b","slug":"coin-1","pickup":"nope"}
         ]});
-        assert!(parse_catalog_collectibles(&spec).is_empty());
+        assert!(matches!(
+            parse_catalog_collectibles(&spec),
+            Err(CatalogValidationError::BlankSlug { catalog: "collectible" })
+        ));
     }
 
     #[test]
@@ -498,7 +540,7 @@ mod tests {
             {"name":"Coin","slug":"coin-1","pickup":"zone","gatedBy":"TimeTrial-1","unlockScore":12000},
             {"name":"Gift","slug":"gift-1","pickup":"grant"}
         ]});
-        let c = parse_catalog_collectibles(&spec);
+        let c = parse_catalog_collectibles(&spec).expect("valid catalog");
         assert_eq!(c.len(), 2);
         assert_eq!(c[0].slug, "coin-1");
         assert_eq!(c[0].pickup, "zone");
@@ -514,22 +556,24 @@ mod tests {
     }
 
     #[test]
-    fn last_duplicate_slug_wins() {
+    fn duplicate_canonical_slug_invalidates_catalog() {
         let spec = json!({"collectibles":{"items":[
             {"name":"old","slug":"c-1","pickup":"zone"},
             {"name":"new","slug":"c-1","pickup":"grant","gated_by":"TT-1"}
         ]}});
-        let c = parse_catalog_collectibles(&spec);
-        assert_eq!(c.len(), 1);
-        assert_eq!(c[0].name, "new");
-        assert_eq!(c[0].pickup, "grant");
-        assert_eq!(c[0].gated_by.as_deref(), Some("TT-1"));
+        assert!(matches!(
+            parse_catalog_collectibles(&spec),
+            Err(CatalogValidationError::DuplicateSlug {
+                catalog: "collectible",
+                slug
+            }) if slug == "c-1"
+        ));
     }
 
     #[test]
     fn default_pickup_is_zone() {
         let spec = json!({"collectibles":[{"name":"x","slug":"x-1"}]});
-        let c = parse_catalog_collectibles(&spec);
+        let c = parse_catalog_collectibles(&spec).expect("valid catalog");
         assert_eq!(c[0].pickup, "zone");
         assert!(c[0].has_zone);
         assert!(!c[0].collect_on_unlock);
@@ -547,7 +591,7 @@ mod tests {
             {"name":"Zone","slug":"zone-1","collectOnUnlock":false,"zone":{}},
             {"name":"Grant","slug":"grant-1","collectOnUnlock":true}
         ]});
-        let c = parse_catalog_collectibles(&spec);
+        let c = parse_catalog_collectibles(&spec).expect("valid catalog");
         assert_eq!(c.len(), 3);
         assert!(c[0].collect_on_unlock && c[0].has_zone);
         assert!(!c[1].collect_on_unlock && c[1].has_zone);
@@ -559,7 +603,35 @@ mod tests {
         let spec = json!({"collectibles":[
             {"name":"None","slug":"none-1","collectOnUnlock":false}
         ]});
-        assert!(parse_catalog_collectibles(&spec).is_empty());
+        assert!(parse_catalog_collectibles(&spec).expect("valid catalog").is_empty());
+    }
+
+    #[test]
+    fn missing_slugs_default_after_explicit_numbered_reservations() {
+        let spec = json!({"collectibles":[
+            {"name":"Reserved","slug":"  Collectible-4  ","pickup":"grant"},
+            {"name":"Default","pickup":"grant"},
+            {"name":"Custom","slug":" custom ","pickup":"grant"},
+            {"name":"Next","pickup":"grant"}
+        ]});
+        let slugs: Vec<_> = parse_catalog_collectibles(&spec)
+            .expect("valid catalog")
+            .into_iter()
+            .map(|item| item.slug)
+            .collect();
+        assert_eq!(slugs, ["Collectible-4", "Collectible-5", "custom", "Collectible-6"]);
+    }
+
+    #[test]
+    fn explicit_non_string_slug_invalidates_entire_catalog() {
+        let spec = json!({"collectibles":[
+            {"slug":"valid","pickup":"grant"},
+            {"slug":42,"pickup":"grant"}
+        ]});
+        assert!(matches!(
+            parse_catalog_collectibles(&spec),
+            Err(CatalogValidationError::BlankSlug { catalog: "collectible" })
+        ));
     }
 
     #[test]
@@ -618,6 +690,24 @@ mod db_tests {
         (spec_id, name_id)
     }
 
+    async fn materialize_spec(pool: &Pool<Postgres>, map_uid: &str, spec_id: i64) {
+        bind_map_from_catalog(pool, map_uid, spec_id)
+            .await
+            .expect("bind collectible snapshot");
+        sqlx::query!(
+            r#"INSERT INTO map_listing_bind
+                   (map_uid, spec_id, verified_author_id, author_verified_at,
+                    materialized_spec_updated_at, materialized_spec_hash)
+               SELECT $1, id, user_id, NOW(), updated_at, md5(spec::text)
+               FROM custom_map_aux_specs WHERE id = $2"#,
+            map_uid,
+            spec_id
+        )
+        .execute(pool)
+        .await
+        .expect("mark collectible snapshot materialized");
+    }
+
     fn test_map_uid() -> String {
         let raw = format!("CLog{}", Uuid::new_v4().simple());
         raw.chars().take(27).collect()
@@ -644,6 +734,7 @@ mod db_tests {
         let user_id = seed_user(&pool, "clog-zone").await;
         let (spec_id, _) = seed_spec(&pool, &user_id).await;
         let map_uid = test_map_uid();
+        materialize_spec(&pool, &map_uid, spec_id).await;
 
         report_collect(&pool, &user_id, &map_uid, "coin-1", spec_id, 1.25, 40.5, -3.0, "zone")
             .await
@@ -684,6 +775,7 @@ mod db_tests {
         let user_id = seed_user(&pool, "clog-grant").await;
         let (spec_id, _) = seed_spec(&pool, &user_id).await;
         let map_uid = test_map_uid();
+        materialize_spec(&pool, &map_uid, spec_id).await;
 
         report_unlock(&pool, &user_id, &map_uid, "gift-1", spec_id)
             .await
@@ -733,6 +825,7 @@ mod db_tests {
         let user_id = seed_user(&pool, "clog-unknown").await;
         let (spec_id, _) = seed_spec(&pool, &user_id).await;
         let map_uid = test_map_uid();
+        materialize_spec(&pool, &map_uid, spec_id).await;
 
         report_collect(&pool, &user_id, &map_uid, "no-such", spec_id, 0.0, 0.0, 0.0, "zone")
             .await
@@ -759,6 +852,7 @@ mod db_tests {
         let user_id = seed_user(&pool, "clog-unlock-only").await;
         let (spec_id, _) = seed_spec(&pool, &user_id).await;
         let map_uid = test_map_uid();
+        materialize_spec(&pool, &map_uid, spec_id).await;
 
         report_unlock(&pool, &user_id, &map_uid, "coin-1", spec_id)
             .await
@@ -779,6 +873,7 @@ mod db_tests {
         let user_id = seed_user(&pool, "clog-bad-source").await;
         let (spec_id, _) = seed_spec(&pool, &user_id).await;
         let map_uid = test_map_uid();
+        materialize_spec(&pool, &map_uid, spec_id).await;
 
         report_collect(&pool, &user_id, &map_uid, "coin-1", spec_id, 1.0, 2.0, 3.0, "nope")
             .await
@@ -808,6 +903,7 @@ mod db_tests {
         let user_id = seed_user(&pool, "clog-wrong-path").await;
         let (spec_id, _) = seed_spec(&pool, &user_id).await;
         let map_uid = test_map_uid();
+        materialize_spec(&pool, &map_uid, spec_id).await;
 
         report_collect(&pool, &user_id, &map_uid, "coin-1", spec_id, 1.0, 2.0, 3.0, "grant")
             .await
@@ -833,9 +929,21 @@ mod db_tests {
         let user_id = seed_user(&pool, "clog-rollback").await;
         let map_uid = test_map_uid();
 
-        let error = record_collect_transition(&pool, &user_id, &map_uid, "rollback-1", 1.0, 2.0, 3.0, "invalid")
-            .await
-            .expect_err("audit source constraint must reject the transaction");
+        let mut tx = pool.begin().await.expect("begin transition");
+        let error = record_collect_transition(
+            &mut tx,
+            &user_id,
+            "rollback-key____",
+            &map_uid,
+            "rollback-1",
+            1.0,
+            2.0,
+            3.0,
+            "invalid",
+        )
+        .await
+        .expect_err("audit source constraint must reject the transaction");
+        drop(tx);
         assert!(error.to_string().contains("collectible_collect_log_source_check"));
         let progress = sqlx::query!("SELECT COUNT(*) AS n FROM collectible_progress WHERE user_id = $1", user_id)
             .fetch_one(&pool)
@@ -854,6 +962,7 @@ mod db_tests {
         let user_id = seed_user(&pool, "clog-pre-mig").await;
         let (spec_id, _) = seed_spec(&pool, &user_id).await;
         let map_uid = test_map_uid();
+        materialize_spec(&pool, &map_uid, spec_id).await;
 
         sqlx::query!(
             r#"--sql

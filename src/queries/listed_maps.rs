@@ -6,6 +6,7 @@ use uuid::Uuid;
 
 use crate::consts::DD2_MAP_UID;
 use crate::nadeo::MapAuthorVerifier;
+use crate::queries::{collectibles, hats, minigames, CatalogValidationError};
 
 pub const LISTED_MAPS_PAGE_SIZE: u32 = 100;
 
@@ -34,6 +35,8 @@ pub enum BindSpecError {
     #[error("Nadeo map author verification failed: {0}")]
     AuthorVerification(String),
     #[error(transparent)]
+    Catalog(#[from] CatalogValidationError),
+    #[error(transparent)]
     Database(#[from] sqlx::Error),
 }
 
@@ -45,9 +48,11 @@ struct SpecBinding {
 async fn get_spec_binding(pool: &Pool<Postgres>, map_uid: &str) -> Result<Option<SpecBinding>, sqlx::Error> {
     let row = query!(
         r#"
-        SELECT spec_id, author_verified_at IS NOT NULL AS "verified!"
-        FROM map_listing_bind
-        WHERE map_uid = $1
+        SELECT b.spec_id,
+               (b.author_verified_at IS NOT NULL AND b.verified_author_id = s.user_id) AS "verified!"
+        FROM map_listing_bind b
+        INNER JOIN custom_map_aux_specs s ON s.id = b.spec_id
+        WHERE b.map_uid = $1
         "#,
         map_uid
     )
@@ -65,19 +70,24 @@ async fn get_spec_binding(pool: &Pool<Postgres>, map_uid: &str) -> Result<Option
 /// only when the authenticated reporter owns the spec and Nadeo says that same
 /// account authored the map. A unique map row resolves concurrent first binds;
 /// after the race, every contender reads and checks the actual winner.
+#[derive(Debug)]
+pub struct AuthoritativeBindResult {
+    pub spec_id: i64,
+    pub removed_hat_wearers: Vec<crate::router::HatOnMapPlayer>,
+    pub materialized: bool,
+}
+
 pub async fn bind_authoritative_spec(
     pool: &Pool<Postgres>,
     verifier: &dyn MapAuthorVerifier,
     reporter_id: &Uuid,
     map_uid: &str,
     requested_spec_id: i64,
-) -> Result<i64, BindSpecError> {
-    if let Some(binding) = get_spec_binding(pool, map_uid).await? {
-        if binding.spec_id != requested_spec_id {
+) -> Result<AuthoritativeBindResult, BindSpecError> {
+    let existing_binding = get_spec_binding(pool, map_uid).await?;
+    if let Some(binding) = &existing_binding {
+        if binding.verified && binding.spec_id != requested_spec_id {
             return Err(BindSpecError::ConflictingBinding);
-        }
-        if binding.verified {
-            return Ok(binding.spec_id);
         }
     }
 
@@ -85,19 +95,70 @@ pub async fn bind_authoritative_spec(
         .fetch_optional(pool)
         .await?
         .ok_or(BindSpecError::SpecNotFound)?;
-    if spec.user_id != *reporter_id {
-        return Err(BindSpecError::SpecNotOwned);
-    }
-
-    let nadeo_author = verifier
-        .author_id_for_uid(map_uid)
-        .await
-        .map_err(BindSpecError::AuthorVerification)?;
-    if nadeo_author != spec.user_id {
-        return Err(BindSpecError::AuthorMismatch);
+    let needs_verification = !existing_binding.is_some_and(|binding| binding.verified);
+    if needs_verification {
+        if spec.user_id != *reporter_id {
+            return Err(BindSpecError::SpecNotOwned);
+        }
+        let nadeo_author = verifier
+            .author_id_for_uid(reporter_id, map_uid)
+            .await
+            .map_err(BindSpecError::AuthorVerification)?;
+        if nadeo_author != spec.user_id {
+            return Err(BindSpecError::AuthorMismatch);
+        }
     }
 
     let mut tx = pool.begin().await?;
+    let locked_spec = query!(
+        r#"
+        SELECT user_id, name_id, spec, updated_at, md5(spec::text) AS "spec_hash!"
+        FROM custom_map_aux_specs
+        WHERE id = $1
+        FOR UPDATE
+        "#,
+        requested_spec_id
+    )
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or(BindSpecError::SpecNotFound)?;
+    if needs_verification && locked_spec.user_id != *reporter_id {
+        return Err(BindSpecError::SpecNotOwned);
+    }
+    let locked_binding = query!(
+        r#"
+        SELECT b.spec_id,
+               (b.author_verified_at IS NOT NULL AND b.verified_author_id = s.user_id) AS "verified!",
+               b.materialized_spec_updated_at, b.materialized_spec_hash
+        FROM map_listing_bind b
+        INNER JOIN custom_map_aux_specs s ON s.id = b.spec_id
+        WHERE b.map_uid = $1
+        FOR UPDATE OF b
+        "#,
+        map_uid
+    )
+    .fetch_optional(&mut *tx)
+    .await?;
+    let recovering_legacy = locked_binding.as_ref().is_some_and(|binding| !binding.verified);
+    if let Some(binding) = &locked_binding {
+        if binding.verified && binding.spec_id != requested_spec_id {
+            return Err(BindSpecError::ConflictingBinding);
+        }
+        if binding.verified
+            && binding.materialized_spec_updated_at == Some(locked_spec.updated_at)
+            && binding.materialized_spec_hash.as_deref() == Some(locked_spec.spec_hash.as_str())
+        {
+            tx.commit().await?;
+            return Ok(AuthoritativeBindResult {
+                spec_id: binding.spec_id,
+                removed_hat_wearers: vec![],
+                materialized: false,
+            });
+        }
+    }
+    let games = minigames::parse_catalog_games(&locked_spec.spec)?;
+    let collectible_rows = collectibles::parse_catalog_collectibles(&locked_spec.spec)?;
+    let hat_rows = hats::parse_catalog_hats(&locked_spec.spec)?;
     query!(
         r#"
         INSERT INTO map_listing_bind (map_uid, spec_id, verified_author_id, author_verified_at)
@@ -114,9 +175,19 @@ pub async fn bind_authoritative_spec(
     .await?;
     query!(
         r#"
-        UPDATE map_listing_bind
-        SET verified_author_id = $3, author_verified_at = NOW()
-        WHERE map_uid = $1 AND spec_id = $2 AND author_verified_at IS NULL
+        UPDATE map_listing_bind b
+        SET spec_id = $2,
+            verified_author_id = $3,
+            author_verified_at = NOW(),
+            materialized_spec_updated_at = NULL,
+            materialized_spec_hash = NULL
+        WHERE b.map_uid = $1
+          AND (
+              b.author_verified_at IS NULL
+              OR b.verified_author_id IS DISTINCT FROM (
+                  SELECT s.user_id FROM custom_map_aux_specs s WHERE s.id = b.spec_id
+              )
+          )
         "#,
         map_uid,
         requested_spec_id,
@@ -126,15 +197,17 @@ pub async fn bind_authoritative_spec(
     .await?;
     let winner = query!(
         r#"
-        SELECT spec_id, author_verified_at IS NOT NULL AS "verified!"
-        FROM map_listing_bind
-        WHERE map_uid = $1
+        SELECT b.spec_id,
+               (b.author_verified_at IS NOT NULL AND b.verified_author_id = s.user_id) AS "verified!"
+        FROM map_listing_bind b
+        INNER JOIN custom_map_aux_specs s ON s.id = b.spec_id
+        WHERE b.map_uid = $1
+        FOR UPDATE OF b
         "#,
         map_uid
     )
     .fetch_optional(&mut *tx)
     .await?;
-    tx.commit().await?;
 
     let Some(winner) = winner else {
         return Err(BindSpecError::SpecNotFound);
@@ -145,7 +218,45 @@ pub async fn bind_authoritative_spec(
     if !winner.verified {
         return Err(BindSpecError::AuthorVerification("binding was not durably verified".to_string()));
     }
-    Ok(winner.spec_id)
+    let mut removed_hat_wearers = if recovering_legacy {
+        hats::purge_map_equipment_in_tx(&mut tx, map_uid).await?
+    } else {
+        Vec::new()
+    };
+    minigames::replace_catalog_in_tx(&mut tx, requested_spec_id, &locked_spec.user_id, &locked_spec.name_id, &games).await?;
+    collectibles::replace_catalog_in_tx(
+        &mut tx,
+        requested_spec_id,
+        &locked_spec.user_id,
+        &locked_spec.name_id,
+        &collectible_rows,
+    )
+    .await?;
+    hats::replace_catalog_in_tx(&mut tx, requested_spec_id, &locked_spec.user_id, &locked_spec.name_id, &hat_rows).await?;
+    minigames::bind_map_from_catalog_in_tx(&mut tx, map_uid, requested_spec_id).await?;
+    collectibles::bind_map_from_catalog_in_tx(&mut tx, map_uid, requested_spec_id).await?;
+    let hat_bind = hats::bind_map_from_catalog_in_tx(&mut tx, map_uid, requested_spec_id).await?;
+    removed_hat_wearers.extend(hat_bind.removed_wearers);
+    query!(
+        r#"
+        UPDATE map_listing_bind
+        SET materialized_spec_updated_at = $2,
+            materialized_spec_hash = $3
+        WHERE map_uid = $1 AND spec_id = $4
+        "#,
+        map_uid,
+        locked_spec.updated_at,
+        locked_spec.spec_hash,
+        requested_spec_id
+    )
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(AuthoritativeBindResult {
+        spec_id: winner.spec_id,
+        removed_hat_wearers,
+        materialized: true,
+    })
 }
 
 /// Resolve an already verified binding, treating the client spec id only as a
@@ -154,11 +265,15 @@ pub async fn bind_authoritative_spec(
 pub async fn resolve_bound_spec(pool: &Pool<Postgres>, map_uid: &str, client_spec_id: i64) -> Result<Option<i64>, sqlx::Error> {
     let row = query!(
         r#"
-        SELECT spec_id
-        FROM map_listing_bind
-        WHERE map_uid = $1
-          AND spec_id = $2
-          AND author_verified_at IS NOT NULL
+        SELECT b.spec_id
+        FROM map_listing_bind b
+        INNER JOIN custom_map_aux_specs s ON s.id = b.spec_id
+        WHERE b.map_uid = $1
+          AND b.spec_id = $2
+          AND b.author_verified_at IS NOT NULL
+          AND b.verified_author_id = s.user_id
+          AND b.materialized_spec_updated_at = s.updated_at
+          AND b.materialized_spec_hash = md5(s.spec::text)
         "#,
         map_uid,
         client_spec_id
@@ -166,6 +281,51 @@ pub async fn resolve_bound_spec(pool: &Pool<Postgres>, map_uid: &str, client_spe
     .fetch_optional(pool)
     .await?;
     Ok(row.map(|row| row.spec_id))
+}
+
+/// Lock the source spec and its map binding in the same order as request 81,
+/// then prove the map's materialized snapshot still matches the source. A
+/// concurrent spec upload either completes first (and this fails closed) or
+/// waits until the gameplay transaction has committed against the old, still
+/// authoritative snapshot.
+pub(crate) async fn lock_materialized_spec(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    map_uid: &str,
+    spec_id: i64,
+) -> Result<bool, sqlx::Error> {
+    let source = query!(
+        r#"
+        SELECT user_id, updated_at, md5(spec::text) AS "spec_hash!"
+        FROM custom_map_aux_specs
+        WHERE id = $1
+        FOR SHARE
+        "#,
+        spec_id
+    )
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some(source) = source else {
+        return Ok(false);
+    };
+    let binding = query!(
+        r#"
+        SELECT verified_author_id, materialized_spec_updated_at, materialized_spec_hash
+        FROM map_listing_bind
+        WHERE map_uid = $1
+          AND spec_id = $2
+          AND author_verified_at IS NOT NULL
+        FOR SHARE
+        "#,
+        map_uid,
+        spec_id
+    )
+    .fetch_optional(&mut **tx)
+    .await?;
+    Ok(binding.is_some_and(|binding| {
+        binding.verified_author_id == Some(source.user_id)
+            && binding.materialized_spec_updated_at == Some(source.updated_at)
+            && binding.materialized_spec_hash.as_deref() == Some(source.spec_hash.as_str())
+    }))
 }
 
 /// First spec-on-map bind wins. Later specs do not replace it.
@@ -245,7 +405,7 @@ pub async fn get_listed_maps_page(pool: &Pool<Postgres>, page: u32) -> Result<Ve
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::queries::custom_map_aux_specs::{listing_threshold_from_spec, upsert_spec};
+    use crate::queries::custom_map_aux_specs::{listing_threshold_from_spec, upsert_spec, upsert_spec_and_catalogs};
     use crate::queries::moderation::{apply_map_ban, upsert_map_meta};
     use serde_json::json;
     use sqlx::postgres::PgPoolOptions;
@@ -260,9 +420,22 @@ mod tests {
         barrier: Option<Arc<Barrier>>,
     }
 
+    struct AlwaysRecordVerifier;
+
+    impl crate::nadeo::OfficialRecordVerifier for AlwaysRecordVerifier {
+        fn has_official_record<'a>(
+            &'a self,
+            _account_id: &'a Uuid,
+            _map_uid: &'a str,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, String>> + Send + 'a>> {
+            Box::pin(async { Ok(true) })
+        }
+    }
+
     impl MapAuthorVerifier for FakeAuthorVerifier {
         fn author_id_for_uid<'a>(
             &'a self,
+            _account_id: &'a Uuid,
             _map_uid: &'a str,
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Uuid, String>> + Send + 'a>> {
             Box::pin(async move {
@@ -283,7 +456,7 @@ mod tests {
         dotenv::dotenv().ok();
         let url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set for listed map tests");
         PgPoolOptions::new()
-            .max_connections(2)
+            .max_connections(8)
             .connect(&url)
             .await
             .expect("connect to DATABASE_URL")
@@ -495,7 +668,8 @@ mod tests {
         assert_eq!(
             bind_authoritative_spec(&pool, &verifier, &owner, &map_uid, first)
                 .await
-                .expect("first bind"),
+                .expect("first bind")
+                .spec_id,
             first
         );
         assert!(matches!(
@@ -578,6 +752,170 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn authoritative_owner_replaces_wrong_legacy_spec_and_purges_equipment() {
+        let _guard = test_lock();
+        let pool = test_pool().await;
+        let owner = seed_user(&pool, "bind-recovery-owner").await;
+        let legacy_owner = seed_user(&pool, "bind-recovery-legacy").await;
+        let map_uid = unique_map_uid("Recover_");
+        let legacy_spec = upsert_spec_and_catalogs(
+            &pool,
+            &legacy_owner,
+            "legacy-wrong",
+            &json!({"hats":[{"slug":"Hat-1","unlock":{"finishThisMap":true}}]}),
+        )
+        .await
+        .expect("legacy spec");
+        let owner_spec = upsert_spec_and_catalogs(
+            &pool,
+            &owner,
+            "authoritative",
+            &json!({"hats":[{"slug":"Hat-1","unlock":{"finishThisMap":true}}]}),
+        )
+        .await
+        .expect("owner spec");
+        hats::bind_map_from_catalog(&pool, &map_uid, legacy_spec)
+            .await
+            .expect("legacy materialization");
+        query!(
+            "INSERT INTO map_listing_bind (map_uid, spec_id) VALUES ($1, $2)",
+            map_uid,
+            legacy_spec
+        )
+        .execute(&pool)
+        .await
+        .expect("legacy binding");
+        query!(
+            r#"
+            INSERT INTO hat_unlock (user_id, hat_key, map_uid, slug)
+            VALUES ($1, substring(md5($2 || ':h:Hat-1') from 1 for 16), $2, 'Hat-1')
+            "#,
+            owner,
+            map_uid
+        )
+        .execute(&pool)
+        .await
+        .expect("legacy unlock");
+        query!(
+            r#"
+            INSERT INTO hat_equipped (user_id, map_uid, slug, hat_key)
+            VALUES ($1, $2, 'Hat-1', substring(md5($3 || ':h:Hat-1') from 1 for 16))
+            "#,
+            owner,
+            map_uid,
+            map_uid
+        )
+        .execute(&pool)
+        .await
+        .expect("legacy equipment");
+
+        assert_eq!(resolve_bound_spec(&pool, &map_uid, legacy_spec).await.unwrap(), None);
+        let verifier = FakeAuthorVerifier {
+            author: owner,
+            barrier: None,
+        };
+        let result = bind_authoritative_spec(&pool, &verifier, &owner, &map_uid, owner_spec)
+            .await
+            .expect("authoritative recovery");
+        assert_eq!(result.spec_id, owner_spec);
+        assert_eq!(result.removed_hat_wearers.len(), 1);
+        assert_eq!(result.removed_hat_wearers[0].wsid, owner.to_string());
+        assert!(result.removed_hat_wearers[0].slug.is_empty());
+        assert_eq!(resolve_bound_spec(&pool, &map_uid, legacy_spec).await.unwrap(), None);
+        assert_eq!(resolve_bound_spec(&pool, &map_uid, owner_spec).await.unwrap(), Some(owner_spec));
+        let binding = query!(
+            r#"
+            SELECT b.spec_id, b.verified_author_id,
+                   b.materialized_spec_updated_at = s.updated_at AS "revision_matches!",
+                   b.materialized_spec_hash = md5(s.spec::text) AS "hash_matches!"
+            FROM map_listing_bind b
+            JOIN custom_map_aux_specs s ON s.id = b.spec_id
+            WHERE b.map_uid = $1
+            "#,
+            map_uid
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("recovered binding");
+        assert_eq!(binding.spec_id, owner_spec);
+        assert_eq!(binding.verified_author_id, Some(owner));
+        assert!(binding.revision_matches);
+        assert!(binding.hash_matches);
+        assert_eq!(
+            query!("SELECT COUNT(*) AS count FROM hat_equipped WHERE map_uid = $1", map_uid)
+                .fetch_one(&pool)
+                .await
+                .expect("equipment count")
+                .count
+                .unwrap_or(0),
+            0,
+            "same-slug legacy equipment must not survive recovery"
+        );
+
+        let _ = query!("DELETE FROM hat_unlock WHERE user_id = $1 AND map_uid = $2", owner, map_uid)
+            .execute(&pool)
+            .await;
+        cleanup_map(&pool, &map_uid).await;
+        cleanup_user(&pool, &legacy_owner).await;
+        cleanup_user(&pool, &owner).await;
+    }
+
+    #[tokio::test]
+    async fn concurrent_legacy_takeover_has_exactly_one_authoritative_winner() {
+        let _guard = test_lock();
+        let pool = test_pool().await;
+        let owner = seed_user(&pool, "bind-takeover-owner").await;
+        let legacy_owner = seed_user(&pool, "bind-takeover-legacy").await;
+        let map_uid = unique_map_uid("Takeover");
+        let legacy_spec = upsert_spec(&pool, &legacy_owner, "legacy", &json!({"listingThreshold": 25}))
+            .await
+            .expect("legacy spec");
+        let first = upsert_spec(&pool, &owner, "takeover-first", &json!({"listingThreshold": 10}))
+            .await
+            .expect("first candidate");
+        let second = upsert_spec(&pool, &owner, "takeover-second", &json!({"listingThreshold": 20}))
+            .await
+            .expect("second candidate");
+        query!(
+            "INSERT INTO map_listing_bind (map_uid, spec_id) VALUES ($1, $2)",
+            map_uid,
+            legacy_spec
+        )
+        .execute(&pool)
+        .await
+        .expect("legacy binding");
+        let verifier = Arc::new(FakeAuthorVerifier {
+            author: owner,
+            barrier: Some(Arc::new(Barrier::new(2))),
+        });
+
+        let task = |spec_id| {
+            let pool = pool.clone();
+            let map_uid = map_uid.clone();
+            let verifier = verifier.clone();
+            tokio::spawn(async move { bind_authoritative_spec(&pool, verifier.as_ref(), &owner, &map_uid, spec_id).await })
+        };
+        let first_result = task(first);
+        let second_result = task(second);
+        let results = [first_result.await.unwrap(), second_result.await.unwrap()];
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(result, Err(BindSpecError::ConflictingBinding)))
+                .count(),
+            1
+        );
+        let winner = get_bound_spec_id(&pool, &map_uid).await.unwrap().expect("winner");
+        assert!(winner == first || winner == second);
+        assert_eq!(resolve_bound_spec(&pool, &map_uid, winner).await.unwrap(), Some(winner));
+
+        cleanup_map(&pool, &map_uid).await;
+        cleanup_user(&pool, &legacy_owner).await;
+        cleanup_user(&pool, &owner).await;
+    }
+
+    #[tokio::test]
     async fn unbound_legacy_and_mismatched_reports_fail_closed() {
         let _guard = test_lock();
         let pool = test_pool().await;
@@ -655,6 +993,495 @@ mod tests {
         assert_eq!(rows[0].name, "Authoritative");
         assert_eq!(rows[0].kind, "Sprint");
 
+        cleanup_map(&pool, &map_uid).await;
+        cleanup_user(&pool, &owner).await;
+    }
+
+    #[tokio::test]
+    async fn synchronized_bind_is_write_free_and_changed_revision_materializes_once() {
+        let _guard = test_lock();
+        let pool = test_pool().await;
+        let owner = seed_user(&pool, "bind-revision-owner").await;
+        let map_uid = unique_map_uid("Revision");
+        let name_id = format!("revision-{}", &Uuid::new_v4().simple().to_string()[..8]);
+        let initial = json!({
+            "minigames":{"games":[{"slug":"old-game","kind":"Sprint"}]},
+            "collectibles":[{"slug":"old-collectible","pickup":"grant"}],
+            "hats":[{"slug":"old-hat","unlock":{"finishThisMap":true}}]
+        });
+        let spec_id = upsert_spec_and_catalogs(&pool, &owner, &name_id, &initial)
+            .await
+            .expect("initial spec");
+        let verifier = FakeAuthorVerifier {
+            author: owner,
+            barrier: None,
+        };
+        let first = bind_authoritative_spec(&pool, &verifier, &owner, &map_uid, spec_id)
+            .await
+            .expect("initial materialization");
+        assert!(first.materialized);
+
+        let before_binding = query!(
+            r#"SELECT xmin::text AS "xmin!", materialized_spec_hash AS "hash!"
+               FROM map_listing_bind WHERE map_uid = $1"#,
+            map_uid
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("binding version");
+        let before_catalog = query!(
+            r#"SELECT xmin::text AS "xmin!" FROM minigame_catalog
+               WHERE spec_id = $1 AND slug = 'old-game'"#,
+            spec_id
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("catalog version");
+        let before_on_map = query!(
+            r#"SELECT xmin::text AS "xmin!" FROM minigame_on_map
+               WHERE map_uid = $1 AND slug = 'old-game'"#,
+            map_uid
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("on-map version");
+
+        let repeat = bind_authoritative_spec(&pool, &verifier, &owner, &map_uid, spec_id)
+            .await
+            .expect("idempotent repeat");
+        assert!(!repeat.materialized);
+        assert!(repeat.removed_hat_wearers.is_empty());
+        let after_binding = query!(
+            r#"SELECT xmin::text AS "xmin!", materialized_spec_hash AS "hash!"
+               FROM map_listing_bind WHERE map_uid = $1"#,
+            map_uid
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("unchanged binding version");
+        let after_catalog = query!(
+            r#"SELECT xmin::text AS "xmin!" FROM minigame_catalog
+               WHERE spec_id = $1 AND slug = 'old-game'"#,
+            spec_id
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("unchanged catalog version");
+        let after_on_map = query!(
+            r#"SELECT xmin::text AS "xmin!" FROM minigame_on_map
+               WHERE map_uid = $1 AND slug = 'old-game'"#,
+            map_uid
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("unchanged on-map version");
+        assert_eq!(after_binding.xmin, before_binding.xmin);
+        assert_eq!(after_binding.hash, before_binding.hash);
+        assert_eq!(after_catalog.xmin, before_catalog.xmin);
+        assert_eq!(after_on_map.xmin, before_on_map.xmin);
+
+        query!(
+            r#"
+            INSERT INTO hat_unlock (user_id, hat_key, map_uid, slug, unlocked_at)
+            VALUES ($1, substring(md5($2 || ':h:old-hat') from 1 for 16), $2, 'old-hat', NOW())
+            "#,
+            owner,
+            map_uid
+        )
+        .execute(&pool)
+        .await
+        .expect("seed old hat unlock");
+        query!(
+            r#"
+            INSERT INTO hat_equipped (user_id, map_uid, slug, hat_key, updated_at)
+            VALUES ($1, $2, 'old-hat', substring(md5($3 || ':h:old-hat') from 1 for 16), NOW())
+            "#,
+            owner,
+            map_uid,
+            map_uid
+        )
+        .execute(&pool)
+        .await
+        .expect("seed old equipped hat");
+
+        let changed = json!({
+            "minigames":{"games":[{"slug":"new-game","kind":"Darts"}]},
+            "collectibles":[{"slug":"new-collectible","pickup":"grant"}],
+            "hats":[{"slug":"new-hat","unlock":{"finishThisMap":true}}]
+        });
+        assert_eq!(
+            upsert_spec_and_catalogs(&pool, &owner, &name_id, &changed)
+                .await
+                .expect("changed revision"),
+            spec_id
+        );
+        let verifier = Arc::new(verifier);
+        let bind_changed_revision = || {
+            let pool = pool.clone();
+            let verifier = verifier.clone();
+            let map_uid = map_uid.clone();
+            tokio::spawn(async move { bind_authoritative_spec(&pool, verifier.as_ref(), &owner, &map_uid, spec_id).await })
+        };
+        let first_rebuild = bind_changed_revision();
+        let second_rebuild = bind_changed_revision();
+        let rebuilds = [
+            first_rebuild.await.expect("first rebuild task").expect("first changed bind"),
+            second_rebuild.await.expect("second rebuild task").expect("second changed bind"),
+        ];
+        assert_eq!(rebuilds.iter().filter(|result| result.materialized).count(), 1);
+        let removed_wearers: Vec<_> = rebuilds.iter().flat_map(|result| result.removed_hat_wearers.iter()).collect();
+        assert_eq!(removed_wearers.len(), 1);
+        assert_eq!(removed_wearers[0].wsid, owner.to_string());
+        assert!(removed_wearers[0].slug.is_empty());
+        let current = query!("SELECT slug FROM minigame_on_map WHERE map_uid = $1", map_uid)
+            .fetch_one(&pool)
+            .await
+            .expect("new materialization");
+        assert_eq!(current.slug, "new-game");
+
+        cleanup_map(&pool, &map_uid).await;
+        cleanup_user(&pool, &owner).await;
+    }
+
+    #[tokio::test]
+    async fn concurrent_source_update_blocks_all_gameplay_until_request_81_materializes() {
+        let _guard = test_lock();
+        let pool = test_pool().await;
+        let owner = seed_user(&pool, "snapshot-gameplay-owner").await;
+        let map_uid = unique_map_uid("Snapshot");
+        let name_id = format!("snapshot-{}", &Uuid::new_v4().simple().to_string()[..8]);
+        let old_spec = json!({
+            "minigames":{"games":[{"slug":"old-game","kind":"Sprint"}]},
+            "collectibles":[
+                {"slug":"old-unlock","pickup":"zone"},
+                {"slug":"old-collect","pickup":"grant"}
+            ],
+            "hats":[{"slug":"old-hat","unlock":{"finishThisMap":true}}]
+        });
+        let spec_id = upsert_spec_and_catalogs(&pool, &owner, &name_id, &old_spec)
+            .await
+            .expect("seed source snapshot");
+        let author_verifier = FakeAuthorVerifier {
+            author: owner,
+            barrier: None,
+        };
+        bind_authoritative_spec(&pool, &author_verifier, &owner, &map_uid, spec_id)
+            .await
+            .expect("materialize old snapshot");
+
+        let new_spec = json!({
+            "minigames":{"games":[{"slug":"new-game","kind":"Darts"}]},
+            "collectibles":[
+                {"slug":"new-unlock","pickup":"zone"},
+                {"slug":"new-collect","pickup":"grant"}
+            ],
+            "hats":[{"slug":"new-hat","unlock":{"finishThisMap":true}}]
+        });
+        let games = minigames::parse_catalog_games(&new_spec).expect("parse new games");
+        let collectible_rows = collectibles::parse_catalog_collectibles(&new_spec).expect("parse new collectibles");
+        let hat_rows = hats::parse_catalog_hats(&new_spec).expect("parse new hats");
+        let mut update_tx = pool.begin().await.expect("begin concurrent source update");
+        query!(
+            "UPDATE custom_map_aux_specs SET spec = $2, updated_at = updated_at + INTERVAL '1 second' WHERE id = $1",
+            spec_id,
+            new_spec
+        )
+        .execute(&mut *update_tx)
+        .await
+        .expect("update source revision");
+        minigames::replace_catalog_in_tx(&mut update_tx, spec_id, &owner, &name_id, &games)
+            .await
+            .expect("replace global games");
+        collectibles::replace_catalog_in_tx(&mut update_tx, spec_id, &owner, &name_id, &collectible_rows)
+            .await
+            .expect("replace global collectibles");
+        hats::replace_catalog_in_tx(&mut update_tx, spec_id, &owner, &name_id, &hat_rows)
+            .await
+            .expect("replace global hats");
+
+        let record_verifier = Arc::new(AlwaysRecordVerifier);
+        let game_task = {
+            let pool = pool.clone();
+            let map_uid = map_uid.clone();
+            tokio::spawn(async move { minigames::report_attempt(&pool, &owner, &map_uid, "old-game", spec_id, 123, "finish").await })
+        };
+        let unlock_task = {
+            let pool = pool.clone();
+            let map_uid = map_uid.clone();
+            tokio::spawn(async move { collectibles::report_unlock(&pool, &owner, &map_uid, "old-unlock", spec_id).await })
+        };
+        let collect_task = {
+            let pool = pool.clone();
+            let map_uid = map_uid.clone();
+            tokio::spawn(async move {
+                collectibles::report_collect(&pool, &owner, &map_uid, "old-collect", spec_id, 1.0, 2.0, 3.0, "grant").await
+            })
+        };
+        let hat_task = {
+            let pool = pool.clone();
+            let map_uid = map_uid.clone();
+            let record_verifier = record_verifier.clone();
+            tokio::spawn(async move { hats::report_unlock(&pool, record_verifier.as_ref(), &owner, &map_uid, "old-hat", spec_id).await })
+        };
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        update_tx.commit().await.expect("publish new source and global catalogs");
+        game_task.await.expect("gameplay task").expect("gameplay query");
+        unlock_task.await.expect("unlock task").expect("unlock query");
+        collect_task.await.expect("collect task").expect("collect query");
+        assert!(!hat_task.await.expect("hat task").expect("hat query"));
+
+        assert_eq!(
+            query!("SELECT COUNT(*) AS count FROM minigame_attempt WHERE user_id = $1", owner)
+                .fetch_one(&pool)
+                .await
+                .expect("attempt count")
+                .count
+                .unwrap_or(0),
+            0
+        );
+        assert_eq!(
+            query!("SELECT COUNT(*) AS count FROM minigame_pb WHERE user_id = $1", owner)
+                .fetch_one(&pool)
+                .await
+                .expect("pb count")
+                .count
+                .unwrap_or(0),
+            0
+        );
+        assert_eq!(
+            query!("SELECT COUNT(*) AS count FROM collectible_progress WHERE user_id = $1", owner)
+                .fetch_one(&pool)
+                .await
+                .expect("progress count")
+                .count
+                .unwrap_or(0),
+            0
+        );
+        assert_eq!(
+            query!("SELECT COUNT(*) AS count FROM hat_unlock WHERE user_id = $1", owner)
+                .fetch_one(&pool)
+                .await
+                .expect("hat count")
+                .count
+                .unwrap_or(0),
+            0
+        );
+        assert_eq!(
+            query!("SELECT slug FROM minigame_on_map WHERE map_uid = $1", map_uid)
+                .fetch_one(&pool)
+                .await
+                .expect("old on-map snapshot")
+                .slug,
+            "old-game"
+        );
+        assert_eq!(
+            query!("SELECT slug FROM minigame_catalog WHERE spec_id = $1", spec_id)
+                .fetch_one(&pool)
+                .await
+                .expect("new global catalog")
+                .slug,
+            "new-game"
+        );
+
+        let rebuilt = bind_authoritative_spec(&pool, &author_verifier, &owner, &map_uid, spec_id)
+            .await
+            .expect("request 81 rebuild");
+        assert!(rebuilt.materialized);
+        minigames::report_attempt(&pool, &owner, &map_uid, "new-game", spec_id, 456, "finish")
+            .await
+            .expect("new game report");
+        collectibles::report_unlock(&pool, &owner, &map_uid, "new-unlock", spec_id)
+            .await
+            .expect("new unlock report");
+        collectibles::report_collect(&pool, &owner, &map_uid, "new-collect", spec_id, 4.0, 5.0, 6.0, "grant")
+            .await
+            .expect("new collect report");
+        assert!(
+            hats::report_unlock(&pool, record_verifier.as_ref(), &owner, &map_uid, "new-hat", spec_id)
+                .await
+                .expect("new hat report")
+        );
+        assert_eq!(
+            query!("SELECT COUNT(*) AS count FROM minigame_pb WHERE user_id = $1", owner)
+                .fetch_one(&pool)
+                .await
+                .expect("materialized pb count")
+                .count
+                .unwrap_or(0),
+            1
+        );
+        assert_eq!(
+            query!("SELECT COUNT(*) AS count FROM collectible_progress WHERE user_id = $1", owner)
+                .fetch_one(&pool)
+                .await
+                .expect("materialized progress count")
+                .count
+                .unwrap_or(0),
+            2
+        );
+        assert_eq!(
+            query!("SELECT COUNT(*) AS count FROM hat_unlock WHERE user_id = $1", owner)
+                .fetch_one(&pool)
+                .await
+                .expect("materialized hat count")
+                .count
+                .unwrap_or(0),
+            1
+        );
+
+        cleanup_map(&pool, &map_uid).await;
+        cleanup_user(&pool, &owner).await;
+    }
+
+    #[tokio::test]
+    async fn authoritative_rebuild_rolls_back_catalogs_on_map_rows_and_hat_cleanup_together() {
+        let _guard = test_lock();
+        let pool = test_pool().await;
+        let owner = seed_user(&pool, "bind-atomic-owner").await;
+        let map_uid = unique_map_uid("Atomic_");
+        let name_id = format!("atomic-{}", &Uuid::new_v4().simple().to_string()[..8]);
+        let old_spec = json!({
+            "listingThreshold": 11,
+            "minigames":{"games":[{"slug":"old-game","kind":"Sprint"}]},
+            "collectibles":[{"slug":"old-collectible","pickup":"grant"}],
+            "hats":[{"slug":"old-hat","unlock":{"finishThisMap":true}}]
+        });
+        let spec_id = upsert_spec_and_catalogs(&pool, &owner, &name_id, &old_spec)
+            .await
+            .expect("seed spec and catalogs");
+        let verifier = FakeAuthorVerifier {
+            author: owner,
+            barrier: None,
+        };
+        bind_authoritative_spec(&pool, &verifier, &owner, &map_uid, spec_id)
+            .await
+            .expect("initial bind");
+        query!(
+            r#"
+            INSERT INTO hat_unlock (user_id, hat_key, map_uid, slug, unlocked_at)
+            VALUES ($1, substring(md5($2 || ':h:old-hat') from 1 for 16), $2, 'old-hat', NOW())
+            "#,
+            owner,
+            map_uid
+        )
+        .execute(&pool)
+        .await
+        .expect("seed unlock");
+        query!(
+            r#"
+            INSERT INTO hat_equipped (user_id, map_uid, slug, hat_key, updated_at)
+            VALUES ($1, $2, 'old-hat', substring(md5($3 || ':h:old-hat') from 1 for 16), NOW())
+            "#,
+            owner,
+            map_uid,
+            map_uid
+        )
+        .execute(&pool)
+        .await
+        .expect("seed equipment");
+
+        let new_spec = json!({
+            "listingThreshold": 77,
+            "minigames":{"games":[{"slug":"new-game","kind":"Darts"}]},
+            "collectibles":[{"slug":"new-collectible","pickup":"grant"}],
+            "hats":[{"slug":"new-hat","unlock":{"finishThisMap":true}}]
+        });
+        assert_eq!(
+            upsert_spec(&pool, &owner, &name_id, &new_spec).await.expect("update source spec"),
+            spec_id
+        );
+
+        sqlx::query("DROP TRIGGER IF EXISTS dd2_test_fail_hat_on_map ON hat_on_map")
+            .execute(&pool)
+            .await
+            .expect("drop stale trigger");
+        sqlx::query("DROP FUNCTION IF EXISTS dd2_test_fail_hat_on_map()")
+            .execute(&pool)
+            .await
+            .expect("drop stale trigger function");
+        sqlx::query(
+            "CREATE FUNCTION dd2_test_fail_hat_on_map() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'forced hat on map failure'; END $$",
+        )
+        .execute(&pool)
+        .await
+        .expect("create trigger function");
+        sqlx::query(
+            "CREATE TRIGGER dd2_test_fail_hat_on_map BEFORE INSERT ON hat_on_map FOR EACH ROW EXECUTE FUNCTION dd2_test_fail_hat_on_map()",
+        )
+        .execute(&pool)
+        .await
+        .expect("create trigger");
+
+        let result = bind_authoritative_spec(&pool, &verifier, &owner, &map_uid, spec_id).await;
+
+        sqlx::query("DROP TRIGGER dd2_test_fail_hat_on_map ON hat_on_map")
+            .execute(&pool)
+            .await
+            .expect("drop trigger");
+        sqlx::query("DROP FUNCTION dd2_test_fail_hat_on_map()")
+            .execute(&pool)
+            .await
+            .expect("drop trigger function");
+        assert!(matches!(result, Err(BindSpecError::Database(_))));
+
+        let stored = query!("SELECT spec, listing_threshold FROM custom_map_aux_specs WHERE id = $1", spec_id)
+            .fetch_one(&pool)
+            .await
+            .expect("source spec remains coherent");
+        assert_eq!(stored.spec, new_spec);
+        assert_eq!(stored.listing_threshold, 77);
+        let game_catalog = query!("SELECT slug FROM minigame_catalog WHERE spec_id = $1", spec_id)
+            .fetch_one(&pool)
+            .await
+            .expect("old game catalog retained");
+        let collectible_catalog = query!("SELECT slug FROM collectible_catalog WHERE spec_id = $1", spec_id)
+            .fetch_one(&pool)
+            .await
+            .expect("old collectible catalog retained");
+        let hat_catalog = query!("SELECT slug FROM hat_catalog WHERE spec_id = $1", spec_id)
+            .fetch_one(&pool)
+            .await
+            .expect("old hat catalog retained");
+        assert_eq!(game_catalog.slug, "old-game");
+        assert_eq!(collectible_catalog.slug, "old-collectible");
+        assert_eq!(hat_catalog.slug, "old-hat");
+
+        let game_on_map = query!("SELECT slug FROM minigame_on_map WHERE map_uid = $1", map_uid)
+            .fetch_one(&pool)
+            .await
+            .expect("old game binding retained");
+        let collectible_on_map = query!("SELECT slug FROM collectible_on_map WHERE map_uid = $1", map_uid)
+            .fetch_one(&pool)
+            .await
+            .expect("old collectible binding retained");
+        let hat_on_map = query!("SELECT slug FROM hat_on_map WHERE map_uid = $1", map_uid)
+            .fetch_one(&pool)
+            .await
+            .expect("old hat binding retained");
+        assert_eq!(game_on_map.slug, "old-game");
+        assert_eq!(collectible_on_map.slug, "old-collectible");
+        assert_eq!(hat_on_map.slug, "old-hat");
+        assert_eq!(
+            query!(
+                "SELECT COUNT(*) AS count FROM hat_equipped WHERE user_id = $1 AND map_uid = $2",
+                owner,
+                map_uid
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("equipment retained")
+            .count
+            .unwrap_or(0),
+            1
+        );
+
+        let _ = query!("DELETE FROM hat_equipped WHERE user_id = $1 AND map_uid = $2", owner, map_uid)
+            .execute(&pool)
+            .await;
+        let _ = query!("DELETE FROM hat_unlock WHERE user_id = $1 AND map_uid = $2", owner, map_uid)
+            .execute(&pool)
+            .await;
         cleanup_map(&pool, &map_uid).await;
         cleanup_user(&pool, &owner).await;
     }

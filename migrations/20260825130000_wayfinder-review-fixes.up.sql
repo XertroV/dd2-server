@@ -11,10 +11,14 @@ ALTER TABLE map_listing_bind
     ALTER COLUMN spec_id SET NOT NULL,
     ADD COLUMN verified_author_id UUID,
     ADD COLUMN author_verified_at TIMESTAMPTZ,
+    ADD COLUMN materialized_spec_updated_at TIMESTAMPTZ,
+    ADD COLUMN materialized_spec_hash TEXT,
     ADD CONSTRAINT map_listing_bind_spec_id_fkey
         FOREIGN KEY (spec_id) REFERENCES custom_map_aux_specs(id) ON DELETE RESTRICT,
     ADD CONSTRAINT map_listing_bind_verification_pair_check
-        CHECK ((verified_author_id IS NULL) = (author_verified_at IS NULL));
+        CHECK ((verified_author_id IS NULL) = (author_verified_at IS NULL)),
+    ADD CONSTRAINT map_listing_bind_materialization_pair_check
+        CHECK ((materialized_spec_updated_at IS NULL) = (materialized_spec_hash IS NULL));
 
 UPDATE minigame_catalog
 SET kind = CASE kind
@@ -38,6 +42,15 @@ ALTER TABLE minigame_catalog
 ALTER TABLE minigame_on_map
     ADD CONSTRAINT minigame_on_map_canonical_kind_check
     CHECK (kind IN ('Sprint', 'Survival', 'Darts', 'HighJump', 'LongJump', 'MaxAvgSpeed'));
+
+-- Keep existing legacy rows readable while rejecting every new negative finish
+-- score at both persistence layers.
+ALTER TABLE minigame_attempt
+    ADD CONSTRAINT minigame_attempt_finish_score_nonnegative_check
+    CHECK (status <> 'finish' OR elapsed_ms >= 0) NOT VALID;
+ALTER TABLE minigame_pb
+    ADD CONSTRAINT minigame_pb_score_nonnegative_check
+    CHECK (score >= 0) NOT VALID;
 
 ALTER TABLE collectible_catalog
     ADD COLUMN collect_on_unlock BOOLEAN NOT NULL DEFAULT FALSE,
@@ -88,7 +101,8 @@ BEGIN
     FROM map_listing_bind b
     LEFT JOIN custom_map_aux_specs s ON s.id = b.spec_id
     WHERE b.map_uid = NEW.map_uid
-      AND b.author_verified_at IS NOT NULL;
+      AND b.author_verified_at IS NOT NULL
+      AND b.verified_author_id = s.user_id;
 
     thresh := LEAST(100, GREATEST(5, COALESCE(thresh, 25)));
 

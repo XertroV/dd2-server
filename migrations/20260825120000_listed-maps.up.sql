@@ -9,13 +9,12 @@ ALTER TABLE custom_map_aux_specs
     CHECK (listing_threshold >= 5 AND listing_threshold <= 100);
 
 UPDATE custom_map_aux_specs
-SET listing_threshold = LEAST(100, GREATEST(5,
-    CASE
-        WHEN jsonb_typeof(spec -> 'listingThreshold') = 'number'
-            THEN TRUNC((spec ->> 'listingThreshold')::numeric)::int
-        ELSE 25
-    END
-));
+SET listing_threshold = CASE
+    WHEN jsonb_typeof(spec -> 'listingThreshold') IS DISTINCT FROM 'number' THEN 25
+    WHEN (spec ->> 'listingThreshold')::numeric < 5 THEN 5
+    WHEN (spec ->> 'listingThreshold')::numeric > 100 THEN 100
+    ELSE TRUNC((spec ->> 'listingThreshold')::numeric)::int
+END;
 
 -- First ReportMinigameMap bind for a map. Later specs do not replace it.
 CREATE TABLE map_listing_bind (
