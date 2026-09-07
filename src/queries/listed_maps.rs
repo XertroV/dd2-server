@@ -80,6 +80,9 @@ pub struct AuthoritativeBindResult {
     pub spec_id: i64,
     pub removed_hat_wearers: Vec<crate::router::HatOnMapPlayer>,
     pub materialized: bool,
+    /// True when a previously usable binding to a different spec (or a stale
+    /// legacy binding) was replaced by this bind.
+    pub replaced_previous: bool,
 }
 
 /// Everything a bind can decide before the per-map lock is taken, including the
@@ -227,6 +230,7 @@ pub async fn commit_authoritative_bind(
                 spec_id: binding.spec_id,
                 removed_hat_wearers: vec![],
                 materialized: false,
+                replaced_previous: false,
             });
         }
     }
@@ -330,6 +334,7 @@ pub async fn commit_authoritative_bind(
         spec_id: winner.spec_id,
         removed_hat_wearers,
         materialized: true,
+        replaced_previous: recovering_legacy,
     })
 }
 
@@ -344,6 +349,230 @@ pub async fn bind_authoritative_spec(
 ) -> Result<AuthoritativeBindResult, BindSpecError> {
     let prepared = prepare_authoritative_bind(pool, verifier, reporter_id, map_uid, requested_spec_id).await?;
     commit_authoritative_bind(pool, &prepared, reporter_id, map_uid, requested_spec_id).await
+}
+
+/// Parse the aux-spec pointer out of a Dips++ map comment. The comment block
+/// is `--BEGIN-DPP--` ... `--END-DPP--` with a `url=` line whose path ends in
+/// `/aux_spec/<wsid>/<name_id>.json`.
+pub fn parse_dpp_comment_url(comment: &str) -> Option<(Uuid, String)> {
+    let start = comment.find("--BEGIN-DPP--")?;
+    let end = comment[start..].find("--END-DPP--").map(|i| start + i)?;
+    let block = &comment[start..end];
+    let url_line = block.lines().find(|l| l.trim_start().starts_with("url="))?;
+    let url = url_line.trim_start().trim_start_matches("url=").trim();
+    let path = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
+    let mut segments = path.split('/').filter(|s| !s.is_empty()).collect::<Vec<_>>();
+    if segments.len() < 3 {
+        return None;
+    }
+    let name = segments.pop()?.trim_end_matches(".json").to_string();
+    let wsid = segments.pop()?;
+    if segments.last() != Some(&"aux_spec") {
+        return None;
+    }
+    let wsid = Uuid::parse_str(wsid).ok()?;
+    if name.is_empty() || name.len() > 32 {
+        return None;
+    }
+    Some((wsid, name))
+}
+
+/// Outcome of one comment-derived bind attempt, for logging and the admin
+/// recheck endpoint.
+#[derive(Debug)]
+pub enum CommentBindOutcome {
+    Bound {
+        spec_id: i64,
+        materialized: bool,
+        replaced_previous: bool,
+    },
+    NotOnNadeo,
+    NoComment,
+    NoDppUrl,
+    SpecNotFound,
+    OffNadeo(String),
+}
+
+impl std::fmt::Display for CommentBindOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CommentBindOutcome::Bound {
+                spec_id,
+                materialized,
+                replaced_previous,
+            } => write!(
+                f,
+                "bound spec {} (materialized: {}, replaced previous: {})",
+                spec_id, materialized, replaced_previous
+            ),
+            CommentBindOutcome::NotOnNadeo => write!(f, "map is not on Nadeo yet"),
+            CommentBindOutcome::NoComment => write!(f, "map has no comment"),
+            CommentBindOutcome::NoDppUrl => write!(f, "comment has no Dips++ url"),
+            CommentBindOutcome::SpecNotFound => write!(f, "comment url does not resolve to a spec"),
+            CommentBindOutcome::OffNadeo(error) => write!(f, "Nadeo lookup failed: {}", error),
+        }
+    }
+}
+
+/// Bind a map to whatever spec its published comment references. The comment
+/// is the map publisher's endorsement (only they can publish or update the
+/// map), so there is no author/spec-owner equality requirement — team maps
+/// where the uploader differs from the author are the normal case. A
+/// comment-derived bind follows the latest comment and may replace an
+/// earlier binding.
+pub async fn try_comment_bind(
+    pool: &Pool<Postgres>,
+    nadeo: &crate::nadeo::NadeoLiveClient,
+    map_uid: &str,
+) -> (CommentBindOutcome, Vec<crate::router::HatOnMapPlayer>) {
+    let comment = match nadeo.fetch_published_comment(map_uid).await {
+        Ok(crate::nadeo::PublishedComment::NotOnNadeo) => {
+            return (CommentBindOutcome::NotOnNadeo, Vec::new());
+        }
+        Ok(crate::nadeo::PublishedComment::Comment(None)) => {
+            return (CommentBindOutcome::NoComment, Vec::new());
+        }
+        Ok(crate::nadeo::PublishedComment::Comment(Some(comment))) => comment,
+        Err(error) => return (CommentBindOutcome::OffNadeo(error), Vec::new()),
+    };
+    let Some((wsid, name_id)) = parse_dpp_comment_url(&comment) else {
+        return (CommentBindOutcome::NoDppUrl, Vec::new());
+    };
+    match bind_from_resolved_comment(pool, map_uid, &wsid, &name_id).await {
+        Ok(result) => (
+            CommentBindOutcome::Bound {
+                spec_id: result.spec_id,
+                materialized: result.materialized,
+                replaced_previous: result.replaced_previous,
+            },
+            result.removed_hat_wearers,
+        ),
+        Err(BindSpecError::SpecNotFound) => (CommentBindOutcome::SpecNotFound, Vec::new()),
+        Err(error) => (CommentBindOutcome::OffNadeo(error.to_string()), Vec::new()),
+    }
+}
+
+/// DB half of the comment bind: resolve the spec exactly the way a client's
+/// `GET /aux_spec/<wsid>/<name_id>.json` would, then bind (following the
+/// latest comment) and materialize.
+pub async fn bind_from_resolved_comment(
+    pool: &Pool<Postgres>,
+    map_uid: &str,
+    wsid: &Uuid,
+    name_id: &str,
+) -> Result<AuthoritativeBindResult, BindSpecError> {
+    let row = query!(
+        r#"SELECT id FROM custom_map_aux_specs WHERE user_id = $1 AND name_id = $2"#,
+        wsid,
+        name_id
+    )
+    .fetch_optional(pool)
+    .await?
+    .ok_or(BindSpecError::SpecNotFound)?;
+    commit_comment_bind(pool, map_uid, row.id).await
+}
+
+async fn commit_comment_bind(pool: &Pool<Postgres>, map_uid: &str, spec_id: i64) -> Result<AuthoritativeBindResult, BindSpecError> {
+    let mut tx = pool.begin().await?;
+    let locked_spec = query!(
+        r#"
+        SELECT user_id, name_id, spec, updated_at, spec_hash
+        FROM custom_map_aux_specs
+        WHERE id = $1
+        FOR UPDATE
+        "#,
+        spec_id
+    )
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or(BindSpecError::SpecNotFound)?;
+    let locked_binding = query!(
+        r#"
+        SELECT b.spec_id,
+               (b.author_verified_at IS NOT NULL AND b.verified_author_id = s.user_id) AS "verified!",
+               b.materialized_spec_updated_at, b.materialized_spec_hash
+        FROM map_listing_bind b
+        INNER JOIN custom_map_aux_specs s ON s.id = b.spec_id
+        WHERE b.map_uid = $1
+        FOR UPDATE OF b
+        "#,
+        map_uid
+    )
+    .fetch_optional(&mut *tx)
+    .await?;
+    // Follow the latest comment: the current binding is only a cache of the
+    // previous comment's choice.
+    let replaced_previous = locked_binding.as_ref().is_some_and(|b| b.spec_id != spec_id);
+    if let Some(binding) = &locked_binding {
+        if !replaced_previous
+            && binding.verified
+            && binding.materialized_spec_updated_at == Some(locked_spec.updated_at)
+            && binding.materialized_spec_hash.as_deref() == Some(locked_spec.spec_hash.as_str())
+        {
+            tx.commit().await?;
+            return Ok(AuthoritativeBindResult {
+                spec_id,
+                removed_hat_wearers: vec![],
+                materialized: false,
+                replaced_previous: false,
+            });
+        }
+    }
+    // Same fail-closed catalog validation as the author-present path.
+    let games = minigames::parse_catalog_games(&locked_spec.spec)?;
+    let collectible_rows = collectibles::parse_catalog_collectibles(&locked_spec.spec)?;
+    let hat_rows = hats::parse_catalog_hats(&locked_spec.spec)?;
+    // The comment is the endorsement: verified_author_id is the spec owner so
+    // the existing `verified` invariant (owner == verified id) holds.
+    query!(
+        r#"
+        INSERT INTO map_listing_bind (map_uid, spec_id, verified_author_id, author_verified_at)
+        VALUES ($1, $2, $3, NOW())
+        ON CONFLICT (map_uid) DO UPDATE SET
+            spec_id = EXCLUDED.spec_id,
+            verified_author_id = EXCLUDED.verified_author_id,
+            author_verified_at = NOW(),
+            materialized_spec_updated_at = NULL,
+            materialized_spec_hash = NULL
+        "#,
+        map_uid,
+        spec_id,
+        locked_spec.user_id
+    )
+    .execute(&mut *tx)
+    .await?;
+    let removed_hat_wearers = if replaced_previous {
+        hats::purge_map_equipment_in_tx(&mut tx, map_uid).await?
+    } else {
+        Vec::new()
+    };
+    minigames::replace_catalog_in_tx(&mut tx, spec_id, &locked_spec.user_id, &locked_spec.name_id, &games).await?;
+    collectibles::replace_catalog_in_tx(&mut tx, spec_id, &locked_spec.user_id, &locked_spec.name_id, &collectible_rows).await?;
+    hats::replace_catalog_in_tx(&mut tx, spec_id, &locked_spec.user_id, &locked_spec.name_id, &hat_rows).await?;
+    minigames::bind_map_from_catalog_in_tx(&mut tx, map_uid, spec_id).await?;
+    collectibles::bind_map_from_catalog_in_tx(&mut tx, map_uid, spec_id).await?;
+    hats::bind_map_from_catalog_in_tx(&mut tx, map_uid, spec_id).await?;
+    query!(
+        r#"
+        UPDATE map_listing_bind
+        SET materialized_spec_updated_at = $2,
+            materialized_spec_hash = $3
+        WHERE map_uid = $1 AND spec_id = $4
+        "#,
+        map_uid,
+        locked_spec.updated_at,
+        locked_spec.spec_hash,
+        spec_id
+    )
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(AuthoritativeBindResult {
+        spec_id,
+        removed_hat_wearers,
+        materialized: true,
+        replaced_previous,
+    })
 }
 
 /// Spec id of this map's verified, materialized binding, if it has one. Same
@@ -1958,5 +2187,174 @@ mod tests {
         cleanup_map(&pool, &tie_a).await;
         cleanup_map(&pool, &tie_b).await;
         cleanup_user(&pool, &author).await;
+    }
+
+    #[test]
+    fn dpp_comment_url_parses_the_plugin_format() {
+        let wsid = "0a2d1bc0-4aaa-4374-b2db-3d561bdab1c9";
+        let comment = format!(
+            "--BEGIN-DPP--\nurl=https://dips-plus-plus.xk.io/aux_spec/{}/my-first-custom-map.json\nfloor00=105.675\nminClientVersion=0.5.9\n--END-DPP--",
+            wsid
+        );
+        let (parsed_wsid, name) = parse_dpp_comment_url(&comment).expect("url parses");
+        assert_eq!(parsed_wsid.to_string(), wsid);
+        assert_eq!(name, "my-first-custom-map");
+        // No block, no url line, non-aux-spec URLs, and garbage wsids all fail.
+        assert!(parse_dpp_comment_url("url=https://example.com/nope.json").is_none());
+        assert!(parse_dpp_comment_url("--BEGIN-DPP--\nfloor00=1\n--END-DPP--").is_none());
+        assert!(parse_dpp_comment_url("--BEGIN-DPP--\nurl=https://example.com/other/x/y.json\n--END-DPP--").is_none());
+        assert!(parse_dpp_comment_url("--BEGIN-DPP--\nurl=https://example.com/aux_spec/not-a-uuid/y.json\n--END-DPP--").is_none());
+        // Unterminated blocks are rejected.
+        assert!(parse_dpp_comment_url(&comment.replace("--END-DPP--", "")).is_none());
+    }
+
+    #[tokio::test]
+    async fn comment_bind_binds_the_comment_spec_without_author_equality() {
+        let _guard = test_lock();
+        let pool = test_pool().await;
+        // A team map: the spec uploader is not the map author. The published
+        // comment is the endorsement, so the bind must succeed anyway.
+        let uploader = seed_user(&pool, "comment-bind-uploader").await;
+        let spec_id = upsert_spec_and_catalogs(
+            &pool,
+            &uploader,
+            "team-map-spec",
+            &json!({"hats":[{"slug":"Hat-1","unlock":{"finishThisMap":true}}]}),
+        )
+        .await
+        .expect("spec");
+        let map_uid = unique_map_uid("CmtBnd");
+
+        let result = bind_from_resolved_comment(&pool, &map_uid, &uploader, "team-map-spec")
+            .await
+            .expect("comment bind");
+        assert_eq!(result.spec_id, spec_id);
+        assert!(result.materialized);
+        assert!(!result.replaced_previous);
+        assert_eq!(resolve_bound_spec(&pool, &map_uid, spec_id).await.unwrap(), Some(spec_id));
+
+        cleanup_map(&pool, &map_uid).await;
+        cleanup_user(&pool, &uploader).await;
+    }
+
+    #[tokio::test]
+    async fn comment_bind_follows_the_latest_comment_and_purges_equipment() {
+        let _guard = test_lock();
+        let pool = test_pool().await;
+        let first_owner = seed_user(&pool, "comment-follow-first").await;
+        let second_owner = seed_user(&pool, "comment-follow-second").await;
+        let map_uid = unique_map_uid("CmtFfw");
+        let first = upsert_spec_and_catalogs(
+            &pool,
+            &first_owner,
+            "first-spec",
+            &json!({"hats":[{"slug":"Hat-1","unlock":{"finishThisMap":true}}]}),
+        )
+        .await
+        .expect("first spec");
+        let second = upsert_spec_and_catalogs(
+            &pool,
+            &second_owner,
+            "second-spec",
+            &json!({"hats":[{"slug":"Hat-1","unlock":{"finishThisMap":true}}]}),
+        )
+        .await
+        .expect("second spec");
+        bind_from_resolved_comment(&pool, &map_uid, &first_owner, "first-spec")
+            .await
+            .expect("first bind");
+        // A player wearing the first spec's hat must lose it when the
+        // publisher's comment moves to the second spec.
+        query!(
+            r#"
+            INSERT INTO hat_unlock (user_id, hat_key, map_uid, slug)
+            VALUES ($1, substring(md5($2 || ':h:Hat-1') from 1 for 16), $2, 'Hat-1')
+            "#,
+            first_owner,
+            map_uid
+        )
+        .execute(&pool)
+        .await
+        .expect("unlock");
+        query!(
+            r#"
+            INSERT INTO hat_equipped (user_id, map_uid, slug, hat_key)
+            VALUES ($1, $2, 'Hat-1', substring(md5($3 || ':h:Hat-1') from 1 for 16))
+            "#,
+            first_owner,
+            map_uid,
+            map_uid
+        )
+        .execute(&pool)
+        .await
+        .expect("equipment");
+
+        let result = bind_from_resolved_comment(&pool, &map_uid, &second_owner, "second-spec")
+            .await
+            .expect("second bind");
+        assert_eq!(result.spec_id, second);
+        assert!(result.replaced_previous);
+        assert_eq!(result.removed_hat_wearers.len(), 1);
+        assert_eq!(resolve_bound_spec(&pool, &map_uid, first).await.unwrap(), None);
+        assert_eq!(resolve_bound_spec(&pool, &map_uid, second).await.unwrap(), Some(second));
+        assert_eq!(
+            query!("SELECT COUNT(*) AS count FROM hat_equipped WHERE map_uid = $1", map_uid)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+                .count
+                .unwrap_or(0),
+            0
+        );
+
+        let _ = query!("DELETE FROM hat_unlock WHERE user_id = $1 AND map_uid = $2", first_owner, map_uid)
+            .execute(&pool)
+            .await;
+        cleanup_map(&pool, &map_uid).await;
+        cleanup_user(&pool, &first_owner).await;
+        cleanup_user(&pool, &second_owner).await;
+    }
+
+    #[tokio::test]
+    async fn comment_bind_rematerializes_revised_spec_and_reports_missing_spec() {
+        let _guard = test_lock();
+        let pool = test_pool().await;
+        let owner = seed_user(&pool, "comment-revision-owner").await;
+        let map_uid = unique_map_uid("CmtRev");
+        let spec_id = upsert_spec_and_catalogs(
+            &pool,
+            &owner,
+            "revised-spec",
+            &json!({"hats":[{"slug":"Hat-1","unlock":{"finishThisMap":true}}]}),
+        )
+        .await
+        .expect("spec");
+        bind_from_resolved_comment(&pool, &map_uid, &owner, "revised-spec")
+            .await
+            .expect("first bind");
+        // Publisher re-uploads the same spec name with new content.
+        upsert_spec_and_catalogs(
+            &pool,
+            &owner,
+            "revised-spec",
+            &json!({"hats":[{"slug":"Hat-2","unlock":{"finishThisMap":true}}]}),
+        )
+        .await
+        .expect("revised spec");
+        let result = bind_from_resolved_comment(&pool, &map_uid, &owner, "revised-spec")
+            .await
+            .expect("second bind");
+        assert_eq!(result.spec_id, spec_id);
+        assert!(result.materialized, "revision must re-materialize");
+        assert!(!result.replaced_previous);
+        assert_eq!(resolve_bound_spec(&pool, &map_uid, spec_id).await.unwrap(), Some(spec_id));
+
+        assert!(matches!(
+            bind_from_resolved_comment(&pool, &map_uid, &owner, "no-such-spec").await,
+            Err(BindSpecError::SpecNotFound)
+        ));
+
+        cleanup_map(&pool, &map_uid).await;
+        cleanup_user(&pool, &owner).await;
     }
 }

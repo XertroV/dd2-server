@@ -100,6 +100,151 @@ lazy_static! {
     static ref HAT_EQUIP_LIMITER: queries::hats::HatEquipRateLimiter =
         queries::hats::HatEquipRateLimiter::new(4096, Duration::from_millis(250), Duration::from_secs(1), 2048);
     static ref WAYFINDER_MAP_OPERATION_LOCKS: WayfinderMapOperationLocks = Default::default();
+    static ref COMMENT_BIND_STATE: std::sync::Mutex<HashMap<String, CommentBindState>> =
+        std::sync::Mutex::new(HashMap::new());
+    static ref COMMENT_BIND_PERMITS: tokio::sync::Semaphore = tokio::sync::Semaphore::new(2);
+}
+
+/// Debounce bookkeeping for one observed map uid.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CommentBindState {
+    next_attempt: time::Instant,
+    attempts: u8,
+}
+
+/// Backoff between comment lookups for a map that is not on Nadeo yet.
+/// Players on a local/unpublished copy keep re-observing the map, and every
+/// new adoption retries subject to this per-uid debounce.
+fn comment_bind_backoff(attempts: u8) -> Duration {
+    match attempts {
+        0 => Duration::from_secs(5 * 60),
+        1 => Duration::from_secs(15 * 60),
+        _ => Duration::from_secs(60 * 60),
+    }
+}
+
+enum CommentBindAdmission {
+    Skip,
+    Schedule,
+}
+
+/// Pure admission decision for the observation hook: rate-limit per uid and
+/// keep the tracked state bounded (uids in reports are client-supplied).
+fn comment_bind_admit(
+    state: &mut HashMap<String, CommentBindState>,
+    map_uid: &str,
+    now: time::Instant,
+    cap: usize,
+) -> CommentBindAdmission {
+    if state.len() >= cap {
+        state.retain(|_, entry| entry.next_attempt > now);
+        if state.len() >= cap {
+            state.clear();
+        }
+    }
+    match state.get_mut(map_uid) {
+        Some(entry) if now < entry.next_attempt => CommentBindAdmission::Skip,
+        entry => {
+            let attempts = entry.as_ref().map(|e| e.attempts.saturating_add(1)).unwrap_or(0);
+            let next_attempt = now + comment_bind_backoff(attempts);
+            match entry {
+                Some(e) => {
+                    e.attempts = attempts;
+                    e.next_attempt = next_attempt;
+                }
+                None => {
+                    state.insert(map_uid.to_string(), CommentBindState { next_attempt, attempts });
+                }
+            }
+            CommentBindAdmission::Schedule
+        }
+    }
+}
+
+/// Override the debounce after an attempt completed: bound maps re-check
+/// slowly (comment/spec revisions), dead ends wait for a mapper action.
+fn comment_bind_reschedule(map_uid: &str, delay: Duration, reset_attempts: bool) {
+    let mut state = COMMENT_BIND_STATE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    match state.get_mut(map_uid) {
+        Some(entry) => {
+            entry.next_attempt = time::Instant::now() + delay;
+            if reset_attempts {
+                entry.attempts = 0;
+            }
+        }
+        None => {
+            state.insert(
+                map_uid.to_string(),
+                CommentBindState {
+                    next_attempt: time::Instant::now() + delay,
+                    attempts: 0,
+                },
+            );
+        }
+    }
+}
+
+/// Called on every Wayfinder map adoption. Enqueues at most one debounced
+/// lookup per map: the published comment is fetched from Nadeo and, when it
+/// references an aux spec, the map is bound to that spec (team-map friendly,
+/// follows the latest comment). Nothing runs when Nadeo is unconfigured; the
+/// author-present request-81 path still works independently.
+fn observe_map_for_comment_bind(pool: &Pool<Postgres>, mgr_tx: &UnboundedSender<ToPlayerMgr>, map_uid: &str) {
+    if map_uid == DD2_MAP_UID || map_uid.len() != 27 {
+        return;
+    }
+    if !NADEO_CLIENT.is_configured() {
+        return;
+    }
+    let admission = {
+        let mut state = COMMENT_BIND_STATE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        comment_bind_admit(&mut state, map_uid, time::Instant::now(), 8192)
+    };
+    if matches!(admission, CommentBindAdmission::Skip) {
+        return;
+    }
+    let pool = pool.clone();
+    let mgr_tx = mgr_tx.clone();
+    let map_uid = map_uid.to_string();
+    spawn_logged("Comment bind", async move {
+        let _permit = COMMENT_BIND_PERMITS.acquire().await;
+        // Serialize with author-present binds on the same map.
+        let map_operation = WAYFINDER_MAP_OPERATION_LOCKS.for_map(&map_uid);
+        let _map_operation = map_operation.lock().await;
+        let (outcome, removed_hat_wearers) =
+            queries::listed_maps::try_comment_bind(&pool, &NADEO_CLIENT, &map_uid).await;
+        match &outcome {
+            queries::listed_maps::CommentBindOutcome::Bound { .. } => {
+                if !removed_hat_wearers.is_empty() {
+                    let _ = mgr_tx.send(ToPlayerMgr::BroadcastToMap {
+                        map_uid: map_uid.clone(),
+                        response: Response::HatsOnMapUpdate {
+                            uid: map_uid.clone(),
+                            hats: removed_hat_wearers,
+                        },
+                    });
+                }
+                info!("Comment bind for map {}: {}", map_uid, outcome);
+                // Keep following comment/spec revisions at a slow cadence.
+                comment_bind_reschedule(&map_uid, Duration::from_secs(60 * 60), true);
+            }
+            queries::listed_maps::CommentBindOutcome::NotOnNadeo => {
+                debug!("Comment bind for map {}: {}", map_uid, outcome);
+                // The admission backoff already scheduled the next attempt.
+            }
+            queries::listed_maps::CommentBindOutcome::NoComment
+            | queries::listed_maps::CommentBindOutcome::NoDppUrl
+            | queries::listed_maps::CommentBindOutcome::SpecNotFound => {
+                debug!("Comment bind for map {}: {}", map_uid, outcome);
+                // Needs a mapper action to change; re-check slowly.
+                comment_bind_reschedule(&map_uid, Duration::from_secs(60 * 60), true);
+            }
+            queries::listed_maps::CommentBindOutcome::OffNadeo(_) => {
+                warn!("Comment bind for map {}: {}", map_uid, outcome);
+                // Transport trouble: the admission backoff retries later.
+            }
+        }
+    });
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 10)]
@@ -2795,6 +2940,59 @@ mod wayfinder_delivery_tests {
             .await
             .expect("cleanup join-order user");
     }
+
+    #[test]
+    fn comment_bind_admission_debounces_per_map() {
+        use super::{comment_bind_admit, CommentBindAdmission};
+        use std::time::Instant;
+
+        let mut state = std::collections::HashMap::new();
+        let now = Instant::now();
+        assert!(matches!(
+            comment_bind_admit(&mut state, "aabcdefghijklmnopqrstuvw", now, 8192),
+            CommentBindAdmission::Schedule
+        ));
+        // Inside the 5-minute first backoff: skipped.
+        assert!(matches!(
+            comment_bind_admit(&mut state, "aabcdefghijklmnopqrstuvw", now + Duration::from_secs(60), 8192),
+            CommentBindAdmission::Skip
+        ));
+        // Past it: second attempt schedules with the 15-minute backoff.
+        assert!(matches!(
+            comment_bind_admit(&mut state, "aabcdefghijklmnopqrstuvw", now + Duration::from_secs(301), 8192),
+            CommentBindAdmission::Schedule
+        ));
+        assert!(matches!(
+            comment_bind_admit(&mut state, "aabcdefghijklmnopqrstuvw", now + Duration::from_secs(301 + 60), 8192),
+            CommentBindAdmission::Skip
+        ));
+        // Past the second backoff: third attempt schedules (60-minute backoff).
+        assert!(matches!(
+            comment_bind_admit(&mut state, "aabcdefghijklmnopqrstuvw", now + Duration::from_secs(301 + 901), 8192),
+            CommentBindAdmission::Schedule
+        ));
+        // Other maps are debounced independently.
+        assert!(matches!(
+            comment_bind_admit(&mut state, "babcdefghijklmnopqrstuvw", now + Duration::from_secs(60), 8192),
+            CommentBindAdmission::Schedule
+        ));
+    }
+
+    #[test]
+    fn comment_bind_admission_keeps_state_bounded() {
+        use super::comment_bind_admit;
+        use std::time::Instant;
+
+        let mut state = std::collections::HashMap::new();
+        let now = Instant::now();
+        for i in 0..8193u32 {
+            let uid = format!("{:026}z", i);
+            comment_bind_admit(&mut state, &uid, now, 8192);
+        }
+        // All entries are still within their first backoff, so the prune
+        // cannot save space and the whole map is dropped instead.
+        assert!(state.len() <= 8192, "state grew to {}", state.len());
+    }
 }
 
 pub fn version_less(v1: &[u32], v2: &[u32]) -> bool {
@@ -3633,6 +3831,7 @@ impl XPlayer {
         if uid.len() != 27 {
             return Ok(tracked.lock().await.clone());
         }
+        observe_map_for_comment_bind(pool, mgr_tx, uid);
         Self::set_wayfinder_map(pool, mgr_tx, tracked, user_id, display_name, Some(uid)).await
     }
 

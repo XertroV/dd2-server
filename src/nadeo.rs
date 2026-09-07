@@ -42,6 +42,10 @@ pub struct LiveMapInfo {
     pub name: Option<String>,
     #[serde(rename = "thumbnailUrl")]
     pub thumbnail_url: Option<String>,
+    #[serde(default)]
+    pub submitter: Option<String>,
+    #[serde(rename = "downloadUrl", default)]
+    pub download_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -619,6 +623,60 @@ impl NadeoLiveClient {
         Ok((author_id, info))
     }
 
+    /// The published map's `<Comments>` string, read from the GBX header via
+    /// two ranged downloads (chunk table, then the tail of the thumbnail
+    /// chunk that carries the comment after its JPEG).
+    pub async fn fetch_published_comment(&self, map_uid: &str) -> Result<PublishedComment, String> {
+        let Some(info) = self.get_map_info_optional(map_uid).await? else {
+            return Ok(PublishedComment::NotOnNadeo);
+        };
+        let Some(url) = info.download_url else {
+            return Err("map info has no downloadUrl".to_string());
+        };
+        let head = self.fetch_range(&url, 0, 192).await?;
+        let Some((data_start, chunks)) = parse_header_chunk_table(&head) else {
+            return Err("could not parse the GBX header chunk table".to_string());
+        };
+        let mut offset = data_start;
+        for (id, raw_size) in chunks {
+            let size = (raw_size & 0x7FFF_FFFF) as usize;
+            if id == CHUNK_THUMB_COMMENTS {
+                if size == 0 {
+                    return Err("thumbnail/comments chunk is empty".to_string());
+                }
+                // The comment sits after the JPEG near the end of the chunk.
+                let window = size.min(COMMENT_FETCH_WINDOW);
+                let start = offset + size - window;
+                let tail = self.fetch_range(&url, start as u64, (start + window) as u64).await?;
+                return match extract_comments(&tail) {
+                    Extracted::Found(comment) => Ok(PublishedComment::Comment(Some(comment))),
+                    Extracted::Truncated => Err("map comment longer than the fetch window".to_string()),
+                    Extracted::Missing => Ok(PublishedComment::Comment(None)),
+                };
+            }
+            offset += size;
+        }
+        // No thumbnail chunk at all: some maps have none, so no comment.
+        Ok(PublishedComment::Comment(None))
+    }
+
+    async fn fetch_range(&self, url: &str, start: u64, end: u64) -> Result<Vec<u8>, String> {
+        let resp = send_with_retry(|| {
+            self.http
+                .get(url)
+                .header("Range", format!("bytes={}-{}", start, end.saturating_sub(1)))
+                .header("User-Agent", &self.user_agent)
+        })
+        .await?;
+        if !resp.status().is_success() {
+            return Err(format!("map file range status {}", resp.status()));
+        }
+        resp.bytes()
+            .await
+            .map(|b| b.to_vec())
+            .map_err(|e| format!("map file range body: {}", e))
+    }
+
     /// Prove an arbitrary account has a Nadeo PersonalBest record for this map.
     /// This uses the authoritative Core API rather than locally reported climb
     /// heights. Any auth, lookup, schema, or transport failure is an error so
@@ -667,6 +725,116 @@ impl NadeoLiveClient {
         let records: Vec<CoreMapRecord> = record_resp.json().await.map_err(|e| e.to_string())?;
         Ok(records_contain_personal_best(&records, &account_id, &map.map_id))
     }
+}
+
+/// GBX header chunk that stores `<Thumbnail.jpg>` followed by `<Comments>`.
+const CHUNK_THUMB_COMMENTS: u32 = 0x0304_3007;
+/// How much of that chunk to fetch when looking for the comment (it follows
+/// the JPEG, so the tail is enough for any sane map comment).
+const COMMENT_FETCH_WINDOW: usize = 64 * 1024;
+/// Refuse absurd comments before allocating.
+const COMMENT_MAX_LEN: usize = 32 * 1024;
+
+/// Result of fetching a published map's comment from Nadeo.
+pub enum PublishedComment {
+    /// No map with this uid exists on Nadeo (yet).
+    NotOnNadeo,
+    /// The map exists; `None` means it has no `<Comments>` value.
+    Comment(Option<String>),
+}
+
+/// Parse a GBX binary header chunk table out of the first bytes of a map
+/// file. Returns the absolute offset where chunk data starts plus the
+/// `(id, raw size|flags)` entries. The table position varies by GBX version,
+/// so scan for it: a plausible count followed by class-chunk ids.
+pub(crate) fn parse_header_chunk_table(head: &[u8]) -> Option<(usize, Vec<(u32, u32)>)> {
+    for start in 8..head.len().saturating_sub(12) {
+        let count = u32::from_le_bytes(head[start..start + 4].try_into().ok()?) as usize;
+        if !(1..=64).contains(&count) {
+            continue;
+        }
+        let table = start + 4;
+        if table + count * 8 > head.len() {
+            continue;
+        }
+        let mut entries = Vec::with_capacity(count);
+        let mut ok = true;
+        for i in 0..count {
+            let p = table + i * 8;
+            let id = u32::from_le_bytes(head[p..p + 4].try_into().ok()?);
+            let raw_size = u32::from_le_bytes(head[p + 4..p + 8].try_into().ok()?);
+            if (id >> 16) != 0x0304 {
+                ok = false;
+                break;
+            }
+            if (raw_size & 0x7FFF_FFFF) as usize > 1 << 28 {
+                ok = false;
+                break;
+            }
+            entries.push((id, raw_size));
+        }
+        if ok {
+            return Some((table + count * 8, entries));
+        }
+    }
+    None
+}
+
+pub(crate) enum Extracted {
+    Found(String),
+    /// A `<Comments>` marker with a length that runs past the buffer.
+    Truncated,
+    Missing,
+}
+
+/// Extract the `<Comments>` string from the tail of the thumbnail chunk.
+/// Observed layouts (validated against a Nadeo download and an editor save):
+/// `<Comments>` + `[len]` + text + `</Comments>`, sometimes with the length
+/// u32 doubled (lookback string form); the trailer disambiguates.
+pub(crate) fn extract_comments(buf: &[u8]) -> Extracted {
+    let Some(marker) = find_subslice(buf, b"<Comments>") else {
+        return Extracted::Missing;
+    };
+    let after = marker + b"<Comments>".len();
+    let mut truncated = false;
+    // Bytes between the marker and the string: one length u32, or two.
+    for consumed in [4usize, 8usize] {
+        let len_at = after + consumed - 4;
+        if len_at + 4 > buf.len() {
+            truncated = true;
+            continue;
+        }
+        let len = u32::from_le_bytes(buf[len_at..len_at + 4].try_into().unwrap()) as usize;
+        let len = len & 0x7FFF_FFFF;
+        if len == 0 || len > COMMENT_MAX_LEN {
+            continue;
+        }
+        let start = after + consumed;
+        let end = start + len;
+        if end > buf.len() {
+            truncated = true;
+            continue;
+        }
+        let trailer = &buf[end..];
+        if !trailer.starts_with(b"</Comments>") {
+            continue;
+        }
+        if let Ok(s) = std::str::from_utf8(&buf[start..end]) {
+            return Extracted::Found(s.to_string());
+        }
+    }
+    if truncated {
+        Extracted::Truncated
+    } else {
+        Extracted::Missing
+    }
+}
+
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    haystack.windows(needle.len()).position(|w| w == needle)
 }
 
 async fn ensure_cached_token<F, Fut>(cache: &RwLock<Option<CachedToken>>, refresh_gate: &Mutex<()>, fetch: F) -> Result<String, String>
@@ -1018,6 +1186,8 @@ mod tests {
                     author: author.to_string(),
                     name: None,
                     thumbnail_url: None,
+                    submitter: None,
+                    download_url: None,
                 }
             ),
             Ok(author)
@@ -1029,6 +1199,8 @@ mod tests {
                 author: author.to_string(),
                 name: None,
                 thumbnail_url: None,
+                submitter: None,
+                download_url: None,
             },
         )
         .expect_err("mismatched UID must fail closed");
@@ -1199,6 +1371,8 @@ mod tests {
                 author: author.to_string(),
                 name: None,
                 thumbnail_url: None,
+                submitter: None,
+                download_url: None,
             },
         )
         .expect_err("fixture must be a mismatch");
@@ -1319,5 +1493,71 @@ mod tests {
             assert_eq!(task.await.unwrap().unwrap(), "token");
         }
         assert_eq!(fetches.load(Ordering::SeqCst), 1);
+    }
+
+    fn synthetic_header(entries: &[(u32, u32)]) -> Vec<u8> {
+        // Layout observed on real maps: 17-byte preamble, u32 chunk count,
+        // then (id, raw size|flags) entries.
+        let mut head = vec![0u8; 17];
+        head[3..5].copy_from_slice(&6u16.to_le_bytes());
+        head[5] = b'B';
+        head.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+        for (id, size) in entries {
+            head.extend_from_slice(&id.to_le_bytes());
+            head.extend_from_slice(&size.to_le_bytes());
+        }
+        head
+    }
+
+    #[test]
+    fn chunk_table_parses_the_observed_layout() {
+        let entries = [
+            (0x0304_3002u32, 57u32),
+            (0x0304_3003, 223),
+            (0x0304_3004, 4),
+            (0x0304_3005, 568),
+            (0x0304_3007, 54_996),
+            (0x0304_3008, 92),
+        ];
+        let head = synthetic_header(&entries);
+        let (data_start, got) = parse_header_chunk_table(&head).expect("chunk table");
+        assert_eq!(data_start, 17 + 4 + entries.len() * 8);
+        assert_eq!(got, entries.to_vec());
+    }
+
+    #[test]
+    fn chunk_table_rejects_garbage() {
+        assert!(parse_header_chunk_table(&[0u8; 64]).is_none());
+    }
+
+    fn comments_buffer(skip: usize, text: &str) -> Vec<u8> {
+        let mut buf = b"\xff\xd9junk".to_vec();
+        buf.extend_from_slice(b"<Comments>");
+        for _ in 0..skip {
+            buf.extend_from_slice(&(text.len() as u32).to_le_bytes());
+        }
+        buf.extend_from_slice(text.as_bytes());
+        buf.extend_from_slice(b"</Comments>");
+        buf
+    }
+
+    #[test]
+    fn comments_extract_single_and_doubled_length_forms() {
+        let text = "--BEGIN-DPP--\nurl=https://dips-plus-plus.xk.io/aux_spec/0a2d1bc0-4aaa-4374-b2db-3d561bdab1c9/map.json\n--END-DPP--";
+        for skip in [1usize, 2] {
+            match extract_comments(&comments_buffer(skip, text)) {
+                Extracted::Found(s) => assert_eq!(s, text, "skip={}", skip),
+                _ => panic!("skip={}: comment was not extracted", skip),
+            }
+        }
+    }
+
+    #[test]
+    fn comments_extract_reports_missing_and_truncated() {
+        assert!(matches!(extract_comments(b"just some jpeg bytes"), Extracted::Missing));
+        let text = "x".repeat(64);
+        let mut buf = comments_buffer(1, &text);
+        buf.truncate(buf.len() - 20);
+        assert!(matches!(extract_comments(&buf), Extracted::Truncated));
     }
 }

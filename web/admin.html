@@ -761,7 +761,30 @@
             <span class="hint" style="margin-right:0.35rem">Your access</span>
             ${yourAccessHtml(mapData) || tagHtml('None')}
           </div>
+          <div class="meta" style="margin-top:0.5rem">
+            <button type="button" id="recheck-bind-btn">Recheck map binding</button>
+            <span id="recheck-bind-out" class="meta"></span>
+          </div>
+          <div class="meta">Recheck re-reads the map's comment on Nadeo and binds the Dips++ spec it
+            references. Use it after publishing or updating your map.</div>
         </div>`;
+      document.getElementById('recheck-bind-btn').addEventListener('click', recheckBind);
+    }
+
+    async function recheckBind() {
+      if (!currentUid) return;
+      const btn = document.getElementById('recheck-bind-btn');
+      const out = document.getElementById('recheck-bind-out');
+      btn.disabled = true;
+      out.textContent = 'Checking…';
+      try {
+        const r = await api('/api/mod/map/' + encodeURIComponent(currentUid) + '/recheck-bind', { method: 'POST' });
+        out.textContent = r.outcome;
+      } catch (e) {
+        out.textContent = e.message;
+      } finally {
+        btn.disabled = false;
+      }
     }
 
     async function refreshBans() {

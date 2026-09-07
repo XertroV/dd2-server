@@ -253,6 +253,13 @@ pub fn routes(state: ModerationState) -> impl Filter<Extract = (impl Reply,), Er
         .and(warp::get())
         .map(|| warp::reply::html(ADMIN_HTML));
 
+    let recheck_bind = warp::path!("api" / "mod" / "map" / String / "recheck-bind")
+        .and(warp::post())
+        .and(warp::path::end())
+        .and(with_state.clone())
+        .and(warp::header::optional::<String>("cookie"))
+        .and_then(handle_recheck_bind);
+
     oauth_start
         .or(oauth_callback)
         .or(logout)
@@ -273,6 +280,7 @@ pub fn routes(state: ModerationState) -> impl Filter<Extract = (impl Reply,), Er
         .or(list_super_mods)
         .or(add_super_mod)
         .or(remove_super_mod)
+        .or(recheck_bind)
         .or(admin_static)
 }
 
@@ -468,6 +476,70 @@ async fn handle_list_bans(map_uid: String, state: ModerationState, cookie: Optio
         Ok(bans) => json_ok(&bans),
         Err(e) => json_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
+}
+
+/// Per-user cooldown so the manual recheck cannot be spammed; the debounced
+/// observation hook does the same work automatically on map adoption.
+static RECHECK_BIND_COOLDOWNS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<Uuid, std::time::Instant>>> =
+    std::sync::OnceLock::new();
+const RECHECK_BIND_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(10);
+
+#[derive(Serialize)]
+struct RecheckBindResp {
+    outcome: String,
+    bound: bool,
+    spec_id: Option<i64>,
+    replaced_previous: Option<bool>,
+}
+
+/// Re-run the comment-derived bind for one map right now: fetch the published
+/// comment from Nadeo and bind whatever spec it references. Intended for the
+/// map's author/uploader (the button on the map page) but safe for any logged
+/// in user — it only does what the observation hook does anyway.
+async fn handle_recheck_bind(map_uid: String, state: ModerationState, cookie: Option<String>) -> Result<impl Reply, Rejection> {
+    let Some((user_id, _)) = session_user(state.pool.as_ref(), cookie).await else {
+        return json_err(StatusCode::UNAUTHORIZED, "not logged in");
+    };
+    {
+        let cooldowns = RECHECK_BIND_COOLDOWNS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+        let mut cooldowns = cooldowns.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let now = std::time::Instant::now();
+        if let Some(until) = cooldowns.get(&user_id) {
+            if *until > now {
+                return json_err(StatusCode::TOO_MANY_REQUESTS, "wait before rechecking again");
+            }
+        }
+        cooldowns.insert(user_id, now + RECHECK_BIND_COOLDOWN);
+        if cooldowns.len() > 8192 {
+            cooldowns.retain(|_, until| *until > now);
+        }
+    }
+    if map_uid.len() != 27 {
+        return json_err(StatusCode::BAD_REQUEST, "map uid must be 27 characters");
+    }
+    if !state.nadeo.is_configured() {
+        return json_err(StatusCode::BAD_GATEWAY, "Nadeo client not configured on this host");
+    }
+    let (outcome, _) = crate::queries::listed_maps::try_comment_bind(&state.pool, &state.nadeo, &map_uid).await;
+    let resp = match &outcome {
+        crate::queries::listed_maps::CommentBindOutcome::Bound {
+            spec_id,
+            materialized: _,
+            replaced_previous,
+        } => RecheckBindResp {
+            outcome: outcome.to_string(),
+            bound: true,
+            spec_id: Some(*spec_id),
+            replaced_previous: Some(*replaced_previous),
+        },
+        _ => RecheckBindResp {
+            outcome: outcome.to_string(),
+            bound: false,
+            spec_id: None,
+            replaced_previous: None,
+        },
+    };
+    json_ok(&resp)
 }
 
 #[derive(Deserialize)]

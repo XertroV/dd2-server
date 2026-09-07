@@ -175,7 +175,11 @@ Do not blindly clobber remote `.env`. In particular:
 
 - Preserve `DATABASE_URL` on both hosts (shared DB).
 - OAuth / Nadeo (`TM_OAUTH_*`, `DD2_NADEO_DS_*`) are required on the **API** host for `/admin` and map-author lazy fetch.
-- Plugin host may log `DD2_NADEO_DS_USERNAME/PASSWORD not set` — expected if you only configured Nadeo on the API host; plugin still serves game traffic.
+- `DD2_NADEO_DS_*` are also required on the **plugin host** since the
+  comment-derived binds shipped: the observation hook (map adoption ->
+  fetch the published comment -> bind its `url=` spec) and the author-present
+  request-81 verification both call Nadeo from `dd2-server2`. Without them the
+  hook stays idle and 81 binds fail with "nadeo not configured".
 
 ### systemd restart storms
 
