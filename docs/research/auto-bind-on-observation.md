@@ -1,7 +1,7 @@
 # Proposal: author-absent binding by reading the published map
 
-Status: **design only, not implemented.** Research context for removing the
-"the author must load their own map once" step. Sibling docs:
+Status: **design + probe results, not implemented.** Research context for
+removing the "the author must load their own map once" step. Sibling docs:
 [aux-spec-map-bind.md](aux-spec-map-bind.md) (how binding works today),
 [map-metadata-cache.md](map-metadata-cache.md) (what Nadeo metadata we cache).
 
@@ -14,6 +14,12 @@ the map fails closed: no minigame attempts, collectible unlocks, hat unlocks,
 and withheld hat reads. The author must load their map once with Dips++
 connected, or the features stay off for everyone.
 
+This also **blocks team maps today**: if a team member uploads the spec and
+the leader publishes the map (the Deep Dip / Shallow Dip pattern), the
+leader's own load fails `SpecNotOwned` (reporter does not own the teammate's
+spec) and the teammate's load fails `AuthorMismatch` (teammate is not the
+Nadeo author). No one in the team can bind at all.
+
 ## Why a comment-embedded challenge does not work
 
 A nonce/hash challenge in the map comment proves the comment contains
@@ -22,56 +28,66 @@ an attacker can copy a victim's entire comment (including the answered
 challenge and the victim's `url=`) into their own map re-upload. The copy gets
 a new uid whose Nadeo author is the attacker, and a content check alone cannot
 tell the copy from the original. With multiple map versions legitimately
-sharing one spec, content-derived identity is ambiguous anyway. The only
-non-copyable signal Nadeo exposes is `author` on the map object, so every
-secure path has to route through account identity.
+sharing one spec, content-derived identity is ambiguous anyway.
 
-## The insight: the published comment is already author-signed
+## The endorsement model (revised: no ownership equality)
 
-Only the map's author can publish or update a map on Nadeo. Therefore the
-`url=` inside a comment **fetched from Nadeo** is an author endorsement of
-that spec — equivalent to request 81 from the author, without the author
-being online. Proposed verification rule for an author-absent bind:
+Only the map's publishing account can publish or update a map on Nadeo.
+Therefore the `url=` inside a comment **fetched from Nadeo by the server** is
+the publisher's endorsement of that spec — whoever owns it. Proposed rule for
+an author-absent bind:
 
-1. Fetch the published map for a UID from Nadeo.
+1. Fetch the published map for a UID from Nadeo (server-side only).
 2. Read its comment; parse the Dips++ `url=` into `(wsid, name_id)`.
-3. Resolve the spec row for that `(wsid, name_id)`.
-4. Require `spec.user_id == url wsid == Nadeo map author`.
-5. Feed the same `commit_authoritative_bind` path as today.
+3. Resolve the spec row for exactly that `(wsid, name_id)` — the same lookup
+   any client's `GET /aux_spec/<wsid>/<name_id>.json` performs.
+4. Bind via the existing `commit_authoritative_bind` path.
 
-Attack check (comment copy): attacker re-uploads victim's map -> new uid,
-Nadeo author = attacker, url wsid = victim -> step 4 mismatch -> refused.
-Attack check (wrong-spec lock-in): the spec choice comes from the author's
-published comment, not from a client-claimed `spec_id`, so nobody can point a
-victim's map at a spec the victim never referenced. (This is exactly why the
-cheaper relaxation — letting any reporter's 81 trigger with only
-`spec.owner == nadeo author` — is unsafe: `spec_id` is client-supplied and an
-attacker could permanently bind a wrong spec owned by the author.)
+There is **no** `spec.user_id == Nadeo author` requirement: team maps where
+the uploader, the map author, and the publisher are different accounts are the
+normal case this must support. (`map-info` exposes `author` and `submitter`
+separately, so distinctions remain observable for moderation if ever needed.)
 
-Multiple map versions sharing one spec are fine: binding is keyed by uid,
-which Nadeo preserves across updates. The existing immutable-binding policy
-(first verified bind wins, same-spec revisions re-materialize) is unchanged.
+Attack analysis without the equality:
 
-## Capability gap (go/no-go probe)
+- **Bind a spec the publisher never endorsed**: requires the published
+  comment to reference it; only the publishing account can change that.
+  Comment copies re-uploaded by an attacker produce a *new uid* bound to the
+  attacker's own map — identical to what today's 81 path already allows for
+  re-uploads, so no new capability.
+- **Wrong-spec lock-in**: if a spec owner manages to get their `url=` embedded
+  by the publisher (contributor/social engineering), the immutable
+  first-bind-wins policy would lock it in. Mitigations to decide at impl
+  time: allow a comment-derived bind to follow the *latest* comment (the
+  publisher can always correct by re-publishing), or keep immutability and
+  add an admin unbind. This is a policy choice, not a security hole: only the
+  publishing account can put any url in the comment at all.
+- Client-reported comments (context reports) remain untrusted; only the
+  Nadeo-downloaded file is an endorsement.
 
-The server cannot read comments today. `LiveMapInfo` (map-info service)
-exposes `uid`, `author`, `name`, `thumbnailUrl` only. Options:
+## Probe results (2026-09-08, scratch scripts in `dips++-all/.scratch/nadeo-map-probe/`)
 
-- **P1 probe (cheap, do first):** with the existing `DD2_NADEO_DS_*`
-  credentials, check whether any map service returns a description/comment
-  field, and whether the map download (`.Map.Gbx` by UID) is reachable.
-  Dedicated servers must be able to fetch maps, so the DS scope is plausible
-  but unverified.
-- **P2 fallback:** minimal GBX header parser for the comment chunk (the
-  comment lives in the header; no full GBX parse needed). Downloads are
-  heavier than map-info (megabytes vs one JSON), so the fetch budget must be
-  smaller than the map-author one.
-- **Not acceptable as identity sources:** the `assets.xk.io/d++maps/<uid>.txt`
-  override (not author-authenticated) and any client-reported comment
-  (spoofable).
+GO — everything needed exists today with the current `DD2_NADEO_DS_*` creds:
 
-If both P1 routes fail, this design is blocked; the author-load path remains
-the mechanism.
+- `GET live-services.../api/token/map/<uid>` returns **`author` AND
+  `submitter`** (both UUIDs), name, uid, `downloadUrl`, `thumbnailUrl`,
+  upload/update timestamps. No comment field.
+- `downloadUrl` (`core.trackmania.nadeo.live/maps/<mapId>/file`) is
+  **unauthenticated**, returns the full `.Map.Gbx`, and **honours `Range`
+  requests** (verified `206`, `Accept-Ranges: bytes`). DD2 = 5,998,704 B.
+- **The map comment is in the GBX header, uncompressed**: header chunk
+  `0x03043007` stores `<Thumbnail.jpg>` (JPEG, EOI `FFD9`) followed by
+  `<Comments>` + length u32(s) + plain text. Verified on a Nadeo-downloaded
+  file (DD2: "Please do not create unofficial versions…") and on a local
+  Dips++ test map (full `--BEGIN-DPP--\nurl=https://…/aux_spec/<wsid>/<name_id>.json`
+  readable verbatim). The LZ-compressed copy in the body is irrelevant.
+- The chunk table is in the first ~64 bytes (`count` at 0x11 for both
+  samples; entries are `u32 id`, `u32 size|0x80000000 flag`). The comment
+  therefore sits at a computable offset: chunk-table read (1 range request,
+  ~128 B) -> thumbnail chunk start+size -> one more range request for the
+  last few KB of that chunk -> find `<Comments>`. **~4 KB total transfer for
+  any map size**; a v1 can simply download the whole file (0.4–6 MB) since
+  lookups are debounced and rare.
 
 ## Trigger, debounce, and budgets
 
@@ -83,38 +99,41 @@ binding.
 - **Map not on Nadeo yet** (players on a local/unpublished copy): per-uid
   negative backoff starting at ~5 min, growing (5 -> 15 -> 60 min cap). More
   players adopting the map raises the chance it is published, and each new
-  adoption retries subject to the per-uid debounce — the user-visible
-  behaviour the flow wants.
+  adoption retries subject to the per-uid debounce.
 - **Map exists, no `url=` in comment** (simple map): nothing to bind; long
   backoff (needs an author action to change).
-- **Map exists, `url=` wsid != author**: refused (attack or third-party
-  re-upload); long backoff.
-- **Bound or boundable**: bind, materialize, stop. Also upsert `map_meta`
-  from the same fetch (author/name/thumbnail), same as the moderation path.
-- **Abuse bounds**: uids in reports are client-supplied; keep a bounded LRU of
-  pending/negative uids (e.g. 10k), reuse the admission-limiter pattern from
-  `CachedMapAuthorVerifier` with a smaller concurrent budget for downloads,
-  and never let the observation path exceed its own hourly cap.
+- **Map exists, `url=` resolves to a spec**: bind, materialize, stop. Also
+  upsert `map_meta` from the same `map-info` call (author/name/thumbnail).
+- **`url=` does not resolve** (spec deleted / wsid unknown): long backoff.
+- **Abuse bounds**: uids in reports are client-supplied; keep a bounded LRU
+  of pending/negative uids (e.g. 10k), reuse the admission-limiter pattern
+  from `CachedMapAuthorVerifier` with a small concurrent budget; map-info is
+  one cheap JSON call, the file fetch is range-limited as above.
 
 ## Resulting flow
 
-Author publishes the map -> first players join (author presence no longer
-required) -> first adoption enqueues the fetch -> comment `url=` verified
-against the Nadeo author -> binding verified and catalogs materialize. The
-author's own request 81 stays as the instant path and bypasses all of this.
+Author (or team) publishes the map -> first players join (author presence not
+required) -> first adoption enqueues the fetch -> comment `url=` resolves ->
+binding verified and catalogs materialize. The author's own request 81 stays
+as the instant path and bypasses all of this — but note 81 should eventually
+be relaxed the same way (spec owner need not be the reporter) or team maps
+will still need the observation path.
 
 ## Implementation shape (when approved)
 
-- P1 probe (above) decides the comment source.
-- GBX comment-chunk reader with local `.Map.Gbx` fixtures (only if P2).
+- `nadeo.rs`: `map_info` extended to keep `submitter`/`downloadUrl`;
+  a `fetch_map_comment(map_uid)` doing the staged range reads + chunk-table
+  walk + `<Comments>` parse (plain text; tolerate the double length u32 seen
+  in lookback strings). No GBX body parsing, no decompressor needed.
 - Observation hook + per-uid debounce/negative cache in `server2.rs`, reusing
-  the spawn/deferred pattern of `report_minigame_map_deferring`.
-- A `PreparedBind` variant whose `verified_author` is derived from the
-  comment-vs-author match; `commit_authoritative_bind` itself unchanged.
-- Tests with fake Nadeo backends (existing `FakeAuthorVerifier` pattern):
-  not-on-Nadeo backoff, comment-copy refusal, wrong-wsid refusal, happy-path
-  bind, spec-revision re-materialization.
+  the deferred-spawn pattern.
+- A `PreparedBind` variant whose `verified_author` is None-with-comment-source
+  (ownership equality removed); `commit_authoritative_bind` unchanged except
+  the verification derivation; decide the rebind policy (follow-comment vs
+  immutable + admin unbind).
+- Tests with fake Nadeo backends (existing pattern): not-on-Nadeo backoff,
+  comment-copy refusal (new-uid case), no-url backoff, happy-path bind for a
+  team map (uploader != author), spec-revision re-materialization.
 - Deploy: plugin host binary only; no migrations; API untouched.
-- After it ships, soften the editor finalization note from "you must play
-  your map once" to "activates automatically once your map is live and
-  players join; play it yourself to activate instantly".
+- After it ships, soften the editor finalization note to "activates
+  automatically once your map is live and players join".
