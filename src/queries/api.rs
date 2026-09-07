@@ -1,5 +1,7 @@
 use std::sync::Arc;
+use std::time::Duration;
 
+use lazy_static::lazy_static;
 use serde_json::Value;
 use sqlx::{query, Pool, Postgres};
 use uuid::Uuid;
@@ -8,9 +10,31 @@ use warp::{
     reply::{Json, Reply, WithStatus},
 };
 
-use crate::{api_error, donations, queries::get_global_lb_count, router::LeaderboardEntry};
+use crate::{
+    api_error,
+    cache_util::AsyncCache,
+    donations,
+    queries::get_global_lb_count,
+    router::{CollectibleListItem, LeaderboardEntry, MinigameListGame},
+};
 
 use super::{get_global_lb, get_users_latest_height, stats};
+
+/// How long rarely-changing GET routes serve from the in-memory cache before
+/// re-querying. The data behind them only moves on threshold crossings, spec
+/// rebinds, or manual edits, so a minute of staleness is fine and bursts of
+/// polls stop hitting Postgres (the listed-maps page query alone scans every
+/// leaderboard row on the page for nb_players).
+const SLOW_ROUTE_TTL: Duration = Duration::from_secs(60);
+
+lazy_static! {
+    static ref CACHED_LISTED_MAPS: AsyncCache<u32, Vec<super::listed_maps::ListedMap>> = Default::default();
+    static ref CACHED_LISTED_MAPS_LEN: AsyncCache<(), i64> = Default::default();
+    static ref CACHED_MINIGAME_LIST: AsyncCache<String, Vec<MinigameListGame>> = Default::default();
+    static ref CACHED_COLLECTIBLE_LIST: AsyncCache<String, Vec<CollectibleListItem>> = Default::default();
+    static ref CACHED_DONATIONS: AsyncCache<(), (f64, f64)> = Default::default();
+    static ref CACHED_TWITCH_LIST: AsyncCache<(), Value> = Default::default();
+}
 
 pub async fn handle_get_global_lb(pool: &Arc<Pool<Postgres>>, page: u32) -> Result<Json, warp::Rejection> {
     let start = (page * 100) as i32;
@@ -115,18 +139,19 @@ pub async fn get_live_leaderboard(pool: &Pool<Postgres>) -> Result<Json, warp::R
 }
 
 pub async fn handle_get_donations(pool: &Pool<Postgres>) -> Result<Json, warp::Rejection> {
-    let donations = donations::get_prize_pool_total(pool).await;
-    let gfm = donations::get_gfm_donations_latest(pool).await;
-    match (gfm, donations) {
-        (Ok(gfm_total), Ok(pp_total)) => Ok(warp::reply::json(&serde_json::json!({
+    let r = CACHED_DONATIONS
+        .get_or_insert_with(&(), SLOW_ROUTE_TTL, || async {
+            let pp_total = donations::get_prize_pool_total(pool).await?;
+            let gfm_total = donations::get_gfm_donations_latest(pool).await?;
+            Ok::<(f64, f64), sqlx::Error>((gfm_total, pp_total))
+        })
+        .await;
+    match r {
+        Ok((_, (gfm_total, pp_total))) => Ok(warp::reply::json(&serde_json::json!({
             "gfm_total": gfm_total,
             "pp_total": pp_total
         }))),
-        (Err(e), _) => {
-            eprintln!("Error: {:?}", e);
-            Err(warp::reject::custom(Into::<ApiErrRejection>::into(e)))
-        }
-        (_, Err(e)) => {
+        Err(e) => {
             eprintln!("Error: {:?}", e);
             Err(warp::reject::custom(Into::<ApiErrRejection>::into(e)))
         }
@@ -134,9 +159,11 @@ pub async fn handle_get_donations(pool: &Pool<Postgres>) -> Result<Json, warp::R
 }
 
 pub async fn handle_get_twitch_list(pool: &Pool<Postgres>) -> Result<Json, warp::Rejection> {
-    let r = get_twitch_profiles_all(pool).await;
+    let r = CACHED_TWITCH_LIST
+        .get_or_insert_with(&(), SLOW_ROUTE_TTL, || get_twitch_profiles_all(pool))
+        .await;
     match r {
-        Ok(r) => Ok(warp::reply::json(&r)),
+        Ok((_, r)) => Ok(warp::reply::json(&r)),
         Err(e) => {
             eprintln!("Error: {:?}", e);
             Err(warp::reject::custom(ApiErrRejection::new(&format!("{:?}", e))))
@@ -264,9 +291,11 @@ fn reject_slug(slug: &str) -> Result<(), warp::Rejection> {
 }
 
 pub async fn handle_get_map_uid_minigames(pool: &Pool<Postgres>, map_uid: String) -> Result<impl Reply, warp::Rejection> {
-    let r = super::minigames::get_minigame_list(pool, &map_uid).await;
+    let r = CACHED_MINIGAME_LIST
+        .get_or_insert_with(&map_uid, SLOW_ROUTE_TTL, || super::minigames::get_minigame_list(pool, &map_uid))
+        .await;
     match r {
-        Ok(games) => Ok(warp::reply::json(&serde_json::json!({ "uid": map_uid, "games": games }))),
+        Ok((_, games)) => Ok(warp::reply::json(&serde_json::json!({ "uid": map_uid, "games": games }))),
         Err(e) => {
             eprintln!("Error: {:?}", e);
             Err(warp::reject::custom(Into::<ApiErrRejection>::into(e)))
@@ -314,9 +343,13 @@ pub async fn handle_get_map_uid_minigame_leaderboard_len(
 }
 
 pub async fn handle_get_map_uid_collectibles(pool: &Pool<Postgres>, map_uid: String) -> Result<impl Reply, warp::Rejection> {
-    let r = super::collectibles::get_collectible_list(pool, &map_uid).await;
+    let r = CACHED_COLLECTIBLE_LIST
+        .get_or_insert_with(&map_uid, SLOW_ROUTE_TTL, || {
+            super::collectibles::get_collectible_list(pool, &map_uid)
+        })
+        .await;
     match r {
-        Ok(items) => Ok(warp::reply::json(&serde_json::json!({ "uid": map_uid, "items": items }))),
+        Ok((_, items)) => Ok(warp::reply::json(&serde_json::json!({ "uid": map_uid, "items": items }))),
         Err(e) => {
             eprintln!("Error: {:?}", e);
             Err(warp::reject::custom(Into::<ApiErrRejection>::into(e)))
@@ -325,9 +358,11 @@ pub async fn handle_get_map_uid_collectibles(pool: &Pool<Postgres>, map_uid: Str
 }
 
 pub async fn handle_get_listed_maps(pool: &Pool<Postgres>, page: u32) -> Result<impl Reply, warp::Rejection> {
-    let r = super::listed_maps::get_listed_maps_page(pool, page).await;
+    let r = CACHED_LISTED_MAPS
+        .get_or_insert_with(&page, SLOW_ROUTE_TTL, || super::listed_maps::get_listed_maps_page(pool, page))
+        .await;
     match r {
-        Ok(r) => Ok(warp::reply::json(&r)),
+        Ok((_, r)) => Ok(warp::reply::json(&r)),
         Err(e) => {
             eprintln!("Error: {:?}", e);
             Err(warp::reject::custom(Into::<ApiErrRejection>::into(e)))
@@ -336,9 +371,11 @@ pub async fn handle_get_listed_maps(pool: &Pool<Postgres>, page: u32) -> Result<
 }
 
 pub async fn handle_get_listed_maps_len(pool: &Pool<Postgres>) -> Result<impl Reply, warp::Rejection> {
-    let r = super::listed_maps::get_listed_maps_len(pool).await;
+    let r = CACHED_LISTED_MAPS_LEN
+        .get_or_insert_with(&(), SLOW_ROUTE_TTL, || super::listed_maps::get_listed_maps_len(pool))
+        .await;
     match r {
-        Ok(r) => Ok(warp::reply::json(&serde_json::json!({
+        Ok((_, r)) => Ok(warp::reply::json(&serde_json::json!({
             "len": r,
             "pages": super::listed_maps::listed_maps_page_count(r)
         }))),

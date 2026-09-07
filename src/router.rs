@@ -856,7 +856,7 @@ pub struct MinigameLBEntry {
     pub ts: u32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MinigameListGame {
     pub slug: String,
     pub kind: String,
@@ -864,7 +864,7 @@ pub struct MinigameListGame {
     pub key: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CollectibleListItem {
     pub slug: String,
     pub name: String,

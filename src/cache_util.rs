@@ -107,3 +107,45 @@ where
         inner.last_scanned = now;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    #[tokio::test]
+    async fn serves_cached_value_within_ttl_and_refreshes_after_it() {
+        let cache: AsyncCache<String, i32> = Default::default();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let ttl = Duration::from_millis(50);
+
+        let fetch = |calls: Arc<AtomicUsize>| {
+            move || {
+                let calls = calls.clone();
+                async move {
+                    // Each real fetch returns a different value so the
+                    // refresh is observable, and counts how often it ran.
+                    Ok::<_, std::convert::Infallible>(10 + calls.fetch_add(1, Ordering::SeqCst) as i32)
+                }
+            }
+        };
+
+        let (age, v) = cache.get_or_insert_with(&"k".to_string(), ttl, fetch(calls.clone())).await.unwrap();
+        assert_eq!((age, v), (Duration::ZERO, 10));
+
+        // Within the TTL the second call serves the cached value without fetching.
+        let (_, v) = cache.get_or_insert_with(&"k".to_string(), ttl, fetch(calls.clone())).await.unwrap();
+        assert_eq!(v, 10);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // After the TTL the fetch runs again; a changed value resets the age.
+        tokio::time::sleep(ttl + Duration::from_millis(10)).await;
+        let (age, v) = cache.get_or_insert_with(&"k".to_string(), ttl, fetch(calls.clone())).await.unwrap();
+        assert_eq!(v, 11);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(age <= Duration::from_millis(5), "age after a changed-value refresh was {age:?}");
+    }
+}

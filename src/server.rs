@@ -23,6 +23,7 @@ use tokio::{
 use crate::{consts::DD2_MAP_UID, donations::get_donations_from_matcherino, http::run_http_server, op_auth::init_op_config};
 
 mod api_error;
+mod cache_util;
 mod consts;
 mod db;
 mod donations;
