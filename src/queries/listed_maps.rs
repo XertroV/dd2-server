@@ -16,6 +16,11 @@ pub struct ListedMap {
     pub became_listed: i64,
     pub map_name: Option<String>,
     pub author_id: Option<String>,
+    /// Players on this map's leaderboard under the same public-count filter
+    /// the listing trigger uses (shadow-banned and actively map-banned
+    /// players excluded). Listing is permanent, so this can drop below the
+    /// threshold that originally listed the map.
+    pub nb_players: i64,
 }
 
 pub fn listed_maps_page_count(len: i64) -> i64 {
@@ -485,7 +490,14 @@ pub async fn get_listed_maps_page(pool: &Pool<Postgres>, page: u32) -> Result<Ve
     let offset = (page as i64) * limit;
     let rows = query!(
         r#"
-        SELECT lm.map_uid, lm.became_listed, mm.map_name, mm.author_id AS "author_id?"
+        SELECT lm.map_uid, lm.became_listed, mm.map_name, mm.author_id AS "author_id?",
+               (SELECT COUNT(*)
+                FROM map_leaderboard m
+                LEFT JOIN shadow_bans sb ON m.user_id = sb.user_id
+                LEFT JOIN map_bans mb ON m.user_id = mb.user_id AND mb.map_uid = m.map_uid
+                    AND mb.lifted_at IS NULL
+                    AND (mb.expires_at IS NULL OR mb.expires_at > NOW())
+                WHERE sb.user_id IS NULL AND mb.user_id IS NULL AND m.map_uid = lm.map_uid) AS "nb_players!"
         FROM listed_maps lm
         LEFT JOIN map_meta mm ON mm.map_uid = lm.map_uid
         WHERE lm.listed AND lm.map_uid <> $1
@@ -505,6 +517,7 @@ pub async fn get_listed_maps_page(pool: &Pool<Postgres>, page: u32) -> Result<Ve
             became_listed: r.became_listed.timestamp(),
             map_name: r.map_name,
             author_id: r.author_id.map(|id| id.to_string()),
+            nb_players: r.nb_players,
         })
         .collect())
 }
@@ -636,13 +649,15 @@ mod tests {
             became_listed: 1_700_000_000,
             map_name: Some("Foo".into()),
             author_id: Some("0a2d1bc0-4aaa-4374-b2db-3d561bdab1c9".into()),
+            nb_players: 25,
         };
         let v = serde_json::to_value(&row).expect("serialize");
         assert_eq!(v["uid"], "abcdefghijklmnopqrstuvwxyza");
         assert_eq!(v["became_listed"], 1_700_000_000);
         assert_eq!(v["map_name"], "Foo");
         assert_eq!(v["author_id"], "0a2d1bc0-4aaa-4374-b2db-3d561bdab1c9");
-        assert_eq!(v.as_object().unwrap().len(), 4);
+        assert_eq!(v["nb_players"], 25);
+        assert_eq!(v.as_object().unwrap().len(), 5);
     }
 
     #[test]
@@ -652,6 +667,7 @@ mod tests {
             became_listed: 1_700_000_001,
             map_name: None,
             author_id: None,
+            nb_players: 0,
         };
         let v = serde_json::to_value(&row).expect("serialize");
         assert!(v["map_name"].is_null());
@@ -665,6 +681,58 @@ mod tests {
         assert_eq!(listed_maps_page_count(1), 1);
         assert_eq!(listed_maps_page_count(100), 1);
         assert_eq!(listed_maps_page_count(101), 2);
+    }
+
+    #[tokio::test]
+    async fn listed_maps_page_reports_public_player_count() {
+        let _guard = test_lock();
+        let pool = test_pool().await;
+        let p1 = seed_user(&pool, "nb-players-1").await;
+        let p2 = seed_user(&pool, "nb-players-2").await;
+        let p3 = seed_user(&pool, "nb-players-3").await;
+        let shadowed = seed_user(&pool, "nb-players-shadowed").await;
+        let map_banned = seed_user(&pool, "nb-players-map-banned").await;
+        let actor = seed_user(&pool, "nb-players-actor").await;
+        let map_uid = unique_map_uid("NbPl_");
+
+        for user in [&p1, &p2, &p3, &shadowed, &map_banned] {
+            insert_lb(&pool, &map_uid, user, 10.0).await;
+        }
+        query!(
+            "INSERT INTO shadow_bans (user_id, reason) VALUES ($1, 'listed nb_players test')",
+            shadowed
+        )
+        .execute(&pool)
+        .await
+        .expect("shadow ban");
+        apply_map_ban(&pool, &map_uid, &map_banned, &actor, "private", "public", None)
+            .await
+            .expect("map ban");
+        query!(
+            "INSERT INTO listed_maps (map_uid, listed, became_listed) VALUES ($1, TRUE, NOW())",
+            map_uid
+        )
+        .execute(&pool)
+        .await
+        .expect("list map");
+
+        let len = get_listed_maps_len(&pool).await.expect("listed len");
+        let mut found = None;
+        for page in 0..listed_maps_page_count(len).max(1) {
+            for entry in get_listed_maps_page(&pool, page as u32).await.expect("listed page") {
+                if entry.uid == map_uid {
+                    found = Some(entry);
+                }
+            }
+        }
+        let entry = found.expect("seeded map on some listed page");
+        assert_eq!(entry.nb_players, 3, "shadow- and map-banned players must not count");
+
+        let _ = query!("DELETE FROM shadow_bans WHERE user_id = $1", shadowed).execute(&pool).await;
+        cleanup_map(&pool, &map_uid).await;
+        for user in [&p1, &p2, &p3, &shadowed, &map_banned, &actor] {
+            cleanup_user(&pool, user).await;
+        }
     }
 
     #[tokio::test]
